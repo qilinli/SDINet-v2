@@ -18,14 +18,14 @@ Current `Midn` predicts:
 This is strong for single-damage scenarios, but multi-damage cases are forced into a compromise because all locations share one global magnitude.
 
 
-## Proposed Model Change
+## Proposed Model Change (Unified v2)
 
 Keep:
 
 - backbone (`SDIDenseNet`)
 - neck (`Flatten + Conv1d + ReLU + Conv1d + ReLU`)
 
-Replace the head with a **multi-damage map head**.
+Replace the head with a single **multi-damage map head** for all training and inference.
 
 ### Multi-Damage Head (sensor-attention style)
 
@@ -47,6 +47,7 @@ Optional auxiliary branch:
 - `presence_logit = Conv1d(E, 70, 1)` + reduction -> `(B, 70)` for damaged/not-damaged classification per location.
 
 This preserves sensor-attention robustness while removing the single-global-scalar bottleneck.
+There is no single/double model switch in v2; one architecture is used for any number of damages `k`.
 
 
 ## Training Objective (for sparse multi-damage labels)
@@ -78,22 +79,46 @@ Optional improvement:
 - pass a binary sensor-availability mask to the head so the model can distinguish missing sensors from true zero signal.
 
 
-## Minimal Migration Plan
+## Multi-Phase Migration Plan (Unified Pipeline)
 
-1. Add a new head class in `lib/midn.py` (for example, `MultiDamageMidn`) that returns `(B, 70)` severity maps.
-2. Add head-mode config in `lib/model.py` (for example, `"single"` vs `"multi"`), keeping `"single"` for backward compatibility.
-3. Update `lib/training.py`:
-   - for multi mode, train against full location target map directly (not `max` + class index only).
-4. Update `lib/testing.py`:
-   - for multi mode, evaluate predicted `severity_map` directly against location-wise target,
-   - avoid converting from `scalar * softmax(location)` in multi mode.
-5. Keep current validation for single mode; add multi-mode metrics:
+### Phase 1 - Architecture (minimal, clean)
+
+1. Update `lib/midn.py` to output only location-wise severity map behavior:
+   - `pred`, `imp`, and weighted sensor reduction to `(B, 70)`.
+2. Update `lib/model.py` to use `out_channels=70` and remove single-damage assumptions in head configuration.
+3. Keep backbone (`SDIDenseNet`) and neck unchanged.
+
+### Phase 2 - Training Objective
+
+1. Update `lib/training.py` to supervise the full target map directly:
+   - remove `max` damage + class-index target decomposition.
+2. Use map regression as the primary objective:
+   - `L_reg = SmoothL1(severity_map, y)`.
+3. Add sparsity control:
+   - `L_sparse = mean(abs(severity_map))`,
+   - `L = L_reg + lambda1 * L_sparse` (start with small `lambda1`).
+
+### Phase 3 - Validation and Testing
+
+1. Evaluate map predictions directly (no `scalar * softmax(location)` reconstruction).
+2. Replace single-location metrics with multi-damage metrics:
    - map MSE/MAE,
    - top-k location hit rate,
    - precision/recall on active-damage locations.
+3. Keep sensor-subset robustness validation, but compute errors on final map outputs.
+
+### Phase 4 - Robustness Expansion
+
+1. Keep random sensor dropping.
+2. Add:
+   - whole-sensor zero masking,
+   - contiguous sensor block dropout,
+   - sensor corruption (spikes, drift, gain bias).
+3. Optional: pass sensor availability mask to distinguish missing sensors from true zero signal.
 
 
-## Backward Compatibility
+## Versioning Decision
 
-- Keep current single-damage head path intact to avoid breaking existing checkpoints and scripts.
-- Introduce multi-damage behavior behind a config switch.
+- v2 is intentionally a unified multi-damage pipeline.
+- Backward compatibility with v1 checkpoints/scripts is not a design requirement inside this branch.
+- If legacy comparison is needed, keep v1 in a separate repository/branch and compare at experiment level.
