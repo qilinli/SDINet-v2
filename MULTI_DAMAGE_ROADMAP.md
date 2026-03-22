@@ -1,124 +1,67 @@
-# Multi-Damage + Sensor-Failure-Robust SDINet Roadmap
+# SDINet-v2 Multi-Damage Roadmap
 
-## Goal
+## Background
 
-Upgrade the current single-damage pipeline to:
+v1 (baseline, Engineering Structures publication) predicts one global damage scalar `(B, 1)` + one location vector `(B, 70)`. All locations share the same magnitude — this is the single-damage bottleneck.
 
-1. predict multiple simultaneous damages naturally, and
-2. remain robust when sensors fail or degrade.
+v2 objectives:
+1. Handle single and multiple simultaneous damages in one unified model
+2. Improve backbone/preprocessing with SOTA components (transformer, time-series encoders, new losses)
+3. Evaluate on new datasets
 
+---
 
-## Current Limitation (Why Change)
+## Multi-Damage Head: Design Options
 
-Current `Midn` predicts:
+Brainstormed approaches (ranked by publication relevance for Engineering Structures):
 
-- one global damage scalar `(B, 1)`, and
-- one location score vector `(B, 70)`.
+### A — Dense Severity Map *(Minimal change)*
+Output `(B, 70)` severity per location. Train with regression + L1 sparsity penalty.
+- **Pro:** Minimal change, naturally handles any K.
+- **Con:** Sparsity is soft (λ is a tunable nuisance); nothing prevents diffuse activations.
 
-This is strong for single-damage scenarios, but multi-damage cases are forced into a compromise because all locations share one global magnitude.
+### B — Presence + Severity Decomposition *(Recommended head)*
+Two heads: binary presence `(B, 70)` via BCE, and severity regression `(B, 70)`. Final output = presence × severity.
+- **Pro:** Structurally enforces sparsity without a penalty parameter. Clean decomposition ("is there damage?" vs. "how much?") — highly interpretable for engineers.
+- **Con:** BCE class imbalance (most locations are 0); needs focal loss or positive weighting.
 
+### C — DETR-Style Set Prediction *(High novelty, high complexity)*
+Predict K_max damage instances via transformer decoder + Hungarian matching loss.
+- **Pro:** Elegant variable-K handling, no threshold or sparsity penalty needed. Novel in SHM.
+- **Con:** Much more complex to train; overkill if K is small (1–2 damages).
 
-## Proposed Model Change (Unified v2)
+### D — Graph-Informed Spatial Refinement *(Strong engineering angle)*
+After MIL sensor aggregation, apply a GNN over a structural topology graph (70 location nodes) to refine the severity map.
+- **Pro:** Physically motivated — structurally connected locations have correlated damage. Resonates well with structural engineering reviewers.
+- **Con:** Requires structural graph definition (adjacency of the 70 locations).
 
-Keep:
+---
 
-- backbone (`SDIDenseNet`)
-- neck (`Flatten + Conv1d + ReLU + Conv1d + ReLU`)
+## Current Recommendation
 
-Replace the head with a single **multi-damage map head** for all training and inference.
+**B + D combination:**
+- Use **Approach B** as the prediction head (presence + severity)
+- Add **Approach D** as an optional spatial refinement module if structural topology is available
+- Keep **MIL sensor aggregation** unchanged (core v1 contribution)
 
-### Multi-Damage Head (sensor-attention style)
+This gives a clean three-level narrative:
+1. *Sensor level* → MIL handles sensor failure (from v1)
+2. *Feature level* → improved backbone (DenseNet → transformer/SOTA)
+3. *Location level* → presence/severity heads + optional GNN refinement
 
-Input from neck: `z` with shape `(B, E, S)` where:
+**Open questions before deciding:**
+- How many simultaneous damages does the dataset have? (If always 1–2, B alone is sufficient)
+- Is structural topology (adjacency of the 70 locations) available? (Determines if D is viable)
+- Is the multi-damage dataset already available or needs to be generated?
 
-- `B`: batch
-- `E`: embedding channels
-- `S`: sensors
+---
 
-Head outputs:
-
-- `pred = Conv1d(E, 70, 1)` -> `(B, 70, S)` (per-location, per-sensor severity evidence)
-- `imp  = Conv1d(E, 70, 1)` -> `(B, 70, S)` (per-location sensor importance logits)
-- `imp  = softmax(imp, dim=-1)` (normalize over sensors only)
-- `severity_map = (pred * imp).sum(-1)` -> `(B, 70)` (final multi-location severity prediction)
-
-Optional auxiliary branch:
-
-- `presence_logit = Conv1d(E, 70, 1)` + reduction -> `(B, 70)` for damaged/not-damaged classification per location.
-
-This preserves sensor-attention robustness while removing the single-global-scalar bottleneck.
-There is no single/double model switch in v2; one architecture is used for any number of damages `k`.
-
-
-## Training Objective (for sparse multi-damage labels)
-
-Assume target `y` has shape `(B, 70)` (normalized severity at each location).
-
-Recommended loss:
-
-- `L_reg`: `SmoothL1Loss(severity_map, y)` (or MSE)
-- `L_sparse`: `mean(abs(severity_map))` to encourage sparse activations
-- Optional `L_bce`: `BCEWithLogitsLoss(presence_logit, (y > threshold).float())`
-
-Total:
-
-- `L = L_reg + lambda1 * L_sparse + lambda2 * L_bce`
-
-
-## Sensor-Failure Robustness Strategy
+## Sensor-Failure Robustness (preserve from v1)
 
 Continue and extend failure simulation during training:
+- Random sensor dropping (already in v1)
+- Whole-sensor zero masking (dead sensors)
+- Contiguous sensor block dropout (regional hardware failure)
+- Sensor corruption (noise spikes, drift, gain bias)
 
-- random sensor dropping (already aligned with existing strategy),
-- whole-sensor zero masking (dead sensors),
-- contiguous sensor block dropout (regional hardware failure),
-- random sensor corruption (noise spikes, drift, gain bias).
-
-Optional improvement:
-
-- pass a binary sensor-availability mask to the head so the model can distinguish missing sensors from true zero signal.
-
-
-## Multi-Phase Migration Plan (Unified Pipeline)
-
-### Phase 1 - Architecture (minimal, clean)
-
-1. Update `lib/midn.py` to output only location-wise severity map behavior:
-   - `pred`, `imp`, and weighted sensor reduction to `(B, 70)`.
-2. Update `lib/model.py` to use `out_channels=70` and remove single-damage assumptions in head configuration.
-3. Keep backbone (`SDIDenseNet`) and neck unchanged.
-
-### Phase 2 - Training Objective
-
-1. Update `lib/training.py` to supervise the full target map directly:
-   - remove `max` damage + class-index target decomposition.
-2. Use map regression as the primary objective:
-   - `L_reg = SmoothL1(severity_map, y)`.
-3. Add sparsity control:
-   - `L_sparse = mean(abs(severity_map))`,
-   - `L = L_reg + lambda1 * L_sparse` (start with small `lambda1`).
-
-### Phase 3 - Validation and Testing
-
-1. Evaluate map predictions directly (no `scalar * softmax(location)` reconstruction).
-2. Replace single-location metrics with multi-damage metrics:
-   - map MSE/MAE,
-   - top-k location hit rate,
-   - precision/recall on active-damage locations.
-3. Keep sensor-subset robustness validation, but compute errors on final map outputs.
-
-### Phase 4 - Robustness Expansion
-
-1. Keep random sensor dropping.
-2. Add:
-   - whole-sensor zero masking,
-   - contiguous sensor block dropout,
-   - sensor corruption (spikes, drift, gain bias).
-3. Optional: pass sensor availability mask to distinguish missing sensors from true zero signal.
-
-
-## Versioning Decision
-
-- v2 is intentionally a unified multi-damage pipeline.
-- Backward compatibility with v1 checkpoints/scripts is not a design requirement inside this branch.
-- If legacy comparison is needed, keep v1 in a separate repository/branch and compare at experiment level.
+Optional: pass a binary sensor-availability mask to the head so the model can distinguish missing sensors from true zero signal.
