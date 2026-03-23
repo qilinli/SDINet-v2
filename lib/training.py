@@ -221,7 +221,7 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None):
         train_loss = train_one_epoch(model, opt, sched, train_dl, accel, ema)
         train_losses.append(train_loss)
         epoch_bar.set_description(
-            f"Train {train_loss:.3e} | Val {val_loss:.3e} | MSE {val_mse:.3e} | TKR {val_acc:.3f}"
+            f"train_loss {train_loss:.3e} | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_acc:.3f}"
         )
 
         val_loss, val_mse, val_acc = val_one_epoch(
@@ -232,7 +232,7 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None):
         val_losses.append(val_loss)
 
         epoch_bar.set_description(
-            f"Train {train_loss:.3e} | Val {val_loss:.3e} | MSE {val_mse:.3e} | TKR {val_acc:.3f}"
+            f"train_loss {train_loss:.3e} | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_acc:.3f}"
         )
 
     # Return the (possibly accelerator-prepared) model so callers can save
@@ -454,8 +454,8 @@ def do_training_b(
         )
         train_losses.append(train_loss)
         epoch_bar.set_description(
-            f"Train {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
-            f" | Val {val_loss:.3e} | MSE {val_mse:.3e} | F1 {val_f1:.3f}"
+            f"train_loss {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
+            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_f1 {val_f1:.3f}"
         )
 
         val_loss, val_mse, val_f1 = val_one_epoch_b(
@@ -466,8 +466,8 @@ def do_training_b(
         val_f1s.append(val_f1)
 
         epoch_bar.set_description(
-            f"Train {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
-            f" | Val {val_loss:.3e} | MSE {val_mse:.3e} | F1 {val_f1:.3f}"
+            f"train_loss {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
+            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_f1 {val_f1:.3f}"
         )
 
     return train_losses, val_losses, val_dl, val_f1s, val_mses, model
