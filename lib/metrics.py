@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from sklearn.metrics import average_precision_score
 
 # ---------------------------------------------------------------------------
 # Normalized label space: y_norm = raw_damage / 0.15 - 1  ∈ [-1, 1]
@@ -158,3 +159,186 @@ def top_k_recall(
     tp        = (topk_mask & y_presence).sum().float()
     total_pos = y_presence.sum().float().clamp(min=1.0)
     return (tp / total_pos).item()
+
+
+@torch.no_grad()
+def average_precision(
+    presence_logits: Tensor,
+    y_norm: Tensor,
+    presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+) -> float:
+    """
+    Area under the Precision-Recall curve for damage presence detection.
+
+    Threshold-free summary of detection quality: integrates P-R tradeoff
+    across all possible decision thresholds.  More informative than F1 at a
+    single threshold, especially under class imbalance (K << L).
+
+    Args:
+        presence_logits:     (B, L) raw logits
+        y_norm:              (B, L) normalized labels ∈ [-1, 1]
+        presence_norm_thresh: Labels above this value count as "damaged"
+    Returns:
+        AP ∈ [0, 1]
+    """
+    probs  = torch.sigmoid(presence_logits).cpu().numpy().ravel()
+    labels = (y_norm > presence_norm_thresh).cpu().numpy().ravel().astype(int)
+    return float(average_precision_score(labels, probs))
+
+
+@torch.no_grad()
+def severity_mae_at_detected(
+    presence_logits: Tensor,
+    severity: Tensor,
+    y_norm: Tensor,
+    k: int | None = None,
+    presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+) -> float:
+    """
+    Mean Absolute Error of severity at *correctly detected* locations only.
+
+    For each sample, top-K locations are selected by presence score.  Among
+    those that are truly damaged (true positives), the MAE between predicted
+    and true severity is computed.  Locations that were missed (false
+    negatives) or incorrectly flagged (false positives) are excluded.
+
+    This decouples severity accuracy from localization accuracy: a model that
+    finds the right location should not be penalised for what it predicts at
+    wrong locations.
+
+    Args:
+        presence_logits:     (B, L) raw logits — used for ranking locations
+        severity:            (B, L) sigmoid-activated severity ∈ [0, 1]
+        y_norm:              (B, L) normalized labels ∈ [-1, 1]
+        k:                   Locations to consider per sample.  If None,
+                             uses the true K for each sample individually
+                             (oracle K — best-case localization scenario).
+        presence_norm_thresh: Threshold defining "truly damaged"
+    Returns:
+        MAE scalar.  Returns 0.0 if no true positives exist in the batch.
+    """
+    probs     = torch.sigmoid(presence_logits)           # (B, L)
+    y_pres    = y_norm > presence_norm_thresh             # (B, L) bool
+    y_sev     = (y_norm + 1.0) / 2.0                     # (B, L) in [0, 1]
+
+    total_mae = 0.0
+    total_tp  = 0
+
+    for b in range(y_norm.size(0)):
+        true_locs = y_pres[b].nonzero(as_tuple=True)[0]
+        K = int(true_locs.numel()) if k is None else k
+        if K == 0:
+            continue
+        topk_idx = probs[b].topk(K).indices              # (K,)
+        for idx in topk_idx:
+            if y_pres[b, idx]:                            # true positive
+                total_mae += abs(severity[b, idx].item() - y_sev[b, idx].item())
+                total_tp  += 1
+
+    return total_mae / max(total_tp, 1)
+
+
+@torch.no_grad()
+def evaluate_all(
+    presence_logits: Tensor,
+    severity: Tensor,
+    y_norm: Tensor,
+    k: int | None = None,
+    presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+) -> dict[str, float]:
+    """
+    Compute the full evaluation suite for the B-head on a dataset split.
+
+    Designed for test-set evaluation after training.  Concatenate predictions
+    from all batches before calling::
+
+        pres_all = torch.cat([...])   # (N_samples, L)
+        sev_all  = torch.cat([...])   # (N_samples, L)
+        y_all    = torch.cat([...])   # (N_samples, L)
+        results  = evaluate_all(pres_all, sev_all, y_all)
+
+    Args:
+        presence_logits: (N, L) raw presence logits
+        severity:        (N, L) sigmoid-activated severity ∈ [0, 1]
+        y_norm:          (N, L) normalized ground-truth labels ∈ [-1, 1]
+        k:               Fixed K for top-K metrics.  None = use true K per sample.
+        presence_norm_thresh: Threshold separating undamaged from damaged labels.
+
+    Returns:
+        Dict with keys:
+
+        ``map_mse``
+            Distributed-map MSE in [0, 1] space.  Primary comparison metric,
+            valid for both v1 and B heads.
+
+        ``top_k_recall``
+            Fraction of true damaged locations in the top-K predictions.
+            K is the true number of damages per sample when ``k=None``.
+
+        ``severity_mae``
+            MAE at correctly detected locations only (true positives).
+            Decouples severity accuracy from localization accuracy.
+
+        ``ap``
+            Average Precision (area under PR curve).  Threshold-free detection
+            quality summary; robust under heavy class imbalance.
+
+        ``f1``, ``precision``, ``recall``
+            Presence detection at the default threshold (0.5).  Reported for
+            reference; prefer ``ap`` for threshold-independent comparison.
+
+        ``mean_k_pred``, ``mean_k_true``
+            Mean number of predicted and true damaged locations per sample
+            (at threshold 0.5).  Useful for diagnosing over/under-detection.
+    """
+    dist_map  = distributed_map_b(presence_logits, severity)   # (N, L)
+    mse       = map_mse(dist_map, y_norm).item() / y_norm.size(0)
+
+    # True K per sample (used when k=None)
+    y_pres_bool = y_norm > presence_norm_thresh                 # (N, L) bool
+    k_true_per  = y_pres_bool.sum(dim=-1).float()               # (N,)
+
+    # Top-K recall: use per-sample true K if k is None
+    if k is None:
+        probs = torch.sigmoid(presence_logits)
+        hits = total_pos = 0
+        for b in range(y_norm.size(0)):
+            K = int(k_true_per[b].item())
+            if K == 0:
+                continue
+            topk_idx  = probs[b].topk(K).indices
+            topk_mask = torch.zeros(y_norm.size(1), dtype=torch.bool, device=y_norm.device)
+            topk_mask[topk_idx] = True
+            hits      += int((topk_mask & y_pres_bool[b]).sum())
+            total_pos += K
+        tkr = hits / max(total_pos, 1)
+    else:
+        tkr = top_k_recall(presence_logits, y_norm, k=k,
+                           presence_norm_thresh=presence_norm_thresh)
+
+    sev_mae = severity_mae_at_detected(
+        presence_logits, severity, y_norm,
+        k=k, presence_norm_thresh=presence_norm_thresh,
+    )
+    ap = average_precision(presence_logits, y_norm,
+                           presence_norm_thresh=presence_norm_thresh)
+
+    tp, fp, fn = presence_f1_stats(presence_logits, y_norm,
+                                   presence_norm_thresh=presence_norm_thresh)
+    f1, prec, rec = f1_from_counts(tp, fp, fn)
+
+    pred_pres = torch.sigmoid(presence_logits) > 0.5
+    mean_k_pred = pred_pres.sum(dim=-1).float().mean().item()
+    mean_k_true = k_true_per.mean().item()
+
+    return {
+        "map_mse":      mse,
+        "top_k_recall": tkr,
+        "severity_mae": sev_mae,
+        "ap":           ap,
+        "f1":           f1,
+        "precision":    prec,
+        "recall":       rec,
+        "mean_k_pred":  mean_k_pred,
+        "mean_k_true":  mean_k_true,
+    }
