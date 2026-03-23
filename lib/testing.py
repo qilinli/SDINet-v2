@@ -1,20 +1,14 @@
 """
-Evaluation helpers for the **single real-world MATLAB benchmark** shipped with this repo.
+Real-world MATLAB benchmark helpers.
 
-What this module does
----------------------
-- Loads input / label tensors from ``data/Testing_SingleEAcc9Sensor0.5sec.mat``.
-- Runs ``do_real_test(model, ...)`` forward pass + notebook-style metrics.
+Loads input / label tensors from ``data/Testing_SingleEAcc9Sensor0.5sec.mat``
+and runs a forward pass for either model head (v1 or Approach-B), returning
+the standard ``evaluate_all`` / ``evaluate_all_v1`` metric dict.
 
-What this module also provides
-------------------------------
-- Checkpoint helpers: ``load_model_from_checkpoint`` and
-  ``do_real_test_from_checkpoint``.
-- A direct CLI entrypoint: ``python -m lib.testing <checkpoint_path>``.
+CLI::
 
-Example::
-
-    python -m lib.testing states/single-damage-sparse-<uuid>.pt
+    python -m lib.testing --v1  states/single-damage-<uuid>.pt
+    python -m lib.testing --b   states/multi-damage-B-<uuid>.pt
 """
 
 from __future__ import annotations
@@ -27,41 +21,18 @@ from pathlib import Path
 import torch
 from scipy.io import loadmat
 
-# ---------------------------------------------------------------------------
-# Repo layout
-# ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-# ---------------------------------------------------------------------------
-# Damage scaling (must match ``lib.data_safetensors.target_preprocess``)
-#
-#   normalized = physical / DAMAGE_PHYSICAL_SCALE - 1
-#   inverse:     physical = (normalized + 1) * DAMAGE_PHYSICAL_SCALE
-# ---------------------------------------------------------------------------
 DAMAGE_PHYSICAL_SCALE: float = 0.15
 
 
-def normalized_damage_to_physical(normalized: torch.Tensor) -> torch.Tensor:
-    """Map model damage output (normalized) back to physical damage units."""
-    return (normalized + 1.0) * DAMAGE_PHYSICAL_SCALE
-
-
 # ---------------------------------------------------------------------------
-# Benchmark file + notebook-aligned scalar metrics (fixed test setup)
+# Benchmark .mat file spec
 # ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class RealMatBenchmarkSpec:
-    """Constants tied to ``Testing_SingleEAcc9Sensor0.5sec.mat`` / notebook."""
-
     mat_filename: str = "Testing_SingleEAcc9Sensor0.5sec.mat"
-    """File under ``<repo>/data/``."""
-
-    reference_scalar_damage: float = 0.125
-    """Scalar damage used for ``rw_mse`` in the original notebook."""
-
-    location_class_for_nll: int = 11
-    """Location class index for the reported NLL line in the notebook."""
 
 
 DEFAULT_BENCHMARK = RealMatBenchmarkSpec()
@@ -74,7 +45,7 @@ def default_benchmark_mat_path(spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK) -
 @lru_cache(maxsize=4)
 def _load_benchmark_tensors_cached(mat_path_str: str) -> tuple[torch.Tensor, torch.Tensor]:
     mat = loadmat(mat_path_str)
-    test_data = torch.from_numpy(mat["Testing_Data"]).float()
+    test_data   = torch.from_numpy(mat["Testing_Data"]).float()
     test_target = torch.from_numpy(mat["Testing_label"]).float()
     return test_data, test_target
 
@@ -84,108 +55,14 @@ def load_real_test_tensors(
     *,
     spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Load ``Testing_Data`` / ``Testing_label`` from the benchmark ``.mat`` file.
-
-    Cached per resolved path. Call this if you need the tensors without running
-    the model.
-    """
+    """Load ``Testing_Data`` / ``Testing_label`` from the benchmark ``.mat`` file (cached)."""
     path = Path(mat_path) if mat_path is not None else default_benchmark_mat_path(spec)
     return _load_benchmark_tensors_cached(str(path.resolve()))
 
 
-def _print_eval_results(results: dict[str, float]) -> None:
-    print(
-        f"map_mse={results['map_mse']:.4e}  "
-        f"top_k_recall={results['top_k_recall']:.3f}  "
-        f"AP={results['ap']:.3f}  "
-        f"F1={results['f1']:.3f}  "
-        f"severity_mae={results['severity_mae']:.4e}  "
-        f"mean_k_pred={results['mean_k_pred']:.1f} (true={results['mean_k_true']:.1f})"
-    )
-
-
-def do_real_test(
-    model: torch.nn.Module,
-    *,
-    device: str | torch.device | None = None,
-    mat_path: str | Path | None = None,
-    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
-    print_result: bool = True,
-) -> dict[str, float]:
-    """
-    Run the benchmark forward pass for a v1 model and return ``evaluate_all_v1`` metrics.
-
-    The physical test target is converted to normalized space
-    (``y_norm = raw / 0.15 - 1``) before evaluation so that all metrics are
-    computed in the same label space as training.
-    """
-    from lib.metrics import evaluate_all_v1
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device)
-
-    test_data, test_target = load_real_test_tensors(mat_path, spec=spec)
-    x = test_data[None, None, ...].to(device)
-
-    with torch.inference_mode():
-        model = model.to(device)
-        model.eval()
-        dmg_pred, loc_pred = model(x)   # (1, 1), (1, L)
-
-    y_norm = (
-        test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0
-    ).unsqueeze(0)  # (1, L)
-
-    result = evaluate_all_v1(dmg_pred, loc_pred, y_norm)
-
-    if print_result:
-        _print_eval_results(result)
-
-    return result
-
-
-def do_real_test_b(
-    model: torch.nn.Module,
-    *,
-    device: str | torch.device | None = None,
-    mat_path: str | Path | None = None,
-    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
-    print_result: bool = True,
-) -> dict[str, float]:
-    """
-    Run the benchmark forward pass for an Approach-B model and return
-    ``evaluate_all`` metrics.
-
-    The physical test target is converted to normalized space
-    (``y_norm = raw / 0.15 - 1``) before evaluation.
-    """
-    from lib.metrics import evaluate_all
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device)
-
-    test_data, test_target = load_real_test_tensors(mat_path, spec=spec)
-    x = test_data[None, None, ...].to(device)
-
-    with torch.inference_mode():
-        model = model.to(device)
-        model.eval()
-        presence_logits, severity = model(x)   # (1, L), (1, L)
-
-    y_norm = (
-        test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0
-    ).unsqueeze(0)  # (1, L)
-
-    result = evaluate_all(presence_logits, severity, y_norm)
-
-    if print_result:
-        _print_eval_results(result)
-
-    return result
-
+# ---------------------------------------------------------------------------
+# Checkpoint loaders
+# ---------------------------------------------------------------------------
 
 def load_model_from_checkpoint(
     checkpoint_path: str | Path,
@@ -193,13 +70,7 @@ def load_model_from_checkpoint(
     device: str | torch.device | None = None,
     model_cfg=None,
 ) -> torch.nn.Module:
-    """
-    Load a saved `model.state_dict()` checkpoint and return a ready-to-run model.
-
-    This matches the notebook usage where the checkpoint filename looks like:
-    `states/single-damage-sparse-<uuid>.pt`.
-    """
-    # Local import to keep this module lightweight.
+    """Load a v1 (Midn) checkpoint and return a ready-to-run model."""
     from lib.model import ModelConfig, build_model
 
     if model_cfg is None:
@@ -212,31 +83,6 @@ def load_model_from_checkpoint(
     if device is not None:
         model = model.to(device)
     return model
-
-
-def do_real_test_from_checkpoint(
-    checkpoint_path: str | Path,
-    *,
-    device: str | torch.device | None = None,
-    mat_path: str | Path | None = None,
-    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
-    model_cfg=None,
-    print_result: bool = True,
-) -> dict[str, float | int]:
-    """
-    Convenience wrapper for ad-hoc evaluation:
-    load checkpoint -> run `do_real_test`.
-    """
-    model = load_model_from_checkpoint(
-        checkpoint_path, device=device, model_cfg=model_cfg
-    )
-    return do_real_test(
-        model,
-        device=device,
-        mat_path=mat_path,
-        spec=spec,
-        print_result=print_result,
-    )
 
 
 def load_model_b_from_checkpoint(
@@ -260,42 +106,103 @@ def load_model_b_from_checkpoint(
     return model
 
 
-def do_real_test_b_from_checkpoint(
-    checkpoint_path: str | Path,
+# ---------------------------------------------------------------------------
+# Real benchmark forward pass
+# ---------------------------------------------------------------------------
+
+def do_real_test(
+    model: torch.nn.Module,
     *,
     device: str | torch.device | None = None,
     mat_path: str | Path | None = None,
     spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
-    model_cfg=None,
     print_result: bool = True,
-) -> dict[str, float | int]:
-    """Convenience wrapper: load Approach-B checkpoint -> run `do_real_test_b`."""
-    model = load_model_b_from_checkpoint(
-        checkpoint_path, device=device, model_cfg=model_cfg
-    )
-    return do_real_test_b(
-        model,
-        device=device,
-        mat_path=mat_path,
-        spec=spec,
-        print_result=print_result,
+) -> dict[str, float]:
+    """Forward pass + ``evaluate_all_v1`` metrics on the real .mat benchmark."""
+    from lib.metrics import evaluate_all_v1
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    test_data, test_target = load_real_test_tensors(mat_path, spec=spec)
+    x = test_data[None, None, ...].to(device)
+
+    with torch.inference_mode():
+        model = model.to(device)
+        model.eval()
+        dmg_pred, loc_pred = model(x)
+
+    y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
+    result = evaluate_all_v1(dmg_pred, loc_pred, y_norm)
+
+    if print_result:
+        _print_eval_results(result)
+
+    return result
+
+
+def do_real_test_b(
+    model: torch.nn.Module,
+    *,
+    device: str | torch.device | None = None,
+    mat_path: str | Path | None = None,
+    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
+    print_result: bool = True,
+) -> dict[str, float]:
+    """Forward pass + ``evaluate_all`` metrics on the real .mat benchmark."""
+    from lib.metrics import evaluate_all
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    test_data, test_target = load_real_test_tensors(mat_path, spec=spec)
+    x = test_data[None, None, ...].to(device)
+
+    with torch.inference_mode():
+        model = model.to(device)
+        model.eval()
+        presence_logits, severity = model(x)
+
+    y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
+    result = evaluate_all(presence_logits, severity, y_norm)
+
+    if print_result:
+        _print_eval_results(result)
+
+    return result
+
+
+def _print_eval_results(results: dict[str, float]) -> None:
+    print(
+        f"map_mse={results['map_mse']:.4e}  "
+        f"top_k_recall={results['top_k_recall']:.3f}  "
+        f"AP={results['ap']:.3f}  "
+        f"F1={results['f1']:.3f}  "
+        f"severity_mae={results['severity_mae']:.4e}  "
+        f"mean_k_pred={results['mean_k_pred']:.1f} (true={results['mean_k_true']:.1f})"
     )
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run SDINet real benchmark from a checkpoint."
-    )
-    parser.add_argument(
-        "checkpoint_path",
-        type=str,
-        help="Path to a saved model.state_dict() checkpoint (.pt).",
-    )
+    parser = argparse.ArgumentParser(description="Run SDINet real benchmark from a checkpoint.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--v1", metavar="CKPT", help="v1 (Midn) checkpoint path")
+    group.add_argument("--b",  metavar="CKPT", help="Approach-B (MidnB) checkpoint path")
     args = parser.parse_args()
 
-    do_real_test_from_checkpoint(
-        checkpoint_path=args.checkpoint_path,
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.v1:
+        model = load_model_from_checkpoint(args.v1, device=device)
+        do_real_test(model, device=device)
+    else:
+        model = load_model_b_from_checkpoint(args.b, device=device)
+        do_real_test_b(model, device=device)
 
 
 if __name__ == "__main__":
