@@ -12,6 +12,16 @@ Usage::
 
 from __future__ import annotations
 
+import os
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
+os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
+
+import torch._dynamo  # noqa: E402
+import torch._dynamo as _dynamo
+_dynamo.config.suppress_errors = True
+_dynamo.config.disable = True
+
 import argparse
 
 from main   import RunConfig,  main as train_v1
