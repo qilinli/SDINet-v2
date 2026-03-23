@@ -98,7 +98,7 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
     if cfg.save_uuid_checkpoint:
         states_dir = Path("states")
         states_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = states_dir / f"multi-damage-B-{uuid4()}.pt"
+        ckpt_path = states_dir / f"b-{cfg.subset_name}-{uuid4()}.pt"
         torch.save(trained_model.state_dict(), ckpt_path)
         print(f"[checkpoint] Saved: {ckpt_path}")
 
@@ -122,4 +122,11 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train SDINet Approach-B")
+    parser.add_argument("--subset", default="double", choices=["single", "double"])
+    parser.add_argument("--epochs", type=int, default=200)
+    args = parser.parse_args()
+    # pos_weight rule of thumb: (L - K) / K  where L=70
+    pos_weight = 69.0 if args.subset == "single" else 34.0
+    main(RunConfigB(subset_name=args.subset, epochs=args.epochs, presence_pos_weight=pos_weight))

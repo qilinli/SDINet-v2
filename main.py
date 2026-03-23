@@ -95,7 +95,7 @@ def main(cfg: RunConfig = RunConfig()) -> None:
     if cfg.save_uuid_checkpoint:
         states_dir = Path("states")
         states_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = states_dir / f"single-damage-dense-{uuid4()}.pt"
+        ckpt_path = states_dir / f"v1-{cfg.subset_name}-{uuid4()}.pt"
         torch.save(trained_model.state_dict(), ckpt_path)
         print(f"[checkpoint] Saved: {ckpt_path}")
     plot_training_results(
@@ -118,4 +118,9 @@ def main(cfg: RunConfig = RunConfig()) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train SDINet v1")
+    parser.add_argument("--subset", default="single", choices=["single", "double"])
+    parser.add_argument("--epochs", type=int, default=200)
+    args = parser.parse_args()
+    main(RunConfig(subset_name=args.subset, epochs=args.epochs))
