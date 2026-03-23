@@ -73,6 +73,7 @@ def main(cfg: RunConfig = RunConfig()) -> None:
     plot_training_results(
         train_losses, val_losses, val_accs, val_mses,
         save_dir=cfg.save_dir, show=cfg.show_plots,
+        val_acc_label="Val top-k recall",
     )
 
     from lib.testing import eval_on_loader_v1, do_real_test

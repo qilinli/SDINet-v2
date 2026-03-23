@@ -9,7 +9,14 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import trange
 
-from lib.metrics import distributed_map_b, f1_from_counts, map_mse, presence_f1_stats
+from lib.metrics import (
+    PRESENCE_NORM_THRESH,
+    distributed_map_b,
+    distributed_map_v1,
+    f1_from_counts,
+    map_mse,
+    presence_f1_stats,
+)
 
 # Training / evaluation defaults
 DEFAULT_DROP_NUM = 10
@@ -21,7 +28,6 @@ DEFAULT_VAL_SUBSET_COUNT = 51
 DEFAULT_VAL_NUM_SENSORS = 65
 DEFAULT_VAL_SUBSET_SIZE = 10
 EPS = 1e-12
-PERCENT_SCALE = 100.0
 MIXED_PRECISION_MODE = "no"
 
 # Optimizer / scheduler defaults
@@ -132,14 +138,32 @@ def val_one_epoch(
     )
 
     total_losses = torch.zeros((sensor_subsets.size(0),))
-    total_mse = torch.zeros((sensor_subsets.size(0),))
-    loc_corr = torch.zeros((sensor_subsets.size(0),))
+    total_mse    = torch.zeros((sensor_subsets.size(0),))
+    tkr_hits = tkr_total = 0
 
     for x, y in val_dl:
         y_dmg, y_loc = y.max(-1, keepdim=True)
         y_loc = y_loc[:, 0]
 
         y_hat_dmg, i_dmg, y_hat_loc, i_loc = model[2](model[:2](x.float()), False)
+
+        # ---- full-sensor predictions for top_k_recall ----------------------
+        # i_dmg / i_loc are softmax-normalised over all S sensors already
+        dmg_pred_full = (y_hat_dmg * i_dmg).sum(-1)           # (B, 1)
+        loc_pred_full = (y_hat_loc * i_loc).sum(-1)            # (B, L)
+        loc_probs     = loc_pred_full.softmax(-1)              # (B, L)
+        y_pres        = y > PRESENCE_NORM_THRESH               # (B, L) bool
+        k_true        = y_pres.sum(-1)                         # (B,)
+        for b in range(y.size(0)):
+            K = int(k_true[b].item())
+            if K == 0:
+                continue
+            topk_mask = torch.zeros(y.size(-1), dtype=torch.bool, device=y.device)
+            topk_mask[loc_probs[b].topk(K).indices] = True
+            tkr_hits  += int((topk_mask & y_pres[b]).sum())
+            tkr_total += K
+
+        # ---- subset-based loss and map_mse ---------------------------------
         y_hat_dmg, y_hat_loc = y_hat_dmg[..., sensor_subsets], y_hat_loc[..., sensor_subsets]
         i_dmg, i_loc = i_dmg[..., sensor_subsets], i_loc[..., sensor_subsets]
         i_dmg = i_dmg / (i_dmg.sum(-1, keepdim=True) + EPS)
@@ -154,9 +178,7 @@ def val_one_epoch(
                 y_dmg[..., None].expand(-1, -1, dmg_preds.size(-1)),
                 reduction="none",
             )
-            .mean(1)
-            .sum(0)
-            .cpu()
+            .mean(1).sum(0).cpu()
         )
         l_loc = (
             F.cross_entropy(
@@ -164,31 +186,20 @@ def val_one_epoch(
                 y_loc[..., None].expand(-1, loc_preds.size(-1)),
                 reduction="none",
             )
-            .sum(0)
-            .cpu()
+            .sum(0).cpu()
         )
         total_losses += l_dmg + l_loc
 
-        distributed_pred = (dmg_preds.add(1).div(2) * loc_preds.softmax(1)).mul(2).sub(1)
-        total_mse += (
-            F.mse_loss(
-                distributed_pred,
-                y[..., None].expand(-1, -1, dmg_preds.size(-1)),
-                reduction="none",
-            )
-            .mean(1)
-            .sum(0)
-            .cpu()
-        )
-
-        loc_corr += (loc_preds.argmax(1) == y_loc[:, None]).sum(0).cpu()
+        # map_mse in [0, 1] space — consistent with metrics.py
+        dist_map = distributed_map_v1(dmg_preds, loc_preds)    # (B, L, N)
+        total_mse += map_mse(dist_map, y).cpu()                # (N,)
 
     model.load_state_dict(state)
     denom = len(val_dl.dataset)
     return (
         torch.median(total_losses).item() / denom,
         torch.median(total_mse).item() / denom,
-        torch.median(loc_corr).item() / denom,
+        tkr_hits / max(tkr_total, 1),
     )
 
 
@@ -210,19 +221,18 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None):
         train_loss = train_one_epoch(model, opt, sched, train_dl, accel, ema)
         train_losses.append(train_loss)
         epoch_bar.set_description(
-            f"Train Loss: {train_loss:10.04e}, Val Loss: {val_loss:10.04e} | Val MSE: {val_mse:10.04e} | Val Acc: {val_acc:5.02f}%"
+            f"Train {train_loss:.3e} | Val {val_loss:.3e} | MSE {val_mse:.3e} | TKR {val_acc:.3f}"
         )
 
         val_loss, val_mse, val_acc = val_one_epoch(
             model, val_dl, DEFAULT_VAL_SUBSET_SIZE
         )
-        val_acc *= PERCENT_SCALE
         val_mses.append(val_mse)
         val_accs.append(val_acc)
         val_losses.append(val_loss)
 
         epoch_bar.set_description(
-            f"Train Loss: {train_loss:10.04e}, Val Loss: {val_loss:10.04e} | Val MSE: {val_mse:10.04e} | Val Acc: {val_acc:5.02f}%"
+            f"Train {train_loss:.3e} | Val {val_loss:.3e} | MSE {val_mse:.3e} | TKR {val_acc:.3f}"
         )
 
     # Return the (possibly accelerator-prepared) model so callers can save

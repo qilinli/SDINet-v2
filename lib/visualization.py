@@ -11,6 +11,7 @@ def plot_training_results(
     *,
     save_dir: str | Path = "saved_results",
     show: bool = True,
+    val_acc_label: str = "Val top-k recall",
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -40,7 +41,7 @@ def plot_training_results(
         fig, ax = plt.subplots(figsize=(6, 1.8))
         ax.plot(val_accs, color="blue", linewidth=0.8)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Val Acc (%)")
+        ax.set_ylabel(val_acc_label)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(save_dir / "val_accuracy.png", dpi=200)

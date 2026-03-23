@@ -100,6 +100,7 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
     plot_training_results(
         train_losses, val_losses, val_f1s, val_mses,
         save_dir=cfg.save_dir, show=cfg.show_plots,
+        val_acc_label="Val F1",
     )
 
     from lib.testing import eval_on_loader_b, do_real_test_b
