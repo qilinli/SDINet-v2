@@ -40,11 +40,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 #   inverse:     physical = (normalized + 1) * DAMAGE_PHYSICAL_SCALE
 # ---------------------------------------------------------------------------
 DAMAGE_PHYSICAL_SCALE: float = 0.15
+# Approach-B severity target: y_sev = (y_norm + 1) / 2 = raw / 0.30
+# Inverse: raw_physical = severity * SEVERITY_PHYSICAL_SCALE
+SEVERITY_PHYSICAL_SCALE: float = 2.0 * DAMAGE_PHYSICAL_SCALE  # 0.30
 
 
 def normalized_damage_to_physical(normalized: torch.Tensor) -> torch.Tensor:
     """Map model damage output (normalized) back to physical damage units."""
     return (normalized + 1.0) * DAMAGE_PHYSICAL_SCALE
+
+
+def severity_to_physical(severity: torch.Tensor) -> torch.Tensor:
+    """Map Approach-B severity output (sigmoid ∈ [0,1]) to physical damage units."""
+    return severity * SEVERITY_PHYSICAL_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +175,83 @@ def do_real_test(
     return result
 
 
+def do_real_test_b(
+    model: torch.nn.Module,
+    *,
+    device: str | torch.device | None = None,
+    mat_path: str | Path | None = None,
+    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
+    print_result: bool = True,
+) -> dict[str, float | int]:
+    """
+    Run the benchmark forward pass for an Approach-B model (MidnB head).
+
+    Approach-B outputs ``(presence_logits, severity)`` both of shape ``(B, L)``
+    instead of v1's scalar damage + 70-dim location pair.  The combined damage
+    map is ``sigmoid(presence_logits) * severity * SEVERITY_PHYSICAL_SCALE``.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    test_data, test_target = load_real_test_tensors(mat_path, spec=spec)
+    x = test_data[None, None, ...].to(device)
+
+    with torch.inference_mode():
+        model = model.to(device)
+        model.eval()
+        presence_logits, severity = model(x)
+
+    # (1, L) → (L,)
+    presence_logits_sq = presence_logits.squeeze()
+    severity_sq = severity.squeeze()
+
+    presence_prob = torch.sigmoid(presence_logits_sq)   # (L,)  ∈ [0, 1]
+    # damage map in physical units: presence_prob * severity * 0.30
+    damage_map = presence_prob * severity_to_physical(severity_sq)  # (L,)
+
+    test_target_sq = test_target.squeeze()
+    gt_dmg = test_target_sq.max().item()
+    gt_loc = test_target_sq.argmax().item()
+
+    loc_argmax = damage_map.argmax().item()
+    dmg_pred_f = damage_map[loc_argmax].item()
+    dmg_at_gt = damage_map[gt_loc].item()
+
+    # Soft assignment MSE: damage map vs physical target
+    rw_err_s = ((damage_map.cpu() - test_target_sq.cpu()) ** 2).mean().item()
+
+    # Hard assignment: concentrate all predicted damage at argmax location
+    hard = torch.zeros_like(test_target_sq)
+    hard[loc_argmax] = dmg_pred_f
+    rw_err_h = ((hard.cpu() - test_target_sq.cpu()) ** 2).mean().item()
+
+    rw_mse = (dmg_at_gt - spec.reference_scalar_damage) ** 2
+
+    result: dict[str, float | int] = {
+        "rw_mse": rw_mse,
+        "rw_err_s": rw_err_s,
+        "rw_err_h": rw_err_h,
+        "dmg_pred": dmg_pred_f,
+        "dmg_at_gt_loc": dmg_at_gt,
+        "loc_argmax": loc_argmax,
+        "gt_dmg": gt_dmg,
+        "gt_loc": gt_loc,
+        "presence_at_gt": presence_prob[gt_loc].item(),
+        "severity_at_gt": severity_sq[gt_loc].item(),
+    }
+
+    if print_result:
+        print(
+            f"Pred {dmg_pred_f:7.04f} @ {loc_argmax:d} | "
+            f"GT {gt_dmg:7.04f} @ {gt_loc:d} | "
+            f"Dmg@GT {dmg_at_gt:7.04f} (P={result['presence_at_gt']:.3f}, S={result['severity_at_gt']:.3f}) | "
+            f"MSE: {rw_mse:10.04e} | rw_err_s: {rw_err_s:10.04e}"
+        )
+
+    return result
+
+
 def load_model_from_checkpoint(
     checkpoint_path: str | Path,
     *,
@@ -211,6 +296,49 @@ def do_real_test_from_checkpoint(
         checkpoint_path, device=device, model_cfg=model_cfg
     )
     return do_real_test(
+        model,
+        device=device,
+        mat_path=mat_path,
+        spec=spec,
+        print_result=print_result,
+    )
+
+
+def load_model_b_from_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: str | torch.device | None = None,
+    model_cfg=None,
+) -> torch.nn.Module:
+    """Load an Approach-B (MidnB) checkpoint and return a ready-to-run model."""
+    from lib.model import ModelConfigB, build_model
+
+    if model_cfg is None:
+        model_cfg = ModelConfigB()
+
+    model = build_model(model_cfg)
+    state = torch.load(str(checkpoint_path), map_location="cpu")
+    model.load_state_dict(state)
+
+    if device is not None:
+        model = model.to(device)
+    return model
+
+
+def do_real_test_b_from_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: str | torch.device | None = None,
+    mat_path: str | Path | None = None,
+    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
+    model_cfg=None,
+    print_result: bool = True,
+) -> dict[str, float | int]:
+    """Convenience wrapper: load Approach-B checkpoint -> run `do_real_test_b`."""
+    model = load_model_b_from_checkpoint(
+        checkpoint_path, device=device, model_cfg=model_cfg
+    )
+    return do_real_test_b(
         model,
         device=device,
         mat_path=mat_path,

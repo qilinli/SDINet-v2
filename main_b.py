@@ -113,12 +113,12 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
     )
 
     if cfg.run_real_test:
-        from lib.testing import do_real_test
+        from lib.testing import do_real_test_b
         device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
-            do_real_test(trained_model, device=device, print_result=True)
+            do_real_test_b(trained_model, device=device, print_result=True)
         except (FileNotFoundError, OSError) as e:
-            print(f"[do_real_test] Skipping (missing benchmark .mat): {e}")
+            print(f"[do_real_test_b] Skipping (missing benchmark .mat): {e}")
 
 
 if __name__ == "__main__":
