@@ -1,6 +1,7 @@
 # Python cache
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
 
 # Vscode cache
 .vscode/
@@ -12,8 +13,8 @@ data
 states/
 states
 
-saved_results/
-saved_results
+saved_results*/
+saved_results*
 
 # Optional: stray checkpoints
 *.pt
