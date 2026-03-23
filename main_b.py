@@ -43,7 +43,7 @@ class RunConfigB:
     # dataloaders
     data_root: str = "data/safetensors/unc=0"
     num_workers: int = 0
-    train_batch_size: int = 128
+    train_batch_size: int = 256
     eval_batch_size: int = 32
     split_seed: int = 42
 
@@ -103,13 +103,21 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
         val_acc_label="Val F1",
     )
 
+    from lib.data_safetensors import get_dataloaders
     from lib.testing import eval_on_loader_b, do_real_test_b
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("\n[test set]")
-    results = eval_on_loader_b(trained_model, test_dl, device)
-    for k, v in results.items():
-        print(f"  {k}: {v:.4f}")
+    _, _, test_single = get_dataloaders("single", cfg.snr, root=cfg.data_root,
+                                        num_workers=cfg.num_workers,
+                                        eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
+    _, _, test_double = get_dataloaders("double", cfg.snr, root=cfg.data_root,
+                                        num_workers=cfg.num_workers,
+                                        eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
+
+    for label, dl in [("single", test_single), ("double", test_double)]:
+        print(f"\n[test / {label}]")
+        for k, v in eval_on_loader_b(trained_model, dl, device).items():
+            print(f"  {k}: {v:.4f}")
 
     if cfg.run_real_test:
         print("\n[real benchmark]")
