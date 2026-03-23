@@ -9,6 +9,8 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import trange
 
+from lib.metrics import distributed_map_b, f1_from_counts, map_mse, presence_f1_stats
+
 # Training / evaluation defaults
 DEFAULT_DROP_NUM = 10
 DEFAULT_DROP_DEN = 65
@@ -240,4 +242,223 @@ def get_opt_and_sched(model, train_dl: DataLoader, epochs: int):
         opt, base_lr, epochs=epochs, steps_per_epoch=len(train_dl)
     )
     return opt, sched
+
+
+# ===========================================================================
+# Approach-B (multi-damage) training and evaluation
+# ===========================================================================
+
+def train_one_epoch_b(
+    model,
+    opt,
+    sched,
+    train_dl: DataLoader,
+    accel: Accelerator,
+    criterion,
+    ema=None,
+) -> tuple[float, float, float]:
+    """
+    One training epoch for the B-head model.
+
+    Args:
+        criterion: :class:`~lib.losses.PresenceSeverityLoss` instance.
+
+    Returns:
+        (avg_total_loss, avg_bce_loss, avg_sev_loss) over the epoch.
+        The BCE and severity components are logged separately for diagnosing
+        which part of the loss dominates (useful for tuning ``pos_weight``
+        and ``severity_weight``).
+    """
+    model.train()
+    accum_total = accum_bce = accum_sev = 0.0
+
+    for x, y in train_dl:
+        opt.zero_grad()
+        with accel.autocast():
+            x = randomise_bag_size(x)
+            presence_logits, severity = model(x)              # (B, L), (B, L)
+            total, bce, sev = criterion(presence_logits, severity, y)
+            if ema is not None:
+                ema.update_parameters(model)
+        accel.backward(total)
+        opt.step()
+        sched.step()
+        accum_total += total.item()
+        accum_bce   += bce.item()
+        accum_sev   += sev.item()
+
+    n = len(train_dl)
+    return accum_total / n, accum_bce / n, accum_sev / n
+
+
+@torch.inference_mode()
+def val_one_epoch_b(
+    model,
+    val_dl: DataLoader,
+    criterion,
+    subset_size: int = DEFAULT_VAL_SUBSET_SIZE,
+) -> tuple[float, float, float]:
+    """
+    Validation epoch for the B-head model with sensor-failure robustness eval.
+
+    Evaluation strategy (mirrors v1's ``val_one_epoch``):
+    - Sensor subsets are generated deterministically (same seed as v1).
+    - For each batch, the per-sensor outputs (``reduce=False``) are indexed
+      into N=51 sensor subsets of size C=10.  Importance weights are
+      renormalised within each subset (over the C dim), then aggregated.
+    - Per-subset map MSE is accumulated and the median is taken — reflecting
+      typical performance under sensor failure rather than best or worst case.
+    - Presence F1 is computed on the *full-sensor* (all 65 sensors) prediction
+      since F1 is a detection metric independent of sensor-failure robustness.
+
+    Returns:
+        (val_loss, val_map_mse, val_f1)
+        - val_loss:    Median subset BCE loss / dataset size  (convergence signal)
+        - val_map_mse: Median subset distributed-map MSE / dataset size
+                       (main comparison metric — comparable to v1's val_mse)
+        - val_f1:      Full-sensor presence F1
+    """
+    model.eval()
+    state = deepcopy(model.state_dict())
+
+    sensor_subsets = gen_sensor_subsets(
+        DEFAULT_VAL_SUBSET_COUNT,
+        subset_size=subset_size,
+        total_sensors=DEFAULT_VAL_NUM_SENSORS,
+    )  # (C=10, N=51)
+    N = sensor_subsets.size(1)
+
+    # Move to model device once before the loop.
+    device = next(model.parameters()).device
+    sensor_subsets = sensor_subsets.to(device)
+    pos_weight     = criterion.pos_weight.to(device)
+
+    total_losses = torch.zeros(N)   # (N,) accumulated subset loss
+    total_mse    = torch.zeros(N)   # (N,) accumulated subset map MSE
+    tp_acc = fp_acc = fn_acc = 0    # full-sensor F1 accumulators
+
+    for x, y in val_dl:
+        y = y.to(device)
+        features = model[:2](x.float().to(device))    # (B, embed_dim, S=65)
+
+        # Per-sensor outputs — no sensor reduction yet
+        presence_raw, severity_raw, importance = model[2](features, reduce=False)
+        # presence_raw:  (B, L, S=65) — logits
+        # severity_raw:  (B, L, S=65) — sigmoid ∈ [0, 1]
+        # importance:    (B, L, S=65) — softmax over S
+
+        # ---- Full-sensor aggregation (used only for F1) -------------------
+        pres_full = (presence_raw * importance).sum(-1)   # (B, L)
+        tp, fp, fn = presence_f1_stats(pres_full, y)
+        tp_acc += tp.item(); fp_acc += fp.item(); fn_acc += fn.item()
+
+        # ---- Subset-based evaluation --------------------------------------
+        # Index sensor dim: (B, L, S)[..., (C, N)] → (B, L, C, N)
+        pres_sub = presence_raw[..., sensor_subsets]      # (B, L, C, N)
+        sev_sub  = severity_raw[..., sensor_subsets]      # (B, L, C, N)
+        imp_sub  = importance[..., sensor_subsets]         # (B, L, C, N)
+
+        # Renormalise importance within each subset (over C, dim=-2).
+        # This mirrors v1's renormalisation in val_one_epoch and ensures
+        # importance weights sum to 1 for every subset independently.
+        imp_sub = imp_sub / (imp_sub.sum(dim=-2, keepdim=True) + EPS)
+
+        # Weighted sum over C sensors → (B, L, N) per-subset predictions
+        pres_pred_n = (pres_sub * imp_sub).sum(dim=-2)    # (B, L, N)
+        sev_pred_n  = (sev_sub  * imp_sub).sum(dim=-2)    # (B, L, N)
+
+        # Distributed map MSE (main comparison metric)
+        dist_map_n = distributed_map_b(pres_pred_n, sev_pred_n)         # (B, L, N)
+        total_mse += map_mse(dist_map_n, y).cpu()                       # (N,)
+
+        # BCE per subset (loss convergence signal)
+        y_pres_n = (
+            y.unsqueeze(-1).expand(-1, -1, N) > criterion.presence_threshold
+        ).float()
+        bce_n = F.binary_cross_entropy_with_logits(
+            pres_pred_n,
+            y_pres_n,
+            pos_weight=pos_weight,
+            reduction="none",
+        ).mean(1).sum(0).cpu()                                           # (N,)
+        total_losses += bce_n
+
+    model.load_state_dict(state)
+    denom  = len(val_dl.dataset)
+    f1, _, _ = f1_from_counts(tp_acc, fp_acc, fn_acc)
+    return (
+        torch.median(total_losses).item() / denom,
+        torch.median(total_mse).item() / denom,
+        f1,
+    )
+
+
+def do_training_b(
+    model,
+    opt,
+    sched,
+    train_dl: DataLoader,
+    val_dl: DataLoader,
+    epochs: int,
+    criterion,
+    ema=None,
+):
+    """
+    Full training loop for the B-head model.
+
+    Return structure is parallel to :func:`do_training` so that the same
+    plotting and checkpointing code in ``main.py`` / ``main_b.py`` works
+    for both heads:
+
+    Returns:
+        (train_losses, val_losses, val_dl, val_f1s, val_mses, model)
+
+        - train_losses: per-epoch average total training loss
+        - val_losses:   per-epoch median subset val loss
+        - val_dl:       the validation DataLoader (pass-through, matches v1 API)
+        - val_f1s:      per-epoch full-sensor presence F1   (analogous to v1 val_accs)
+        - val_mses:     per-epoch median subset map MSE     (analogous to v1 val_mses)
+        - model:        the accelerator-prepared model
+
+    Additional loss components (bce / severity breakdown) are printed in the
+    progress bar but not returned; inspect ``train_bce_losses`` and
+    ``train_sev_losses`` via tqdm output or add them to the return if needed.
+    """
+    accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
+    model, opt, sched, train_dl, val_dl = accel.prepare(
+        model, opt, sched, train_dl, val_dl
+    )
+
+    train_losses: list[float] = []
+    val_losses:   list[float] = []
+    val_f1s:      list[float] = []
+    val_mses:     list[float] = []
+
+    val_loss = val_mse = float("inf")
+    val_f1 = train_loss = 0.0
+
+    epoch_bar = trange(epochs)
+    for _epoch in epoch_bar:
+        train_loss, bce, sev = train_one_epoch_b(
+            model, opt, sched, train_dl, accel, criterion, ema
+        )
+        train_losses.append(train_loss)
+        epoch_bar.set_description(
+            f"Train {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
+            f" | Val {val_loss:.3e} | MSE {val_mse:.3e} | F1 {val_f1:.3f}"
+        )
+
+        val_loss, val_mse, val_f1 = val_one_epoch_b(
+            model, val_dl, criterion, DEFAULT_VAL_SUBSET_SIZE
+        )
+        val_losses.append(val_loss)
+        val_mses.append(val_mse)
+        val_f1s.append(val_f1)
+
+        epoch_bar.set_description(
+            f"Train {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
+            f" | Val {val_loss:.3e} | MSE {val_mse:.3e} | F1 {val_f1:.3f}"
+        )
+
+    return train_losses, val_losses, val_dl, val_f1s, val_mses, model
 
