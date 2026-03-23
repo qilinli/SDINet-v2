@@ -40,19 +40,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 #   inverse:     physical = (normalized + 1) * DAMAGE_PHYSICAL_SCALE
 # ---------------------------------------------------------------------------
 DAMAGE_PHYSICAL_SCALE: float = 0.15
-# Approach-B severity target: y_sev = (y_norm + 1) / 2 = raw / 0.30
-# Inverse: raw_physical = severity * SEVERITY_PHYSICAL_SCALE
-SEVERITY_PHYSICAL_SCALE: float = 2.0 * DAMAGE_PHYSICAL_SCALE  # 0.30
 
 
 def normalized_damage_to_physical(normalized: torch.Tensor) -> torch.Tensor:
     """Map model damage output (normalized) back to physical damage units."""
     return (normalized + 1.0) * DAMAGE_PHYSICAL_SCALE
-
-
-def severity_to_physical(severity: torch.Tensor) -> torch.Tensor:
-    """Map Approach-B severity output (sigmoid ∈ [0,1]) to physical damage units."""
-    return severity * SEVERITY_PHYSICAL_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +94,17 @@ def load_real_test_tensors(
     return _load_benchmark_tensors_cached(str(path.resolve()))
 
 
+def _print_eval_results(results: dict[str, float]) -> None:
+    print(
+        f"map_mse={results['map_mse']:.4e}  "
+        f"top_k_recall={results['top_k_recall']:.3f}  "
+        f"AP={results['ap']:.3f}  "
+        f"F1={results['f1']:.3f}  "
+        f"severity_mae={results['severity_mae']:.4e}  "
+        f"mean_k_pred={results['mean_k_pred']:.1f} (true={results['mean_k_true']:.1f})"
+    )
+
+
 def do_real_test(
     model: torch.nn.Module,
     *,
@@ -109,15 +112,16 @@ def do_real_test(
     mat_path: str | Path | None = None,
     spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
     print_result: bool = True,
-) -> dict[str, float | int]:
+) -> dict[str, float]:
     """
-    Run the benchmark forward pass and return metrics (same keys as the notebook).
+    Run the benchmark forward pass for a v1 model and return ``evaluate_all_v1`` metrics.
 
-    Parameters
-    ----------
-    model
-        Trained network; **you** load weights before calling (this function does not).
+    The physical test target is converted to normalized space
+    (``y_norm = raw / 0.15 - 1``) before evaluation so that all metrics are
+    computed in the same label space as training.
     """
+    from lib.metrics import evaluate_all_v1
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
@@ -128,49 +132,16 @@ def do_real_test(
     with torch.inference_mode():
         model = model.to(device)
         model.eval()
-        dmg_pred, loc_pred = model(x)
+        dmg_pred, loc_pred = model(x)   # (1, 1), (1, L)
 
-    dmg_pred_norm = dmg_pred.squeeze()
-    dmg_pred_f = normalized_damage_to_physical(dmg_pred_norm).item()
+    y_norm = (
+        test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0
+    ).unsqueeze(0)  # (1, L)
 
-    loc_pred_sq = loc_pred.squeeze()
-    loc_nll = -(
-        loc_pred_sq.log_softmax(-1)[spec.location_class_for_nll].item()
-    )
-    max_nll = -(loc_pred_sq.log_softmax(-1).max().item())
-
-    # Soft assignment: distribute predicted damage across all locations by probability.
-    smooth = dmg_pred_f * loc_pred_sq.softmax(-1)
-    # Hard assignment: place all predicted damage at the single most likely location.
-    hard = torch.zeros_like(test_target.squeeze())
-    hard[loc_pred_sq.argmax().item()] = dmg_pred_f
-
-    test_target_sq = test_target.squeeze()
-    gt_dmg = test_target_sq.max().item()
-    gt_loc = test_target_sq.argmax().item()
-    rw_mse = (dmg_pred_f - spec.reference_scalar_damage) ** 2
-    rw_err_s = ((smooth.cpu() - test_target_sq.cpu()) ** 2).mean().item()
-    rw_err_h = ((hard.cpu() - test_target_sq.cpu()) ** 2).mean().item()
-
-    result: dict[str, float | int] = {
-        "rw_mse": rw_mse,
-        "rw_nll": loc_nll,
-        "rw_err_s": rw_err_s,
-        "rw_err_h": rw_err_h,
-        "dmg_pred": dmg_pred_f,
-        "loc_argmax": loc_pred_sq.argmax().item(),
-        "gt_dmg": gt_dmg,
-        "gt_loc": gt_loc,
-        "best_nll": max_nll,
-    }
+    result = evaluate_all_v1(dmg_pred, loc_pred, y_norm)
 
     if print_result:
-        print(
-            f"Pred {dmg_pred_f:7.04f} @ {result['loc_argmax']:d} | "
-            f"GT {gt_dmg:7.04f} @ {gt_loc:d} | "
-            f"MSE: {rw_mse:10.04e}, NLL: {loc_nll:10.04e} "
-            f"(best: {max_nll:10.04e})"
-        )
+        _print_eval_results(result)
 
     return result
 
@@ -182,14 +153,16 @@ def do_real_test_b(
     mat_path: str | Path | None = None,
     spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
     print_result: bool = True,
-) -> dict[str, float | int]:
+) -> dict[str, float]:
     """
-    Run the benchmark forward pass for an Approach-B model (MidnB head).
+    Run the benchmark forward pass for an Approach-B model and return
+    ``evaluate_all`` metrics.
 
-    Approach-B outputs ``(presence_logits, severity)`` both of shape ``(B, L)``
-    instead of v1's scalar damage + 70-dim location pair.  The combined damage
-    map is ``sigmoid(presence_logits) * severity * SEVERITY_PHYSICAL_SCALE``.
+    The physical test target is converted to normalized space
+    (``y_norm = raw / 0.15 - 1``) before evaluation.
     """
+    from lib.metrics import evaluate_all
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
@@ -200,54 +173,16 @@ def do_real_test_b(
     with torch.inference_mode():
         model = model.to(device)
         model.eval()
-        presence_logits, severity = model(x)
+        presence_logits, severity = model(x)   # (1, L), (1, L)
 
-    # (1, L) → (L,)
-    presence_logits_sq = presence_logits.squeeze()
-    severity_sq = severity.squeeze()
+    y_norm = (
+        test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0
+    ).unsqueeze(0)  # (1, L)
 
-    presence_prob = torch.sigmoid(presence_logits_sq)   # (L,)  ∈ [0, 1]
-    # damage map in physical units: presence_prob * severity * 0.30
-    damage_map = presence_prob * severity_to_physical(severity_sq)  # (L,)
-
-    test_target_sq = test_target.squeeze()
-    gt_dmg = test_target_sq.max().item()
-    gt_loc = test_target_sq.argmax().item()
-
-    loc_argmax = damage_map.argmax().item()
-    dmg_pred_f = damage_map[loc_argmax].item()
-    dmg_at_gt = damage_map[gt_loc].item()
-
-    # Soft assignment MSE: damage map vs physical target
-    rw_err_s = ((damage_map.cpu() - test_target_sq.cpu()) ** 2).mean().item()
-
-    # Hard assignment: concentrate all predicted damage at argmax location
-    hard = torch.zeros_like(test_target_sq)
-    hard[loc_argmax] = dmg_pred_f
-    rw_err_h = ((hard.cpu() - test_target_sq.cpu()) ** 2).mean().item()
-
-    rw_mse = (dmg_at_gt - spec.reference_scalar_damage) ** 2
-
-    result: dict[str, float | int] = {
-        "rw_mse": rw_mse,
-        "rw_err_s": rw_err_s,
-        "rw_err_h": rw_err_h,
-        "dmg_pred": dmg_pred_f,
-        "dmg_at_gt_loc": dmg_at_gt,
-        "loc_argmax": loc_argmax,
-        "gt_dmg": gt_dmg,
-        "gt_loc": gt_loc,
-        "presence_at_gt": presence_prob[gt_loc].item(),
-        "severity_at_gt": severity_sq[gt_loc].item(),
-    }
+    result = evaluate_all(presence_logits, severity, y_norm)
 
     if print_result:
-        print(
-            f"Pred {dmg_pred_f:7.04f} @ {loc_argmax:d} | "
-            f"GT {gt_dmg:7.04f} @ {gt_loc:d} | "
-            f"Dmg@GT {dmg_at_gt:7.04f} (P={result['presence_at_gt']:.3f}, S={result['severity_at_gt']:.3f}) | "
-            f"MSE: {rw_mse:10.04e} | rw_err_s: {rw_err_s:10.04e}"
-        )
+        _print_eval_results(result)
 
     return result
 

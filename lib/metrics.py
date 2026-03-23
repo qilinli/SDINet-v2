@@ -239,6 +239,103 @@ def severity_mae_at_detected(
 
 
 @torch.no_grad()
+def evaluate_all_v1(
+    dmg_pred: Tensor,
+    loc_pred: Tensor,
+    y_norm: Tensor,
+    k: int | None = None,
+    presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+) -> dict[str, float]:
+    """
+    Compute the evaluation suite for the v1 head using the same metric keys
+    as :func:`evaluate_all`.
+
+    v1 predicts a single global damage scalar (``dmg_pred``, tanh-activated)
+    and raw location logits (``loc_pred``).  The adaptation to the shared
+    metric interface is:
+
+    - ``map_mse``:      :func:`distributed_map_v1` in [0, 1] space.
+    - Localization:     ``softmax(loc_pred)`` used as per-location presence
+                        scores for ``top_k_recall`` and ``ap`` — natural for a
+                        single-damage softmax head.
+    - ``severity_mae``: scalar ``(dmg_pred + 1) / 2`` broadcast to all L
+                        locations (v1 has no per-location severity).
+    - ``f1`` / ``precision`` / ``recall``: ``sigmoid(loc_pred) > 0.5`` for
+                        API consistency; prefer ``top_k_recall`` and ``ap``
+                        for v1 comparisons.
+
+    Args:
+        dmg_pred: (B, 1) tanh-activated global damage scalar
+        loc_pred: (B, L) raw location logits
+        y_norm:   (B, L) normalized ground-truth labels ∈ [-1, 1]
+        k:        Fixed K for top-K metrics. None = use true K per sample.
+        presence_norm_thresh: Threshold separating undamaged from damaged labels.
+    """
+    dist_map  = distributed_map_v1(dmg_pred, loc_pred)   # (B, L) in [0, 1]
+    target_01 = (y_norm + 1.0) / 2.0
+    mse = F.mse_loss(dist_map, target_01).item()
+
+    # Softmax probabilities as presence scores (natural for v1 single-damage head)
+    loc_probs   = loc_pred.softmax(dim=-1)                # (B, L)
+    y_pres_bool = y_norm > presence_norm_thresh
+    k_true_per  = y_pres_bool.sum(dim=-1).float()
+
+    # Top-K recall using softmax ranking
+    if k is None:
+        hits = total_pos = 0
+        for b in range(y_norm.size(0)):
+            K = int(k_true_per[b].item())
+            if K == 0:
+                continue
+            topk_idx  = loc_probs[b].topk(K).indices
+            topk_mask = torch.zeros(y_norm.size(1), dtype=torch.bool, device=y_norm.device)
+            topk_mask[topk_idx] = True
+            hits      += int((topk_mask & y_pres_bool[b]).sum())
+            total_pos += K
+        tkr = hits / max(total_pos, 1)
+    else:
+        topk_mask = torch.zeros_like(loc_probs, dtype=torch.bool)
+        topk_mask.scatter_(-1, loc_probs.topk(k, dim=-1).indices, True)
+        tkr = (
+            (topk_mask & y_pres_bool).sum().float()
+            / y_pres_bool.sum().float().clamp(min=1.0)
+        ).item()
+
+    # AP using softmax probabilities
+    probs_np  = loc_probs.cpu().numpy().ravel()
+    labels_np = y_pres_bool.cpu().numpy().ravel().astype(int)
+    ap = float(average_precision_score(labels_np, probs_np))
+
+    # Severity MAE: broadcast scalar damage to all locations
+    sev_broadcast = ((dmg_pred + 1.0) / 2.0).expand_as(loc_pred)   # (B, L)
+    sev_mae = severity_mae_at_detected(
+        loc_pred, sev_broadcast, y_norm,
+        k=k, presence_norm_thresh=presence_norm_thresh,
+    )
+
+    # F1 using sigmoid(loc_pred) for API consistency with evaluate_all
+    tp, fp, fn    = presence_f1_stats(loc_pred, y_norm,
+                                      presence_norm_thresh=presence_norm_thresh)
+    f1, prec, rec = f1_from_counts(tp, fp, fn)
+
+    pred_pres   = torch.sigmoid(loc_pred) > 0.5
+    mean_k_pred = pred_pres.sum(dim=-1).float().mean().item()
+    mean_k_true = k_true_per.mean().item()
+
+    return {
+        "map_mse":      mse,
+        "top_k_recall": tkr,
+        "severity_mae": sev_mae,
+        "ap":           ap,
+        "f1":           f1,
+        "precision":    prec,
+        "recall":       rec,
+        "mean_k_pred":  mean_k_pred,
+        "mean_k_true":  mean_k_true,
+    }
+
+
+@torch.no_grad()
 def evaluate_all(
     presence_logits: Tensor,
     severity: Tensor,
