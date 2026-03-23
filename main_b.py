@@ -1,18 +1,15 @@
 """
-main_b.py — entry point for Approach-B (multi-damage) training.
+main_b.py — Approach-B (multi-damage) training on single+double combined data.
 
-Parallel to main.py (v1 single-damage).  The key differences:
-  - Uses ModelConfigB → MidnB head (presence + severity per location)
-  - Uses PresenceSeverityLoss instead of MSE + cross-entropy
-  - Calls do_training_b / val_one_epoch_b which report F1 instead of loc accuracy
-  - Checkpoints saved under 'multi-damage-B-<uuid>.pt'
+Trains MidnB (presence + severity per location) on the union of the single-
+and double-damage subsets.  Val loss, map_mse and F1 are recorded every epoch
+and saved as training curves.  A full evaluate_all metric report is printed
+on the held-out test split and the real .mat benchmark after training.
 
-To run a quick comparison:
-    python main.py     # v1 baseline
-    python main_b.py   # v2 Approach-B
+Usage::
 
-Both write comparable val_mse (distributed-map MSE) to the plots so you can
-overlay them for ablation.
+    python main_b.py            # 200 epochs (default)
+    python main_b.py --epochs 50
 """
 from __future__ import annotations
 
@@ -22,7 +19,7 @@ from uuid import uuid4
 
 import torch
 
-# --- server compatibility overrides (same as main.py) ---
+# --- server compatibility overrides ---
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 torch._dynamo.config.disable = True
@@ -32,7 +29,7 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
 
-from lib.data_safetensors import get_dataloaders
+from lib.data_safetensors import get_combined_dataloaders
 from lib.model import ModelConfigB, build_criterion_b, build_model
 from lib.training import do_training_b, get_opt_and_sched
 from lib.visualization import plot_training_results
@@ -40,8 +37,6 @@ from lib.visualization import plot_training_results
 
 @dataclass(frozen=True)
 class RunConfigB:
-    # dataset
-    subset_name: str = "double"   # "single" | "double" — use double for multi-damage
     snr: float = -1.0
     epochs: int = 200
 
@@ -58,17 +53,16 @@ class RunConfigB:
     save_uuid_checkpoint: bool = True
     run_real_test: bool = True
 
-    # --- model / loss knobs ---
-    # pos_weight: BCE positive-class weight.
-    #   Single-damage (K=1): (70-1)/1 = 69.
-    #   Double-damage (K=2): (70-2)/2 = 34.  Adjust to match your subset.
-    presence_pos_weight: float = 34.0
+    # loss knobs
+    # pos_weight rule of thumb: (L - K_mean) / K_mean
+    # Combined single+double → mean K ≈ 1.5 → (70 - 1.5) / 1.5 ≈ 45.7
+    presence_pos_weight: float = 45.7
     severity_weight: float = 1.0
 
 
 def main(cfg: RunConfigB = RunConfigB()) -> None:
-    train_dl, val_dl, test_dl = get_dataloaders(
-        cfg.subset_name,
+    train_dl, val_dl, test_dl = get_combined_dataloaders(
+        ["single", "double"],
         cfg.snr,
         root=cfg.data_root,
         num_workers=cfg.num_workers,
@@ -92,41 +86,41 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
     opt, sched = get_opt_and_sched(model, train_dl, cfg.epochs)
 
     train_losses, val_losses, _eval_dl, val_f1s, val_mses, trained_model = do_training_b(
-        model, opt, sched, train_dl, test_dl, cfg.epochs, criterion, ema=ema
+        model, opt, sched, train_dl, val_dl, cfg.epochs, criterion, ema=ema
     )
 
     if cfg.save_uuid_checkpoint:
         states_dir = Path("states")
         states_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = states_dir / f"b-{cfg.subset_name}-{uuid4()}.pt"
+        ckpt_path = states_dir / f"b-combined-{uuid4()}.pt"
         torch.save(trained_model.state_dict(), ckpt_path)
         print(f"[checkpoint] Saved: {ckpt_path}")
 
-    # val_f1s plays the role of val_accs in main.py — same plot layout
+    # val_f1s plays the role of val_accs — same plot layout as main.py
     plot_training_results(
-        train_losses,
-        val_losses,
-        val_f1s,    # ← F1 instead of location accuracy
-        val_mses,
-        save_dir=cfg.save_dir,
-        show=cfg.show_plots,
+        train_losses, val_losses, val_f1s, val_mses,
+        save_dir=cfg.save_dir, show=cfg.show_plots,
     )
 
+    from lib.testing import eval_on_loader_b, do_real_test_b
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("\n[test set]")
+    results = eval_on_loader_b(trained_model, test_dl, device)
+    for k, v in results.items():
+        print(f"  {k}: {v:.4f}")
+
     if cfg.run_real_test:
-        from lib.testing import do_real_test_b
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("\n[real benchmark]")
         try:
             do_real_test_b(trained_model, device=device, print_result=True)
         except (FileNotFoundError, OSError) as e:
-            print(f"[do_real_test_b] Skipping (missing benchmark .mat): {e}")
+            print(f"  Skipping (missing benchmark .mat): {e}")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Train SDINet Approach-B")
-    parser.add_argument("--subset", default="double", choices=["single", "double"])
+    parser = argparse.ArgumentParser(description="Train SDINet Approach-B on single+double combined")
     parser.add_argument("--epochs", type=int, default=200)
     args = parser.parse_args()
-    # pos_weight rule of thumb: (L - K) / K  where L=70
-    pos_weight = 69.0 if args.subset == "single" else 34.0
-    main(RunConfigB(subset_name=args.subset, epochs=args.epochs, presence_pos_weight=pos_weight))
+    main(RunConfigB(epochs=args.epochs))

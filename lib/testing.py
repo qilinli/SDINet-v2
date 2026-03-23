@@ -174,6 +174,50 @@ def do_real_test_b(
     return result
 
 
+@torch.inference_mode()
+def eval_on_loader_v1(
+    model: torch.nn.Module,
+    dl,
+    device: torch.device | str | None = None,
+) -> dict[str, float]:
+    """Run ``evaluate_all_v1`` on every batch in *dl* and return aggregated metrics."""
+    from lib.metrics import evaluate_all_v1
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+    model = model.to(device)
+    model.eval()
+
+    D, L, Y = [], [], []
+    for x, y in dl:
+        d, l = model(x.to(device))
+        D.append(d.cpu()); L.append(l.cpu()); Y.append(y.cpu())
+    return evaluate_all_v1(torch.cat(D), torch.cat(L), torch.cat(Y))
+
+
+@torch.inference_mode()
+def eval_on_loader_b(
+    model: torch.nn.Module,
+    dl,
+    device: torch.device | str | None = None,
+) -> dict[str, float]:
+    """Run ``evaluate_all`` on every batch in *dl* and return aggregated metrics."""
+    from lib.metrics import evaluate_all
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+    model = model.to(device)
+    model.eval()
+
+    P, S, Y = [], [], []
+    for x, y in dl:
+        p, s = model(x.to(device))
+        P.append(p.cpu()); S.append(s.cpu()); Y.append(y.cpu())
+    return evaluate_all(torch.cat(P), torch.cat(S), torch.cat(Y))
+
+
 def _print_eval_results(results: dict[str, float]) -> None:
     print(
         f"map_mse={results['map_mse']:.4e}  "

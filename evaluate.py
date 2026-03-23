@@ -30,10 +30,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from lib.data_safetensors import get_dataloaders
-from lib.metrics import evaluate_all, evaluate_all_v1
 from lib.testing import (
     do_real_test,
     do_real_test_b,
+    eval_on_loader_v1,
+    eval_on_loader_b,
     load_model_from_checkpoint,
     load_model_b_from_checkpoint,
 )
@@ -49,34 +50,6 @@ METRICS = [
     "mean_k_pred",
     "mean_k_true",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Dataset evaluation helpers
-# ---------------------------------------------------------------------------
-
-@torch.inference_mode()
-def eval_v1_on_loader(
-    model: torch.nn.Module, dl: DataLoader, device: torch.device
-) -> dict[str, float]:
-    model.eval()
-    D, L, Y = [], [], []
-    for x, y in dl:
-        d, l = model(x.to(device))
-        D.append(d.cpu()); L.append(l.cpu()); Y.append(y.cpu())
-    return evaluate_all_v1(torch.cat(D), torch.cat(L), torch.cat(Y))
-
-
-@torch.inference_mode()
-def eval_b_on_loader(
-    model: torch.nn.Module, dl: DataLoader, device: torch.device
-) -> dict[str, float]:
-    model.eval()
-    P, S, Y = [], [], []
-    for x, y in dl:
-        p, s = model(x.to(device))
-        P.append(p.cpu()); S.append(s.cpu()); Y.append(y.cpu())
-    return evaluate_all(torch.cat(P), torch.cat(S), torch.cat(Y))
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +78,11 @@ def run_evaluation(
     *_, test_double = get_dataloaders("double", snr, root=data_root, num_workers=0, seed=seed)
 
     return {
-        "v1/single": eval_v1_on_loader(model_v1, test_single, device),
-        "v1/double": eval_v1_on_loader(model_v1, test_double, device),
+        "v1/single": eval_on_loader_v1(model_v1, test_single, device),
+        "v1/double": eval_on_loader_v1(model_v1, test_double, device),
         "v1/real":   do_real_test(model_v1, device=device, print_result=False),
-        "B/single":  eval_b_on_loader(model_b,  test_single, device),
-        "B/double":  eval_b_on_loader(model_b,  test_double, device),
+        "B/single":  eval_on_loader_b(model_b,  test_single, device),
+        "B/double":  eval_on_loader_b(model_b,  test_double, device),
         "B/real":    do_real_test_b(model_b, device=device, print_result=False),
     }
 

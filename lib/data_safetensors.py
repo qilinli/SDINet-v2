@@ -64,6 +64,57 @@ def target_preprocess(data) -> npt.NDArray[np.float32]:
     return data.get_tensor("target").astype(np.float32) / 0.15 - 1
 
 
+def get_combined_dataloaders(
+    subset_names: list[str],
+    snr: float = 0.0,
+    *,
+    root: str | Path = "data/safetensors/unc=0",
+    num_workers: int = 0,
+    train_batch_size: int = 128,
+    eval_batch_size: int = 32,
+    seed: int = 42,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Build train / val / test DataLoaders from multiple subsets combined.
+
+    Each subset is split independently (70 / 15 / 15) with the same seed
+    before concatenation, so the splits are reproducible and there is no
+    leakage between train and eval across subsets.
+    """
+    from torch.utils.data import ConcatDataset
+
+    root = Path(root)
+    train_parts, val_parts, test_parts = [], [], []
+
+    for name in subset_names:
+        ds_root = root / name
+        train_ds = SafetensorsDataset(
+            ds_root, [lambda x: input_preprocess(x, snr=snr), target_preprocess]
+        )
+        val_ds = SafetensorsDataset(
+            ds_root, [lambda x: val_input_preprocess(x, snr=snr), target_preprocess]
+        )
+
+        indices = np.arange(len(train_ds))
+        train_idx, valtest_idx = train_test_split(indices, test_size=0.3, random_state=seed)
+        val_idx, test_idx = train_test_split(valtest_idx, test_size=0.5, random_state=seed)
+
+        train_parts.append(Subset(train_ds, train_idx))
+        val_parts.append(Subset(val_ds, val_idx))
+        test_parts.append(Subset(val_ds, test_idx))
+
+    train_dl = DataLoader(
+        ConcatDataset(train_parts), batch_size=train_batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_dl = DataLoader(
+        ConcatDataset(val_parts), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers
+    )
+    test_dl = DataLoader(
+        ConcatDataset(test_parts), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers
+    )
+    return train_dl, val_dl, test_dl
+
+
 def get_dataloaders(
     subset_name: str,
     snr: float = 0.0,
