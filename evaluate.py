@@ -78,7 +78,10 @@ def run_evaluation(
     model_b  = load_model_b_from_checkpoint(b_ckpt,  device=device)
 
     cal = load_calibration(b_ckpt)
-    b_label = f"B (T={cal['temperature']:.2f}, θ={cal['threshold']:.2f})"
+    if "ratio_alpha" in cal:
+        b_label = f"B (T={cal['temperature']:.2f}, α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
+    else:
+        b_label = f"B (T={cal['temperature']:.2f}, θ={cal['threshold']:.2f})"
     print(f"[calibration] B checkpoint: {b_label}")
 
     *_, test_single = get_dataloaders("single", snr, root=data_root, num_workers=0, seed=seed)

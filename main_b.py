@@ -106,7 +106,7 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
     )
 
     from lib.calibration import (
-        calibrate_b, save_calibration,
+        calibrate_b_ratio, save_calibration,
         eval_on_loader_b_calibrated, do_real_test_b_calibrated,
     )
     from lib.data_safetensors import get_dataloaders
@@ -125,7 +125,7 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
                                         num_workers=cfg.num_workers,
                                         eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
 
-    cal = calibrate_b(trained_model, [val_single, val_double], device)
+    cal = calibrate_b_ratio(trained_model, [val_single, val_double], device)
     if ckpt_path is not None:
         save_calibration(cal, ckpt_path)
 
