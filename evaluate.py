@@ -29,12 +29,15 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from lib.calibration import (
+    do_real_test_b_calibrated,
+    eval_on_loader_b_calibrated,
+    load_calibration,
+)
 from lib.data_safetensors import get_dataloaders
 from lib.testing import (
     do_real_test,
-    do_real_test_b,
     eval_on_loader_v1,
-    eval_on_loader_b,
     load_model_from_checkpoint,
     load_model_b_from_checkpoint,
 )
@@ -74,16 +77,20 @@ def run_evaluation(
     model_v1 = load_model_from_checkpoint(v1_ckpt, device=device)
     model_b  = load_model_b_from_checkpoint(b_ckpt,  device=device)
 
+    cal = load_calibration(b_ckpt)
+    b_label = f"B (T={cal['temperature']:.2f}, θ={cal['threshold']:.2f})"
+    print(f"[calibration] B checkpoint: {b_label}")
+
     *_, test_single = get_dataloaders("single", snr, root=data_root, num_workers=0, seed=seed)
     *_, test_double = get_dataloaders("double", snr, root=data_root, num_workers=0, seed=seed)
 
     return {
-        "v1/single": eval_on_loader_v1(model_v1, test_single, device),
-        "v1/double": eval_on_loader_v1(model_v1, test_double, device),
-        "v1/real":   do_real_test(model_v1, device=device, print_result=False),
-        "B/single":  eval_on_loader_b(model_b,  test_single, device),
-        "B/double":  eval_on_loader_b(model_b,  test_double, device),
-        "B/real":    do_real_test_b(model_b, device=device, print_result=False),
+        "v1/single":  eval_on_loader_v1(model_v1, test_single, device),
+        "v1/double":  eval_on_loader_v1(model_v1, test_double, device),
+        "v1/real":    do_real_test(model_v1, device=device, print_result=False),
+        "B/single":   eval_on_loader_b_calibrated(model_b, test_single, device, **cal),
+        "B/double":   eval_on_loader_b_calibrated(model_b, test_double, device, **cal),
+        "B/real":     do_real_test_b_calibrated(model_b, device=device, print_result=False, **cal),
     }
 
 
