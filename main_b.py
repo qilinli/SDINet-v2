@@ -89,9 +89,11 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
         model, opt, sched, train_dl, val_dl, cfg.epochs, criterion, ema=ema
     )
 
+    states_dir = Path("states")
+    states_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = None
     if cfg.save_uuid_checkpoint:
-        states_dir = Path("states")
-        states_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = states_dir / f"b-combined-{uuid4()}.pt"
         torch.save(trained_model.state_dict(), ckpt_path)
         print(f"[checkpoint] Saved: {ckpt_path}")
@@ -103,10 +105,19 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
         val_acc_label="Val F1",
     )
 
+    from lib.calibration import (
+        calibrate_b, save_calibration,
+        eval_on_loader_b_calibrated, do_real_test_b_calibrated,
+    )
     from lib.data_safetensors import get_dataloaders
-    from lib.testing import eval_on_loader_b, do_real_test_b
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    _, val_single, _ = get_dataloaders("single", cfg.snr, root=cfg.data_root,
+                                        num_workers=cfg.num_workers,
+                                        eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
+    _, val_double, _ = get_dataloaders("double", cfg.snr, root=cfg.data_root,
+                                        num_workers=cfg.num_workers,
+                                        eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
     _, _, test_single = get_dataloaders("single", cfg.snr, root=cfg.data_root,
                                         num_workers=cfg.num_workers,
                                         eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
@@ -114,15 +125,19 @@ def main(cfg: RunConfigB = RunConfigB()) -> None:
                                         num_workers=cfg.num_workers,
                                         eval_batch_size=cfg.eval_batch_size, seed=cfg.split_seed)
 
+    cal = calibrate_b(trained_model, [val_single, val_double], device)
+    if ckpt_path is not None:
+        save_calibration(cal, ckpt_path)
+
     for label, dl in [("single", test_single), ("double", test_double)]:
         print(f"\n[test / {label}]")
-        for k, v in eval_on_loader_b(trained_model, dl, device).items():
+        for k, v in eval_on_loader_b_calibrated(trained_model, dl, device, **cal).items():
             print(f"  {k}: {v:.4f}")
 
     if cfg.run_real_test:
         print("\n[real benchmark]")
         try:
-            do_real_test_b(trained_model, device=device, print_result=True)
+            do_real_test_b_calibrated(trained_model, device=device, print_result=True, **cal)
         except (FileNotFoundError, OSError) as e:
             print(f"  Skipping (missing benchmark .mat): {e}")
 
