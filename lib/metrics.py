@@ -342,6 +342,7 @@ def evaluate_all(
     y_norm: Tensor,
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+    threshold: float = 0.5,
 ) -> dict[str, float]:
     """
     Compute the full evaluation suite for the B-head on a dataset split.
@@ -421,10 +422,11 @@ def evaluate_all(
                            presence_norm_thresh=presence_norm_thresh)
 
     tp, fp, fn = presence_f1_stats(presence_logits, y_norm,
+                                   threshold=threshold,
                                    presence_norm_thresh=presence_norm_thresh)
     f1, prec, rec = f1_from_counts(tp, fp, fn)
 
-    pred_pres = torch.sigmoid(presence_logits) > 0.5
+    pred_pres = torch.sigmoid(presence_logits) > threshold
     mean_k_pred = pred_pres.sum(dim=-1).float().mean().item()
     mean_k_true = k_true_per.mean().item()
 
