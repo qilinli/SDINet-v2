@@ -77,7 +77,7 @@ def load_model_from_checkpoint(
         model_cfg = ModelConfig()
 
     model = build_model(model_cfg)
-    state = torch.load(str(checkpoint_path), map_location="cpu")
+    state = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
 
     if device is not None:
@@ -98,7 +98,7 @@ def load_model_b_from_checkpoint(
         model_cfg = ModelConfigB()
 
     model = build_model(model_cfg)
-    state = torch.load(str(checkpoint_path), map_location="cpu")
+    state = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
 
     if device is not None:
