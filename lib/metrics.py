@@ -343,6 +343,8 @@ def evaluate_all(
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
     threshold: float = 0.5,
+    ratio_alpha: float | None = None,
+    ratio_beta: float = 0.0,
 ) -> dict[str, float]:
     """
     Compute the full evaluation suite for the B-head on a dataset split.
@@ -421,12 +423,19 @@ def evaluate_all(
     ap = average_precision(presence_logits, y_norm,
                            presence_norm_thresh=presence_norm_thresh)
 
-    tp, fp, fn = presence_f1_stats(presence_logits, y_norm,
-                                   threshold=threshold,
-                                   presence_norm_thresh=presence_norm_thresh)
+    # Binary presence predictions — absolute or ratio thresholding
+    probs = torch.sigmoid(presence_logits)
+    if ratio_alpha is not None:
+        max_prob  = probs.max(dim=-1, keepdim=True).values   # (N, 1)
+        pred_pres = (probs > ratio_alpha * max_prob) & (max_prob > ratio_beta)
+    else:
+        pred_pres = probs > threshold
+
+    tp = (pred_pres &  y_pres_bool).sum().long()
+    fp = (pred_pres & ~y_pres_bool).sum().long()
+    fn = (~pred_pres & y_pres_bool).sum().long()
     f1, prec, rec = f1_from_counts(tp, fp, fn)
 
-    pred_pres = torch.sigmoid(presence_logits) > threshold
     mean_k_pred = pred_pres.sum(dim=-1).float().mean().item()
     mean_k_true = k_true_per.mean().item()
 
