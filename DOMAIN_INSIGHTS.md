@@ -317,3 +317,104 @@ Experiments (real benchmark results), Discussion (robustness to domain shift)
 > held-out synthetic data. The per-location relative scoring in the B head is
 > more robust to this domain shift, as detection decisions depend on the relative
 > ordering of location scores rather than their absolute magnitudes.
+
+---
+
+## 11. Transformer cross-attention subsumes the MIL sensor aggregation mechanism
+
+**Domain rationale**
+In a sensor network, each structural location is best characterised by a specific
+subset of sensors — those physically proximate to it or connected via load paths.
+The MIL importance branch (Approach B) learns a scalar weight per (sensor, location)
+pair to approximate this physical relevance. Transformer cross-attention learns the
+same relationship but with greater expressivity: each damage query attends to sensors
+with query-specific, content-dependent patterns that can vary across structural states.
+
+**ML implication**
+Cross-attention in the DETR-style decoder replaces the explicit importance branch.
+The attention weights over sensor positions play the same role as MIL importance
+weights, but are learned jointly with the detection task and updated iteratively
+across decoder layers. Sensor dropout at inference maps directly to attention
+masking (dropped sensors receive −∞ before softmax), which is more principled than
+renormalising importance weights.
+
+**Where in paper**
+Methodology (DETR decoder design), Discussion (relationship between MIL and
+attention-based aggregation)
+
+**Quote-ready**
+> The importance-weighted sensor aggregation introduced in the MIL framework is a
+> special case of transformer cross-attention: both mechanisms learn to weight
+> sensor contributions to each structural location's prediction according to their
+> physical relevance. The DETR-style decoder replaces the explicit importance branch
+> with multi-head cross-attention, recovering the MIL inductive bias while allowing
+> richer, query-specific sensor relevance patterns that adapt to the structural state.
+> Sensor unavailability is handled through attention masking, providing an exact
+> treatment of missing sensors rather than the approximate renormalisation required
+> by fixed importance weights.
+
+---
+
+## 12. Two-stage prediction mirrors the engineering diagnostic process
+
+**Domain rationale**
+Structural engineers diagnose damage in two conceptually distinct steps: first
+localise the anomaly (which part of the structure is behaving differently?) and
+then quantify its severity (how much has the stiffness or capacity reduced?).
+Severity estimation is inherently conditioned on localisation — measuring how
+much a member is damaged requires knowing which member to examine.
+
+**ML implication**
+A two-stage slot decoder (stage 1: attend over sensors to identify damaged
+location; stage 2: re-attend conditioned on predicted location to estimate
+severity) mirrors this diagnostic sequence. Severity head inputs that include
+the predicted location embedding produce more accurate estimates than a single
+head predicting both simultaneously, because the second attention can focus on
+the sensors most informative for that specific location's severity.
+
+**Where in paper**
+Methodology (decoder architecture motivation), Discussion (interpretability
+for structural engineers)
+
+**Quote-ready**
+> The two-stage slot decoder mirrors the sequential diagnostic process familiar
+> to structural engineers: localisation precedes severity quantification, and
+> the latter benefits from knowing the former. By conditioning the severity
+> attention on the predicted location, the decoder directs its evidence
+> gathering to the sensors most informative for that specific structural member,
+> rather than averaging over the full sensor network.
+
+---
+
+## 13. Discrete enumerated locations simplify set detection dramatically vs image detection
+
+**Domain rationale**
+In image object detection, objects can appear anywhere in continuous 2D space —
+the output space is infinite and bounding box regression requires continuous
+coordinate prediction. In SHM, there are exactly L=70 predefined structural
+monitoring locations. Every possible damage location is known in advance. The
+problem is not searching for where damage might be, but deciding which of the
+known candidates are active.
+
+**ML implication**
+This discrete structure makes the SHM analogue of DETR far simpler than image
+DETR: no bounding box regression, no anchor generation, no IoU-based matching,
+no multi-scale feature pyramids. Slot attention operates over 70 location feature
+vectors (not continuous spatial queries), and Hungarian matching uses pure
+classification cost. Approach B (per-location sigmoid) is the SHM analogue of
+dense anchor-based detection (YOLO/SSD). DETR-lite is the SHM analogue of
+set-prediction detection, but simplified by the finite discrete location space.
+
+**Where in paper**
+Methodology (architecture motivation for DETR-lite), Discussion (comparison to
+image detection literature)
+
+**Quote-ready**
+> Unlike image object detection, where objects may appear at arbitrary positions
+> in a continuous spatial domain, structural damage is constrained to a finite
+> set of L predefined monitoring locations. This discrete structure fundamentally
+> simplifies the detection problem: slot-based set prediction requires no bounding
+> box regression, no anchor design, and no IoU-based matching. Each slot identifies
+> its target location by content similarity to a precomputed library of
+> location feature vectors, reducing the combinatorial search to an assignment
+> problem over L=70 candidates.
