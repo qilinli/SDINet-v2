@@ -11,7 +11,8 @@ from tqdm.auto import trange
 
 from lib.metrics import (
     PRESENCE_NORM_THRESH,
-    distributed_map_b,
+    _c_slot_decode,
+    distributed_map_dr,
     distributed_map_v1,
     f1_from_counts,
     map_mse,
@@ -19,13 +20,10 @@ from lib.metrics import (
 )
 
 # Training / evaluation defaults
-DEFAULT_DROP_NUM = 10
-DEFAULT_DROP_DEN = 65
-DEFAULT_DROP_RATE = DEFAULT_DROP_NUM / DEFAULT_DROP_DEN
+DEFAULT_DROP_RATE = 0.0
 
 SUBSET_RNG_SEED = 42
 DEFAULT_VAL_SUBSET_COUNT = 51
-DEFAULT_VAL_NUM_SENSORS = 65
 DEFAULT_VAL_SUBSET_SIZE = 10
 EPS = 1e-12
 MIXED_PRECISION_MODE = "no"
@@ -62,18 +60,26 @@ def train_one_epoch(
     train_dl: DataLoader,
     accel: Accelerator,
     ema=None,
+    drop_rate: float = DEFAULT_DROP_RATE,
 ) -> float:
     model.train()
     accum = 0.0
     for x, y in train_dl:
         y_dmg, y_loc = y.max(-1, keepdim=True)
         y_loc = y_loc[:, 0]
+        damaged = y_dmg[:, 0] > PRESENCE_NORM_THRESH          # (B,) bool — healthy mask
         opt.zero_grad()
         with accel.autocast():
-            x = randomise_bag_size(x)
+            x = randomise_bag_size(x, drop_rate)
             y_hat_dmg, y_hat_loc = model(x)
             dmg_loss = F.mse_loss(y_hat_dmg, y_dmg)
-            loc_loss = F.cross_entropy(y_hat_loc, y_loc)
+            # Only apply localization CE on samples that actually have damage;
+            # for healthy samples argmax(y_norm) = 0 by tie-breaking convention,
+            # which would train the model to wrongly localize damage at location 0.
+            if damaged.any():
+                loc_loss = F.cross_entropy(y_hat_loc[damaged], y_loc[damaged])
+            else:
+                loc_loss = y_hat_loc.sum() * 0.0               # no-op, keeps graph
             loss = dmg_loss + loc_loss
             if ema is not None:
                 ema.update_parameters(model)
@@ -119,23 +125,29 @@ def gen_sensor_subsets(
 
 @torch.inference_mode()
 def val_one_epoch(
-    model, val_dl: DataLoader, subset_size: int = DEFAULT_VAL_SUBSET_SIZE
+    model, val_dl: DataLoader, subset_size: int | None = None
 ) -> tuple[float, float, float]:
     '''
-    Validate one epoch under sampled sensor-failure subsets.
+    Validate one epoch on the full sensor set (default) or under sampled
+    sensor-failure subsets.
 
-    The routine evaluates loss, distributed-map MSE, and location accuracy on a
-    reduced set of `DEFAULT_VAL_SUBSET_COUNT` randomly generated sensor subsets.
-    This keeps validation lightweight while preserving a stable convergence
-    signal across epochs.
+    Pass ``subset_size=DEFAULT_VAL_SUBSET_SIZE`` to replicate the fault-tolerance
+    evaluation protocol from the original v1 paper (51 subsets of 10 sensors).
+    By default (``subset_size=None``) all sensors are used, which is faster and
+    measures clean accuracy without injected sensor failures.
     '''
     model.eval()
     state = deepcopy(model.state_dict())
-    sensor_subsets = gen_sensor_subsets(
-        DEFAULT_VAL_SUBSET_COUNT,
-        subset_size=subset_size,
-        total_sensors=DEFAULT_VAL_NUM_SENSORS,
-    )
+
+    _x_peek, _ = next(iter(val_dl))
+    n_sensors = _x_peek.size(-1)
+    if subset_size is None or n_sensors <= subset_size:
+        # full sensor set — no fault injection
+        sensor_subsets = torch.arange(n_sensors).unsqueeze(1)   # (n_sensors, 1)
+    else:
+        sensor_subsets = gen_sensor_subsets(
+            DEFAULT_VAL_SUBSET_COUNT, subset_size=subset_size, total_sensors=n_sensors,
+        )
 
     total_losses = torch.zeros((sensor_subsets.size(0),))
     total_mse    = torch.zeros((sensor_subsets.size(0),))
@@ -144,6 +156,7 @@ def val_one_epoch(
     for x, y in val_dl:
         y_dmg, y_loc = y.max(-1, keepdim=True)
         y_loc = y_loc[:, 0]
+        damaged = y_dmg[:, 0] > PRESENCE_NORM_THRESH          # (B,) — exclude healthy
 
         y_hat_dmg, i_dmg, y_hat_loc, i_loc = model[2](model[:2](x.float()), False)
 
@@ -180,14 +193,18 @@ def val_one_epoch(
             )
             .mean(1).sum(0).cpu()
         )
-        l_loc = (
-            F.cross_entropy(
-                loc_preds,
-                y_loc[..., None].expand(-1, loc_preds.size(-1)),
-                reduction="none",
+        # Localization CE is only meaningful for samples with actual damage.
+        if damaged.any():
+            l_loc = (
+                F.cross_entropy(
+                    loc_preds[damaged],
+                    y_loc[damaged, None].expand(-1, loc_preds.size(-1)),
+                    reduction="none",
+                )
+                .sum(0).cpu()
             )
-            .sum(0).cpu()
-        )
+        else:
+            l_loc = torch.zeros_like(l_dmg)
         total_losses += l_dmg + l_loc
 
         # map_mse in [0, 1] space — consistent with metrics.py
@@ -203,7 +220,8 @@ def val_one_epoch(
     )
 
 
-def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None):
+def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None,
+                drop_rate: float = DEFAULT_DROP_RATE):
     accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
     model, opt, sched, train_dl, val_dl = accel.prepare(model, opt, sched, train_dl, val_dl)
 
@@ -218,15 +236,13 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None):
     val_mses: list[float] = []
 
     for _epoch in epoch_bar:
-        train_loss = train_one_epoch(model, opt, sched, train_dl, accel, ema)
+        train_loss = train_one_epoch(model, opt, sched, train_dl, accel, ema, drop_rate)
         train_losses.append(train_loss)
         epoch_bar.set_description(
             f"train_loss {train_loss:.3e} | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_acc:.3f}"
         )
 
-        val_loss, val_mse, val_acc = val_one_epoch(
-            model, val_dl, DEFAULT_VAL_SUBSET_SIZE
-        )
+        val_loss, val_mse, val_acc = val_one_epoch(model, val_dl)
         val_mses.append(val_mse)
         val_accs.append(val_acc)
         val_losses.append(val_loss)
@@ -255,10 +271,10 @@ def get_opt_and_sched(model, train_dl: DataLoader, epochs: int):
 
 
 # ===========================================================================
-# Approach-B (multi-damage) training and evaluation
+# Approach-C (DETR-style set prediction) training and evaluation
 # ===========================================================================
 
-def train_one_epoch_b(
+def train_one_epoch_c(
     model,
     opt,
     sched,
@@ -266,144 +282,91 @@ def train_one_epoch_b(
     accel: Accelerator,
     criterion,
     ema=None,
+    drop_rate: float = DEFAULT_DROP_RATE,
 ) -> tuple[float, float, float]:
     """
-    One training epoch for the B-head model.
+    One training epoch for the C-head model.
 
     Args:
-        criterion: :class:`~lib.losses.PresenceSeverityLoss` instance.
+        criterion: :class:`~lib.losses.SetCriterion` instance.
 
     Returns:
-        (avg_total_loss, avg_bce_loss, avg_sev_loss) over the epoch.
-        The BCE and severity components are logged separately for diagnosing
-        which part of the loss dominates (useful for tuning ``pos_weight``
-        and ``severity_weight``).
+        (avg_total_loss, avg_loc_loss, avg_sev_loss) over the epoch.
     """
     model.train()
-    accum_total = accum_bce = accum_sev = 0.0
+    accum_total = accum_loc = accum_sev = 0.0
 
     for x, y in train_dl:
         opt.zero_grad()
         with accel.autocast():
-            x = randomise_bag_size(x)
-            presence_logits, severity = model(x)              # (B, L), (B, L)
-            total, bce, sev = criterion(presence_logits, severity, y)
+            x = randomise_bag_size(x, drop_rate)
+            loc_logits, severity = model(x)              # (B, K, L+1), (B, K)
+            total, loc, sev = criterion(loc_logits, severity, y)
             if ema is not None:
                 ema.update_parameters(model)
         accel.backward(total)
         opt.step()
         sched.step()
         accum_total += total.item()
-        accum_bce   += bce.item()
+        accum_loc   += loc.item()
         accum_sev   += sev.item()
 
     n = len(train_dl)
-    return accum_total / n, accum_bce / n, accum_sev / n
+    return accum_total / n, accum_loc / n, accum_sev / n
 
 
 @torch.inference_mode()
-def val_one_epoch_b(
+def val_one_epoch_c(
     model,
     val_dl: DataLoader,
     criterion,
-    subset_size: int = DEFAULT_VAL_SUBSET_SIZE,
 ) -> tuple[float, float, float]:
     """
-    Validation epoch for the B-head model with sensor-failure robustness eval.
+    Validation epoch for the C-head model (pure DETR slot decoding).
 
-    Evaluation strategy (mirrors v1's ``val_one_epoch``):
-    - Sensor subsets are generated deterministically (same seed as v1).
-    - For each batch, the per-sensor outputs (``reduce=False``) are indexed
-      into N=51 sensor subsets of size C=10.  Importance weights are
-      renormalised within each subset (over the C dim), then aggregated.
-    - Per-subset map MSE is accumulated and the median is taken — reflecting
-      typical performance under sensor failure rather than best or worst case.
-    - Presence F1 is computed on the *full-sensor* (all 65 sensors) prediction
-      since F1 is a detection metric independent of sensor-failure robustness.
+    Top-K recall ranks slots by is-object score and checks if the top-K
+    predicted locations cover the true damaged locations.  No threshold
+    needed — provides a meaningful signal even before calibration.
 
     Returns:
-        (val_loss, val_map_mse, val_f1)
-        - val_loss:    Median subset BCE loss / dataset size  (convergence signal)
-        - val_map_mse: Median subset distributed-map MSE / dataset size
-                       (main comparison metric — comparable to v1's val_mse)
-        - val_f1:      Full-sensor presence F1
+        (val_loss, val_map_mse=NaN, val_top_k_recall)
+        val_map_mse is NaN because map_mse requires a soft aggregated map
+        which is not produced by pure DETR decoding.
     """
     model.eval()
-    state = deepcopy(model.state_dict())
-
-    sensor_subsets = gen_sensor_subsets(
-        DEFAULT_VAL_SUBSET_COUNT,
-        subset_size=subset_size,
-        total_sensors=DEFAULT_VAL_NUM_SENSORS,
-    )  # (C=10, N=51)
-    N = sensor_subsets.size(1)
-
-    # Move to model device once before the loop.
     device = next(model.parameters()).device
-    sensor_subsets = sensor_subsets.to(device)
-    pos_weight     = criterion.pos_weight.to(device)
 
-    total_losses = torch.zeros(N)   # (N,) accumulated subset loss
-    total_mse    = torch.zeros(N)   # (N,) accumulated subset map MSE
-    tp_acc = fp_acc = fn_acc = 0    # full-sensor F1 accumulators
+    accum_loss = 0.0
+    tkr_hits = tkr_total = 0
 
     for x, y in val_dl:
-        y = y.to(device)
-        features = model[:2](x.float().to(device))    # (B, embed_dim, S=65)
+        x, y = x.float().to(device), y.to(device)
+        B = x.size(0)
+        loc_logits, severity = model(x)
 
-        # Per-sensor outputs — no sensor reduction yet
-        presence_raw, severity_raw, importance = model[2](features, reduce=False)
-        # presence_raw:  (B, L, S=65) — logits
-        # severity_raw:  (B, L, S=65) — sigmoid ∈ [0, 1]
-        # importance:    (B, L, S=65) — softmax over S
+        total, _, _ = criterion(loc_logits, severity, y)
+        accum_loss += total.item() * B
 
-        # ---- Full-sensor aggregation (used only for F1) -------------------
-        pres_full = (presence_raw * importance).sum(-1)   # (B, L)
-        tp, fp, fn = presence_f1_stats(pres_full, y)
-        tp_acc += tp.item(); fp_acc += fp.item(); fn_acc += fn.item()
+        # Top-k recall: rank slots by is_obj, take top-K per sample
+        is_obj, pred_loc = _c_slot_decode(loc_logits)   # (B, K) each
+        y_pres = y > PRESENCE_NORM_THRESH                # (B, L) bool
+        k_true = y_pres.sum(-1)                          # (B,)
+        for b in range(B):
+            K = int(k_true[b].item())
+            if K == 0:
+                continue
+            K_slots   = min(K, is_obj.size(-1))
+            top_slots = is_obj[b].topk(K_slots).indices
+            pred_set  = set(pred_loc[b, top_slots].tolist())
+            true_set  = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
+            tkr_hits  += len(pred_set & true_set)
+            tkr_total += K
 
-        # ---- Subset-based evaluation --------------------------------------
-        # Index sensor dim: (B, L, S)[..., (C, N)] → (B, L, C, N)
-        pres_sub = presence_raw[..., sensor_subsets]      # (B, L, C, N)
-        sev_sub  = severity_raw[..., sensor_subsets]      # (B, L, C, N)
-        imp_sub  = importance[..., sensor_subsets]         # (B, L, C, N)
-
-        # Renormalise importance within each subset (over C, dim=-2).
-        # This mirrors v1's renormalisation in val_one_epoch and ensures
-        # importance weights sum to 1 for every subset independently.
-        imp_sub = imp_sub / (imp_sub.sum(dim=-2, keepdim=True) + EPS)
-
-        # Weighted sum over C sensors → (B, L, N) per-subset predictions
-        pres_pred_n = (pres_sub * imp_sub).sum(dim=-2)    # (B, L, N)
-        sev_pred_n  = (sev_sub  * imp_sub).sum(dim=-2)    # (B, L, N)
-
-        # Distributed map MSE (main comparison metric)
-        dist_map_n = distributed_map_b(pres_pred_n, sev_pred_n)         # (B, L, N)
-        total_mse += map_mse(dist_map_n, y).cpu()                       # (N,)
-
-        # BCE per subset (loss convergence signal)
-        y_pres_n = (
-            y.unsqueeze(-1).expand(-1, -1, N) > criterion.presence_threshold
-        ).float()
-        bce_n = F.binary_cross_entropy_with_logits(
-            pres_pred_n,
-            y_pres_n,
-            pos_weight=pos_weight,
-            reduction="none",
-        ).mean(1).sum(0).cpu()                                           # (N,)
-        total_losses += bce_n
-
-    model.load_state_dict(state)
-    denom  = len(val_dl.dataset)
-    f1, _, _ = f1_from_counts(tp_acc, fp_acc, fn_acc)
-    return (
-        torch.median(total_losses).item() / denom,
-        torch.median(total_mse).item() / denom,
-        f1,
-    )
+    n_samples = len(val_dl.dataset)
+    return accum_loss / n_samples, float("nan"), tkr_hits / max(tkr_total, 1)
 
 
-def do_training_b(
+def do_training_c(
     model,
     opt,
     sched,
@@ -412,27 +375,15 @@ def do_training_b(
     epochs: int,
     criterion,
     ema=None,
+    drop_rate: float = DEFAULT_DROP_RATE,
 ):
     """
-    Full training loop for the B-head model.
+    Full training loop for the C-head model.
 
-    Return structure is parallel to :func:`do_training` so that the same
-    plotting and checkpointing code in ``main.py`` / ``main_b.py`` works
-    for both heads:
+    Return structure mirrors :func:`do_training`:
 
     Returns:
         (train_losses, val_losses, val_dl, val_f1s, val_mses, model)
-
-        - train_losses: per-epoch average total training loss
-        - val_losses:   per-epoch median subset val loss
-        - val_dl:       the validation DataLoader (pass-through, matches v1 API)
-        - val_f1s:      per-epoch full-sensor presence F1   (analogous to v1 val_accs)
-        - val_mses:     per-epoch median subset map MSE     (analogous to v1 val_mses)
-        - model:        the accelerator-prepared model
-
-    Additional loss components (bce / severity breakdown) are printed in the
-    progress bar but not returned; inspect ``train_bce_losses`` and
-    ``train_sev_losses`` via tqdm output or add them to the return if needed.
     """
     accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
     model, opt, sched, train_dl, val_dl = accel.prepare(
@@ -445,29 +396,183 @@ def do_training_b(
     val_mses:     list[float] = []
 
     val_loss = val_mse = float("inf")
-    val_f1 = train_loss = 0.0
+    val_tkr = train_loss = 0.0
 
     epoch_bar = trange(epochs)
     for _epoch in epoch_bar:
-        train_loss, bce, sev = train_one_epoch_b(
-            model, opt, sched, train_dl, accel, criterion, ema
+        train_loss, loc, sev = train_one_epoch_c(
+            model, opt, sched, train_dl, accel, criterion, ema, drop_rate
         )
         train_losses.append(train_loss)
         epoch_bar.set_description(
-            f"train_loss {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
-            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_f1 {val_f1:.3f}"
+            f"train_loss {train_loss:.3e} (loc={loc:.2e} sev={sev:.2e})"
+            f" | val_loss {val_loss:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
 
-        val_loss, val_mse, val_f1 = val_one_epoch_b(
-            model, val_dl, criterion, DEFAULT_VAL_SUBSET_SIZE
-        )
+        val_loss, val_mse, val_tkr = val_one_epoch_c(model, val_dl, criterion)
         val_losses.append(val_loss)
         val_mses.append(val_mse)
-        val_f1s.append(val_f1)
+        val_f1s.append(val_tkr)
 
         epoch_bar.set_description(
-            f"train_loss {train_loss:.3e} (bce={bce:.2e} sev={sev:.2e})"
-            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_f1 {val_f1:.3f}"
+            f"train_loss {train_loss:.3e} (loc={loc:.2e} sev={sev:.2e})"
+            f" | val_loss {val_loss:.3e} | val_top_k_recall {val_tkr:.3f}"
+        )
+
+    return train_losses, val_losses, val_dl, val_f1s, val_mses, model
+
+
+# ===========================================================================
+# Approach-DR (direct regression) training and evaluation
+# ===========================================================================
+
+def train_one_epoch_dr(
+    model,
+    opt,
+    sched,
+    train_dl: DataLoader,
+    accel: Accelerator,
+    ema=None,
+    drop_rate: float = DEFAULT_DROP_RATE,
+    pos_weight: float | None = None,
+) -> float:
+    """One training epoch for the DR head.
+
+    Loss:
+        pos_weight=None  →  MSE(pred, (y_norm + 1) / 2)   — continuous severity targets
+        pos_weight=float →  weighted BCE(pred, y_presence) — binary labels (e.g. Qatar)
+
+    BCE with pos_weight is more principled when labels are binary {-1, +1}:
+    it uses the correct gradient geometry for classification and handles the
+    class imbalance (K damaged / L total locations).  MSE on binary targets
+    converges, but with weaker gradient signal and no imbalance compensation.
+    """
+    model.train()
+    accum = 0.0
+
+    for x, y in train_dl:
+        opt.zero_grad()
+        with accel.autocast():
+            x    = randomise_bag_size(x, drop_rate)
+            pred = model(x)                                    # (B, L) ∈ [0, 1]
+            if pos_weight is not None:
+                target = (y > PRESENCE_NORM_THRESH).float()
+                # F.binary_cross_entropy doesn't support pos_weight directly;
+                # equivalent weighting: w=pos_weight for positives, w=1 for negatives
+                w = target * (pos_weight - 1.0) + 1.0
+                # clamp: MIL aggregation (sigmoid * softmax).sum() is theoretically
+                # in [0,1] but floating-point rounding can produce values like 1.0000001
+                loss = F.binary_cross_entropy(pred.clamp(0.0, 1.0), target, weight=w)
+            else:
+                loss = F.mse_loss(pred, (y + 1.0) / 2.0)
+            if ema is not None:
+                ema.update_parameters(model)
+        accel.backward(loss)
+        opt.step()
+        sched.step()
+        accum += loss.item()
+
+    return accum / len(train_dl)
+
+
+@torch.inference_mode()
+def val_one_epoch_dr(
+    model,
+    val_dl: DataLoader,
+    pos_weight: float | None = None,
+) -> tuple[float, float, float]:
+    """
+    Validation epoch for the DR head (full-sensor, no sensor subsets).
+
+    Returns:
+        (val_loss, val_map_mse, val_top_k_recall)
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    accum_loss = 0.0
+    accum_mse  = 0.0
+    tkr_hits = tkr_total = 0
+
+    for x, y in val_dl:
+        x, y = x.float().to(device), y.to(device)
+        B = x.size(0)
+        pred = model(x)                                        # (B, L) ∈ [0, 1]
+
+        if pos_weight is not None:
+            target = (y > PRESENCE_NORM_THRESH).float()
+            w = target * (pos_weight - 1.0) + 1.0
+            # reduction='mean' gives per-element mean; multiply by B to get per-sample sum
+            accum_loss += F.binary_cross_entropy(pred.clamp(0.0, 1.0), target, weight=w).item() * B
+        else:
+            accum_loss += F.mse_loss(pred, (y + 1.0) / 2.0).item() * B
+        accum_mse += map_mse(distributed_map_dr(pred), y).item()
+
+        # Top-k recall: rank locations by pred score, check top-K against ground truth.
+        y_pres = y > PRESENCE_NORM_THRESH                          # (B, L) bool
+        k_true = y_pres.sum(-1)                                    # (B,)
+        for b in range(B):
+            K = int(k_true[b].item())
+            if K == 0:
+                continue
+            topk_mask = torch.zeros(y.size(-1), dtype=torch.bool, device=y.device)
+            topk_mask[pred[b].topk(K).indices] = True
+            tkr_hits  += int((topk_mask & y_pres[b]).sum())
+            tkr_total += K
+
+    n_samples = len(val_dl.dataset)
+    # Both accum_loss and accum_mse are sums over samples → divide by n_samples for
+    # per-sample means on the same scale as train_loss and v1/B val metrics.
+    return accum_loss / n_samples, accum_mse / n_samples, tkr_hits / max(tkr_total, 1)
+
+
+def do_training_dr(
+    model,
+    opt,
+    sched,
+    train_dl: DataLoader,
+    val_dl: DataLoader,
+    epochs: int,
+    ema=None,
+    drop_rate: float = DEFAULT_DROP_RATE,
+    pos_weight: float | None = None,
+):
+    """
+    Full training loop for the DR head.
+
+    Returns:
+        (train_losses, val_losses, val_dl, val_f1s, val_mses, model)
+    """
+    accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
+    model, opt, sched, train_dl, val_dl = accel.prepare(
+        model, opt, sched, train_dl, val_dl
+    )
+
+    train_losses: list[float] = []
+    val_losses:   list[float] = []
+    val_f1s:      list[float] = []
+    val_mses:     list[float] = []
+
+    val_loss = val_mse = float("inf")
+    val_tkr = train_loss = 0.0
+
+    epoch_bar = trange(epochs)
+    for _epoch in epoch_bar:
+        train_loss = train_one_epoch_dr(model, opt, sched, train_dl, accel, ema, drop_rate, pos_weight)
+        train_losses.append(train_loss)
+        epoch_bar.set_description(
+            f"train_loss {train_loss:.3e}"
+            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_tkr:.3f}"
+        )
+
+        val_loss, val_mse, val_tkr = val_one_epoch_dr(model, val_dl, pos_weight)
+        val_losses.append(val_loss)
+        val_mses.append(val_mse)
+        val_f1s.append(val_tkr)
+
+        epoch_bar.set_description(
+            f"train_loss {train_loss:.3e}"
+            f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
 
     return train_losses, val_losses, val_dl, val_f1s, val_mses, model

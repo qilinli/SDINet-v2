@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
 import numpy.typing as npt
+import torch
 from safetensors import safe_open
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -68,7 +71,7 @@ def get_combined_dataloaders(
     subset_names: list[str],
     snr: float = 0.0,
     *,
-    root: str | Path = "data/safetensors/unc=0",
+    root: str | Path = "data/7-story-frame/safetensors/unc=0",
     num_workers: int = 0,
     train_batch_size: int = 128,
     eval_batch_size: int = 32,
@@ -119,7 +122,7 @@ def get_dataloaders(
     subset_name: str,
     snr: float = 0.0,
     *,
-    root: str | Path = "data/safetensors/unc=0",
+    root: str | Path = "data/7-story-frame/safetensors/unc=0",
     num_workers: int = 12,
     train_batch_size: int = 128,
     eval_batch_size: int = 32,
@@ -161,3 +164,71 @@ def get_dataloaders(
     )
     return train_dl, val_dl, test_dl
 
+
+# ---------------------------------------------------------------------------
+# Real .mat benchmark (7-story frame physical experiment)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+DAMAGE_PHYSICAL_SCALE: float = 0.15
+
+
+@dataclass(frozen=True)
+class RealMatBenchmarkSpec:
+    mat_filename: str = "Testing_SingleEAcc9Sensor0.5sec.mat"
+    time_len: int = 500   # raw data zero-padded to this length if shorter
+
+
+DEFAULT_BENCHMARK    = RealMatBenchmarkSpec()
+TWO_DAMAGE_BENCHMARK = RealMatBenchmarkSpec(
+    mat_filename="Testing_TwoEAcc9Sensor0.45sec.mat",
+    time_len=500,   # T=450 in file — zero-padded to 500 on load
+)
+
+
+def default_benchmark_mat_path(spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK) -> Path:
+    return _REPO_ROOT / "data" / "7-story-frame" / spec.mat_filename
+
+
+@lru_cache(maxsize=4)
+def _load_benchmark_tensors_cached(mat_path_str: str) -> tuple[torch.Tensor, torch.Tensor]:
+    from scipy.io import loadmat
+    mat = loadmat(mat_path_str)
+    test_data   = torch.from_numpy(mat["Testing_Data"]).float()
+    test_target = torch.from_numpy(mat["Testing_label"]).float()
+    return test_data, test_target
+
+
+def load_real_test_tensors(
+    mat_path: str | Path | None = None,
+    *,
+    spec: RealMatBenchmarkSpec = DEFAULT_BENCHMARK,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load ``Testing_Data`` / ``Testing_label`` from the benchmark ``.mat`` file (cached).
+
+    Zero-pads the time axis to ``spec.time_len`` if the raw data is shorter.
+    """
+    path = Path(mat_path) if mat_path is not None else default_benchmark_mat_path(spec)
+    test_data, test_target = _load_benchmark_tensors_cached(str(path.resolve()))
+
+    T = test_data.size(0)
+    if T < spec.time_len:
+        pad = torch.zeros(spec.time_len - T, test_data.size(1))
+        test_data = torch.cat([test_data, pad], dim=0)
+    elif T > spec.time_len:
+        test_data = test_data[: spec.time_len]
+
+    return test_data, test_target
+
+
+def _print_eval_results(results: dict[str, float]) -> None:
+    print(
+        f"map_mse={results['map_mse']:.4e}  "
+        f"top_k_recall={results['top_k_recall']:.3f}  "
+        f"AP={results['ap']:.3f}  "
+        f"F1={results['f1']:.3f}  "
+        f"severity_mae={results['severity_mae']:.4e}  "
+        f"mean_k_pred={results['mean_k_pred']:.1f} (true={results['mean_k_true']:.1f})"
+    )

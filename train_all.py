@@ -1,50 +1,109 @@
 """
-train_all.py — run both v1 and Approach-B training sequentially.
-
-Both models train on the single+double combined dataset.
+train_all.py — run v1, C, and/or DR training sequentially via train.py.
 
 Usage::
 
-    python train_all.py              # 200 epochs each
-    python train_all.py --epochs 50  # quick smoke-test
-    python train_all.py --models b   # only Approach-B
+    python train_all.py --dataset 7story               # v1 + dr, 200 epochs each
+    python train_all.py --dataset qatar --models v1 c dr --epochs 50
+    python train_all.py --dataset tower --models dr --epochs 100
 """
 
 from __future__ import annotations
 
+import argparse
+import subprocess
+import sys
 import os
+
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
 
-import torch._dynamo  # noqa: E402
-import torch._dynamo as _dynamo
-_dynamo.config.suppress_errors = True
-_dynamo.config.disable = True
-
-import argparse
-
-from main   import RunConfig,  main as train_v1
-from main_b import RunConfigB, main as train_b
+from lib.datasets import DATASETS
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train v1 and Approach-B on single+double combined data"
+        description="Train v1, C, DR sequentially on a given dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--models", nargs="+", default=["v1", "b"],
-                        choices=["v1", "b"],
-                        help="Which models to train (default: both)")
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--dataset", required=True, choices=list(DATASETS),
+                        help="Dataset to train on")
+    parser.add_argument("--models", nargs="+", default=["v1", "dr"],
+                        choices=["v1", "c", "dr"],
+                        help="Which models to train")
+    parser.add_argument("--epochs",          type=int,   default=200)
+    parser.add_argument("--batch-size",      type=int,   default=128)
+    parser.add_argument("--eval-batch-size", type=int,   default=32)
+    parser.add_argument("--drop-rate",       type=float, default=0.0)
+    parser.add_argument("--num-workers",     type=int,   default=0)
+    parser.add_argument("--seed",            type=int,   default=42)
+    parser.add_argument("--root",            default=None,
+                        help="Override dataset root path")
+
+    # backbone / neck
+    parser.add_argument("--structure",    type=int, nargs=3, default=[6, 6, 6],
+                        metavar=("B1", "B2", "B3"))
+    parser.add_argument("--embed-dim",    type=int,   default=768)
+    parser.add_argument("--neck-dropout", type=float, default=0.0)
+
+    # dataset-specific
+    parser.add_argument("--snr",              type=float, default=-1.0)
+    parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"])
+    parser.add_argument("--window-size",      type=int,   default=2048)
+    parser.add_argument("--overlap",          type=float, default=0.5)
+    parser.add_argument("--downsample",       type=int,   default=4)
+
+    # model-specific (passed through to train.py which ignores irrelevant ones)
+    parser.add_argument("--bce-pos-weight",     type=float, default=None)
+    parser.add_argument("--num-slots",          type=int,   default=5)
+    parser.add_argument("--num-decoder-layers", type=int,   default=2)
+    parser.add_argument("--nhead",              type=int,   default=8)
+    parser.add_argument("--no-obj-weight",      type=float, default=0.1)
+    parser.add_argument("--loc-weight",         type=float, default=1.0)
+    parser.add_argument("--sev-weight",         type=float, default=None)
+
     args = parser.parse_args()
 
-    if "v1" in args.models:
-        print(f"\n{'='*60}\n  Training v1  ({args.epochs} epochs)\n{'='*60}\n")
-        train_v1(RunConfig(epochs=args.epochs))
+    # Build the shared flags to forward to train.py
+    shared = [
+        "--dataset",        args.dataset,
+        "--epochs",         str(args.epochs),
+        "--batch-size",     str(args.batch_size),
+        "--eval-batch-size",str(args.eval_batch_size),
+        "--drop-rate",      str(args.drop_rate),
+        "--num-workers",    str(args.num_workers),
+        "--seed",           str(args.seed),
+        "--structure",      *[str(b) for b in args.structure],
+        "--embed-dim",      str(args.embed_dim),
+        "--neck-dropout",   str(args.neck_dropout),
+        "--snr",            str(args.snr),
+        "--tower-excitation", *args.tower_excitation,
+        "--window-size",    str(args.window_size),
+        "--overlap",        str(args.overlap),
+        "--downsample",     str(args.downsample),
+        "--num-decoder-layers", str(args.num_decoder_layers),
+        "--nhead",          str(args.nhead),
+        "--no-obj-weight",  str(args.no_obj_weight),
+        "--loc-weight",     str(args.loc_weight),
+    ]
+    if args.root is not None:
+        shared += ["--root", args.root]
+    if args.bce_pos_weight is not None:
+        shared += ["--bce-pos-weight", str(args.bce_pos_weight)]
+    if args.num_slots is not None:
+        shared += ["--num-slots", str(args.num_slots)]
+    if args.sev_weight is not None:
+        shared += ["--sev-weight", str(args.sev_weight)]
 
-    if "b" in args.models:
-        print(f"\n{'='*60}\n  Training B   ({args.epochs} epochs)\n{'='*60}\n")
-        train_b(RunConfigB(epochs=args.epochs))
+    for model in args.models:
+        sep = "=" * 60
+        print(f"\n{sep}\n  Training {model.upper()}  ({args.epochs} epochs) on {args.dataset}\n{sep}\n")
+        cmd = [sys.executable, "train.py", "--model", model] + shared
+        ret = subprocess.call(cmd)
+        if ret != 0:
+            print(f"[train_all] train.py exited with code {ret} for model={model}", file=sys.stderr)
+            sys.exit(ret)
 
 
 if __name__ == "__main__":

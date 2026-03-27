@@ -17,24 +17,21 @@ PRESENCE_NORM_THRESH: float = -1.0 + 1e-4
 # Distributed damage maps — both expressed in [0, 1] for fair comparison
 # ---------------------------------------------------------------------------
 
-def distributed_map_b(presence_logits: Tensor, severity: Tensor) -> Tensor:
+def distributed_map_dr(pred: Tensor) -> Tensor:
     """
-    Distributed damage map for the B-head, in [0, 1] space.
+    Distributed damage map for the DR head — the prediction IS the map.
 
-    Formula: ``sigmoid(presence_logits) * severity``
-
-    Properties:
-    - Undamaged (presence prob → 0): map → 0
-    - Damaged (presence prob → 1, severity → s): map → s
-    - Target space: ``(y_norm + 1) / 2 = raw_damage / 0.15 ∈ [0, 1]``
+    DR directly outputs severity ∈ [0, 1] per location, so the damage map
+    is the raw output with no further transformation.
 
     Args:
-        presence_logits: (B, L) or (B, L, N)  raw presence logits
-        severity:        (B, L) or (B, L, N)  sigmoid-activated ∈ [0, 1]
+        pred: (B, L)  sigmoid-activated severity prediction ∈ [0, 1]
     Returns:
-        Tensor of same shape, values in [0, 1]
+        (B, L) — identical to input
     """
-    return torch.sigmoid(presence_logits) * severity
+    return pred
+
+
 
 
 def distributed_map_v1(dmg_pred: Tensor, loc_pred: Tensor) -> Tensor:
@@ -45,7 +42,7 @@ def distributed_map_v1(dmg_pred: Tensor, loc_pred: Tensor) -> Tensor:
 
     Note: v1's internal ``val_one_epoch`` uses the equivalent ``(…).mul(2).sub(1)``
     form in [-1, 1] space.  This version is in [0, 1] for a common comparison
-    baseline against ``distributed_map_b``.
+    baseline against ``distributed_map_c`` and ``distributed_map_dr``.
 
     Args:
         dmg_pred: (B, 1) or (B, 1, N)  Tanh-activated global damage scalar
@@ -66,7 +63,7 @@ def map_mse(pred_map: Tensor, target_norm: Tensor) -> Tensor:
     MSE between the predicted damage map and the normalized ground truth.
 
     Both are aligned in [0, 1] space:
-    - ``pred_map``     — output of :func:`distributed_map_b` or :func:`distributed_map_v1`
+    - ``pred_map``     — output of :func:`distributed_map_v1` or :func:`distributed_map_dr`
     - ``target_norm``  — ``(y_norm + 1) / 2``, where y_norm is the model's raw label
 
     When ``pred_map`` is (B, L, N) (subset evaluation), ``target_norm`` (B, L)
@@ -245,10 +242,13 @@ def evaluate_all_v1(
     y_norm: Tensor,
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+    temperature: float = 1.0,
+    ratio_alpha: float | None = None,
+    ratio_beta: float = 0.0,
 ) -> dict[str, float]:
     """
     Compute the evaluation suite for the v1 head using the same metric keys
-    as :func:`evaluate_all`.
+    as :func:`evaluate_all_dr` and :func:`evaluate_all_c`.
 
     v1 predicts a single global damage scalar (``dmg_pred``, tanh-activated)
     and raw location logits (``loc_pred``).  The adaptation to the shared
@@ -271,12 +271,13 @@ def evaluate_all_v1(
         k:        Fixed K for top-K metrics. None = use true K per sample.
         presence_norm_thresh: Threshold separating undamaged from damaged labels.
     """
-    dist_map  = distributed_map_v1(dmg_pred, loc_pred)   # (B, L) in [0, 1]
+    loc_scaled = loc_pred / temperature
+    dist_map  = distributed_map_v1(dmg_pred, loc_scaled)  # (B, L) in [0, 1]
     target_01 = (y_norm + 1.0) / 2.0
     mse = F.mse_loss(dist_map, target_01).item()
 
     # Softmax probabilities as presence scores (natural for v1 single-damage head)
-    loc_probs   = loc_pred.softmax(dim=-1)                # (B, L)
+    loc_probs   = loc_scaled.softmax(dim=-1)               # (B, L)
     y_pres_bool = y_norm > presence_norm_thresh
     k_true_per  = y_pres_bool.sum(dim=-1).float()
 
@@ -307,18 +308,24 @@ def evaluate_all_v1(
     ap = float(average_precision_score(labels_np, probs_np))
 
     # Severity MAE: broadcast scalar damage to all locations
-    sev_broadcast = ((dmg_pred + 1.0) / 2.0).expand_as(loc_pred)   # (B, L)
+    sev_broadcast = ((dmg_pred + 1.0) / 2.0).expand_as(loc_scaled)   # (B, L)
     sev_mae = severity_mae_at_detected(
-        loc_pred, sev_broadcast, y_norm,
+        loc_scaled, sev_broadcast, y_norm,
         k=k, presence_norm_thresh=presence_norm_thresh,
     )
 
-    # F1 using sigmoid(loc_pred) for API consistency with evaluate_all
-    tp, fp, fn    = presence_f1_stats(loc_pred, y_norm,
-                                      presence_norm_thresh=presence_norm_thresh)
+    # F1: ratio threshold on softmax probs (if calibrated), else sigmoid > 0.5 fallback
+    if ratio_alpha is not None:
+        max_prob  = loc_probs.max(dim=-1, keepdim=True).values
+        pred_pres = (loc_probs > ratio_alpha * max_prob) & (max_prob > ratio_beta)
+    else:
+        pred_pres = torch.sigmoid(loc_scaled) > 0.5
+    y_pres_bool_f1 = y_norm > presence_norm_thresh
+    tp = (pred_pres &  y_pres_bool_f1).sum().long()
+    fp = (pred_pres & ~y_pres_bool_f1).sum().long()
+    fn = (~pred_pres & y_pres_bool_f1).sum().long()
     f1, prec, rec = f1_from_counts(tp, fp, fn)
 
-    pred_pres   = torch.sigmoid(loc_pred) > 0.5
     mean_k_pred = pred_pres.sum(dim=-1).float().mean().item()
     mean_k_true = k_true_per.mean().item()
 
@@ -335,10 +342,13 @@ def evaluate_all_v1(
     }
 
 
+# ---------------------------------------------------------------------------
+# Approach-DR evaluation helpers
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
-def evaluate_all(
-    presence_logits: Tensor,
-    severity: Tensor,
+def evaluate_all_dr(
+    pred: Tensor,
     y_norm: Tensor,
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
@@ -347,89 +357,74 @@ def evaluate_all(
     ratio_beta: float = 0.0,
 ) -> dict[str, float]:
     """
-    Compute the full evaluation suite for the B-head on a dataset split.
+    Compute the full evaluation suite for the DR head on a dataset split.
 
-    Designed for test-set evaluation after training.  Concatenate predictions
-    from all batches before calling::
-
-        pres_all = torch.cat([...])   # (N_samples, L)
-        sev_all  = torch.cat([...])   # (N_samples, L)
-        y_all    = torch.cat([...])   # (N_samples, L)
-        results  = evaluate_all(pres_all, sev_all, y_all)
+    DR outputs a single severity value ∈ [0, 1] per location, used directly
+    as both the damage map (no transformation) and the presence score.
 
     Args:
-        presence_logits: (N, L) raw presence logits
-        severity:        (N, L) sigmoid-activated severity ∈ [0, 1]
-        y_norm:          (N, L) normalized ground-truth labels ∈ [-1, 1]
-        k:               Fixed K for top-K metrics.  None = use true K per sample.
-        presence_norm_thresh: Threshold separating undamaged from damaged labels.
+        pred:      (N, L) sigmoid-activated severity ∈ [0, 1]
+        y_norm:    (N, L) normalized ground-truth labels ∈ [-1, 1]
+        k:         Fixed K for top-K metrics. None = use true K per sample.
+        threshold: Presence threshold on pred (default 0.5).
+        ratio_alpha: Ratio rule: predict l if pred[l] > α * max pred.
+        ratio_beta:  Absolute gate: max pred must exceed β (default 0.0).
 
-    Returns:
-        Dict with keys:
-
-        ``map_mse``
-            Distributed-map MSE in [0, 1] space.  Primary comparison metric,
-            valid for both v1 and B heads.
-
-        ``top_k_recall``
-            Fraction of true damaged locations in the top-K predictions.
-            K is the true number of damages per sample when ``k=None``.
-
-        ``severity_mae``
-            MAE at correctly detected locations only (true positives).
-            Decouples severity accuracy from localization accuracy.
-
-        ``ap``
-            Average Precision (area under PR curve).  Threshold-free detection
-            quality summary; robust under heavy class imbalance.
-
-        ``f1``, ``precision``, ``recall``
-            Presence detection at the default threshold (0.5).  Reported for
-            reference; prefer ``ap`` for threshold-independent comparison.
-
-        ``mean_k_pred``, ``mean_k_true``
-            Mean number of predicted and true damaged locations per sample
-            (at threshold 0.5).  Useful for diagnosing over/under-detection.
+    Returns the same dict as :func:`evaluate_all_v1` for cross-model comparison.
     """
-    dist_map  = distributed_map_b(presence_logits, severity)   # (N, L)
+    dist_map  = distributed_map_dr(pred)                        # (N, L) = pred
     mse       = map_mse(dist_map, y_norm).item() / y_norm.size(0)
 
-    # True K per sample (used when k=None)
-    y_pres_bool = y_norm > presence_norm_thresh                 # (N, L) bool
-    k_true_per  = y_pres_bool.sum(dim=-1).float()               # (N,)
+    y_pres_bool = y_norm > presence_norm_thresh
+    k_true_per  = y_pres_bool.sum(dim=-1).float()
 
-    # Top-K recall: use per-sample true K if k is None
+    # Top-K recall: rank by pred value
     if k is None:
-        probs = torch.sigmoid(presence_logits)
         hits = total_pos = 0
         for b in range(y_norm.size(0)):
             K = int(k_true_per[b].item())
             if K == 0:
                 continue
-            topk_idx  = probs[b].topk(K).indices
+            topk_idx  = pred[b].topk(K).indices
             topk_mask = torch.zeros(y_norm.size(1), dtype=torch.bool, device=y_norm.device)
             topk_mask[topk_idx] = True
             hits      += int((topk_mask & y_pres_bool[b]).sum())
             total_pos += K
         tkr = hits / max(total_pos, 1)
     else:
-        tkr = top_k_recall(presence_logits, y_norm, k=k,
-                           presence_norm_thresh=presence_norm_thresh)
+        topk_mask = torch.zeros_like(pred, dtype=torch.bool)
+        topk_mask.scatter_(-1, pred.topk(k, dim=-1).indices, True)
+        tkr = (
+            (topk_mask & y_pres_bool).sum().float()
+            / y_pres_bool.sum().float().clamp(min=1.0)
+        ).item()
 
-    sev_mae = severity_mae_at_detected(
-        presence_logits, severity, y_norm,
-        k=k, presence_norm_thresh=presence_norm_thresh,
-    )
-    ap = average_precision(presence_logits, y_norm,
-                           presence_norm_thresh=presence_norm_thresh)
+    # AP: pred values serve directly as probability scores
+    probs_np  = pred.cpu().numpy().ravel()
+    labels_np = y_pres_bool.cpu().numpy().ravel().astype(int)
+    ap = float(average_precision_score(labels_np, probs_np))
 
-    # Binary presence predictions — absolute or ratio thresholding
-    probs = torch.sigmoid(presence_logits)
+    # Severity MAE at correctly detected (true-positive) locations
+    y_sev     = (y_norm + 1.0) / 2.0
+    total_mae = 0.0
+    total_tp  = 0
+    for b in range(y_norm.size(0)):
+        K = int(k_true_per[b].item()) if k is None else k
+        if K == 0:
+            continue
+        topk_idx = pred[b].topk(K).indices
+        for idx in topk_idx:
+            if y_pres_bool[b, idx]:
+                total_mae += abs(pred[b, idx].item() - y_sev[b, idx].item())
+                total_tp  += 1
+    sev_mae = total_mae / max(total_tp, 1)
+
+    # Binary presence: absolute or ratio thresholding on pred
     if ratio_alpha is not None:
-        max_prob  = probs.max(dim=-1, keepdim=True).values   # (N, 1)
-        pred_pres = (probs > ratio_alpha * max_prob) & (max_prob > ratio_beta)
+        max_pred  = pred.max(dim=-1, keepdim=True).values
+        pred_pres = (pred > ratio_alpha * max_pred) & (max_pred > ratio_beta)
     else:
-        pred_pres = probs > threshold
+        pred_pres = pred > threshold
 
     tp = (pred_pres &  y_pres_bool).sum().long()
     fp = (pred_pres & ~y_pres_bool).sum().long()
@@ -444,6 +439,121 @@ def evaluate_all(
         "top_k_recall": tkr,
         "severity_mae": sev_mae,
         "ap":           ap,
+        "f1":           f1,
+        "precision":    prec,
+        "recall":       rec,
+        "mean_k_pred":  mean_k_pred,
+        "mean_k_true":  mean_k_true,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Approach-C slot decoding
+# ---------------------------------------------------------------------------
+
+def _c_slot_decode(loc_logits: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Pure DETR slot decoding for the C-head.
+
+    Each slot independently outputs a probability over L locations + 1 no-object
+    class.  This function returns the per-slot is-object score and argmax location
+    so callers can apply whatever threshold or ranking they need.
+
+    Args:
+        loc_logits: (B, K, L+1)  raw location logits (last dim = no-object)
+    Returns:
+        is_obj   : (B, K) — P(slot is not no-object) ∈ [0, 1]
+        pred_loc : (B, K) — argmax location index for each slot (0-indexed)
+    """
+    slot_probs = loc_logits.softmax(dim=-1)        # (B, K, L+1)
+    is_obj     = 1.0 - slot_probs[..., -1]         # (B, K)
+    pred_loc   = slot_probs[..., :-1].argmax(-1)   # (B, K)
+    return is_obj, pred_loc
+
+
+@torch.no_grad()
+def evaluate_all_c(
+    loc_logits: Tensor,
+    severity: Tensor,
+    y_norm: Tensor,
+    k: int | None = None,
+    presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+    obj_threshold: float = 0.5,
+) -> dict[str, float]:
+    """
+    Full evaluation for the C-head using pure DETR slot decoding.
+
+    Each slot independently predicts a location OR no-object (∅).
+    A slot is active when its is-object score exceeds ``obj_threshold``.
+    The predicted damage set for sample b is the set of locations pointed
+    to by active slots — naturally bounded by K_max.
+
+    map_mse and ap are not applicable with discrete slot decoding and are
+    returned as NaN so comparison tables can display them as such.
+
+    Args:
+        loc_logits:    (N, K_max, L+1)  raw location logits (last = ∅)
+        severity:      (N, K_max)       sigmoid-activated severity ∈ [0, 1]
+        y_norm:        (N, L)           normalized ground-truth ∈ [-1, 1]
+        k:             Fixed K for top-K recall.  None = use true K per sample.
+        obj_threshold: Slot fires when is_obj > obj_threshold (default 0.5).
+    """
+    NaN = float("nan")
+
+    is_obj, pred_loc = _c_slot_decode(loc_logits)       # (N, K) each
+    active = is_obj > obj_threshold                      # (N, K) bool
+
+    y_pres_bool = y_norm > presence_norm_thresh          # (N, L) bool
+    k_true_per  = y_pres_bool.sum(-1).float()            # (N,)
+    y_sev       = (y_norm + 1.0) / 2.0                  # (N, L) in [0, 1]
+
+    # Top-K recall: rank slots by is_obj, take top-K, check predicted locations
+    hits = total_pos = 0
+    for b in range(y_norm.size(0)):
+        K = int(k_true_per[b].item()) if k is None else k
+        if K == 0:
+            continue
+        K_slots = min(K, is_obj.size(-1))
+        top_slots = is_obj[b].topk(K_slots).indices          # top-K slots by confidence
+        pred_set  = set(pred_loc[b, top_slots].tolist())
+        true_set  = set(y_pres_bool[b].nonzero(as_tuple=False)[:, 0].tolist())
+        hits      += len(pred_set & true_set)
+        total_pos += int(k_true_per[b].item()) if k is None else k
+    tkr = hits / max(total_pos, 1)
+
+    # F1 / precision / recall from active slots (set-based, deduplication included)
+    tp = fp = fn = 0
+    sev_mae_total = 0.0
+    sev_mae_count = 0
+    for b in range(y_norm.size(0)):
+        pred_set = set(pred_loc[b, active[b]].tolist())
+        true_set = set(y_pres_bool[b].nonzero(as_tuple=False)[:, 0].tolist())
+        tp_locs  = pred_set & true_set
+        tp += len(tp_locs)
+        fp += len(pred_set - true_set)
+        fn += len(true_set - pred_set)
+        # Severity MAE: for each TP location, use the highest-confidence active slot
+        for loc in tp_locs:
+            best_k = max(
+                (k_idx for k_idx in range(active.size(-1))
+                 if active[b, k_idx] and pred_loc[b, k_idx].item() == loc),
+                key=lambda ki: is_obj[b, ki].item(),
+                default=None,
+            )
+            if best_k is not None:
+                sev_mae_total += abs(severity[b, best_k].item() - y_sev[b, loc].item())
+                sev_mae_count += 1
+
+    f1, prec, rec = f1_from_counts(tp, fp, fn)
+    sev_mae    = sev_mae_total / max(sev_mae_count, 1)
+    mean_k_pred = active.sum(-1).float().mean().item()
+    mean_k_true = k_true_per.mean().item()
+
+    return {
+        "map_mse":      NaN,
+        "top_k_recall": tkr,
+        "severity_mae": sev_mae,
+        "ap":           NaN,
         "f1":           f1,
         "precision":    prec,
         "recall":       rec,
