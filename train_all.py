@@ -49,12 +49,28 @@ def main() -> None:
 
     # dataset-specific
     parser.add_argument("--snr",              type=float, default=-1.0)
+    parser.add_argument("--subsets",          nargs="+", default=None,
+                        choices=["healthy", "single", "double"],
+                        help="Training subsets for 7story datasets (default: single double)")
     parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"])
     parser.add_argument("--window-size",      type=int,   default=2048)
     parser.add_argument("--overlap",          type=float, default=0.5)
     parser.add_argument("--downsample",       type=int,   default=4)
 
     # model-specific (passed through to train.py which ignores irrelevant ones)
+    parser.add_argument("--tag",                 default="",
+                        help="Output dir suffix, e.g. 'pmix' → states/qatar-pmix/")
+    parser.add_argument("--p-mix",              type=float, default=0.0,
+                        help="Synthetic double-damage mixing probability (Qatar only)")
+    parser.add_argument("--held-out-double",    type=int,   default=None,
+                        choices=[0, 1, 2, 3, 4],
+                        help="Hold out this double-damage recording index (0-4) for test; "
+                             "add the other 4 to training (Qatar only).")
+    parser.add_argument("--split-double",       action="store_true", default=False,
+                        help="Use first½ of all 5 double-damage recordings for training, "
+                             "second½ for test (Qatar only).")
+    parser.add_argument("--targeted-mix",       action="store_true", default=False,
+                        help="Bias synthetic K=2 mixing toward the 5 known double-damage pairs (Qatar only).")
     parser.add_argument("--bce-pos-weight",     type=float, default=None)
     parser.add_argument("--num-slots",          type=int,   default=5)
     parser.add_argument("--num-decoder-layers", type=int,   default=2)
@@ -78,6 +94,10 @@ def main() -> None:
         "--embed-dim",      str(args.embed_dim),
         "--neck-dropout",   str(args.neck_dropout),
         "--snr",            str(args.snr),
+    ]
+    if args.subsets:
+        shared += ["--subsets"] + args.subsets
+    shared += [
         "--tower-excitation", *args.tower_excitation,
         "--window-size",    str(args.window_size),
         "--overlap",        str(args.overlap),
@@ -87,6 +107,16 @@ def main() -> None:
         "--no-obj-weight",  str(args.no_obj_weight),
         "--loc-weight",     str(args.loc_weight),
     ]
+    if args.tag:
+        shared += ["--tag", args.tag]
+    if args.p_mix > 0.0:
+        shared += ["--p-mix", str(args.p_mix)]
+    if args.held_out_double is not None:
+        shared += ["--held-out-double", str(args.held_out_double)]
+    if args.split_double:
+        shared += ["--split-double"]
+    if args.targeted_mix:
+        shared += ["--targeted-mix"]
     if args.root is not None:
         shared += ["--root", args.root]
     if args.bce_pos_weight is not None:

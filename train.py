@@ -91,14 +91,20 @@ def _build_dl_kwargs(args, dataset) -> dict:
         eval_batch_size=args.eval_batch_size,
         seed=args.seed,
     )
-    if dataset.name == "7story":
+    if dataset.name in ("7story", "7story-sparse"):
         base["snr"] = args.snr
+        if args.subsets:
+            base["subsets"] = args.subsets
     elif dataset.name == "tower":
         base["tower_excitation"] = tuple(args.tower_excitation)
     elif dataset.name == "qatar":
-        base["window_size"] = args.window_size
-        base["overlap"]     = args.overlap
-        base["downsample"]  = args.downsample
+        base["window_size"]     = args.window_size
+        base["overlap"]         = args.overlap
+        base["downsample"]      = args.downsample
+        base["p_mix"]           = args.p_mix
+        base["held_out_double"] = args.held_out_double
+        base["split_double"]    = args.split_double
+        base["targeted_mix"]    = args.targeted_mix
     return base
 
 
@@ -257,7 +263,8 @@ def main(args) -> None:
     )
 
     # Save checkpoint
-    states_dir = Path(__file__).resolve().parent / "states" / args.dataset
+    run_name   = f"{args.dataset}-{args.tag}" if args.tag else args.dataset
+    states_dir = Path(__file__).resolve().parent / "states" / run_name
     states_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = None
     if args.save_checkpoint:
@@ -267,7 +274,7 @@ def main(args) -> None:
 
     # Plots
     val_acc_label = "Val F1" if args.model in ("c", "dr") else "Val top-k recall"
-    save_dir = f"saved_results/{args.dataset}/{args.model}"
+    save_dir = f"saved_results/{run_name}/{args.model}"
     plot_training_results(
         train_losses, val_losses, val_accs, val_mses,
         save_dir=save_dir,
@@ -346,6 +353,9 @@ if __name__ == "__main__":
     # --- dataset-specific ---
     parser.add_argument("--snr",              type=float, default=-1.0,
                         help="SNR for noise injection (7-story only; -1=off)")
+    parser.add_argument("--subsets",          nargs="+", default=None,
+                        choices=["healthy", "single", "double"],
+                        help="Training subsets for 7story datasets (default: single double)")
     parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"],
                         help="Excitation types to include (tower only)")
     parser.add_argument("--window-size",      type=int,   default=2048,
@@ -354,6 +364,20 @@ if __name__ == "__main__":
                         help="Window overlap fraction (qatar only)")
     parser.add_argument("--downsample",       type=int,   default=4,
                         help="Decimation factor (qatar only; 4=256 Hz)")
+    parser.add_argument("--p-mix",            type=float, default=0.0,
+                        help="Prob of synthetic double-damage mixing per sample (qatar only)")
+    parser.add_argument("--held-out-double",  type=int,   default=None,
+                        choices=[0, 1, 2, 3, 4],
+                        help="Hold out this double-damage recording index (0-4) for test; "
+                             "add the other 4 to training (qatar only). Default: all 5 for test only.")
+    parser.add_argument("--split-double",     action="store_true", default=False,
+                        help="Use first½ of all 5 double-damage recordings for training, "
+                             "second½ for test (qatar only). Mutually exclusive with --held-out-double.")
+    parser.add_argument("--targeted-mix",     action="store_true", default=False,
+                        help="Bias synthetic K=2 mixing toward the 5 known double-damage joint pairs "
+                             "(qatar only). Requires --p-mix > 0.")
+    parser.add_argument("--tag",              default="",
+                        help="Suffix appended to output dirs, e.g. 'pmix' → states/qatar-pmix/")
 
     args = parser.parse_args()
 

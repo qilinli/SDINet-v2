@@ -19,6 +19,7 @@ from typing import Callable, Literal
 from lib.data_safetensors import (
     get_combined_dataloaders,
     get_dataloaders as _get_split_loader,
+    SPARSE_7STORY_SENSOR_INDICES,
 )
 from lib.data_tower import (
     TOWER_DEFAULT_ROOT,
@@ -89,8 +90,9 @@ class DatasetConfig:
         7-story pools single + double val sets (both were seen during training).
         All other datasets return a single-element list.
         """
-        if self.name == "7story":
-            return _7story_cal_loaders(**kwargs)
+        if self.name in ("7story", "7story-sparse"):
+            si = SPARSE_7STORY_SENSOR_INDICES if self.name == "7story-sparse" else None
+            return _7story_cal_loaders(**kwargs, sensor_indices=si)
         _, val_dl, _ = self.get_dataloaders(**kwargs)
         return [val_dl]
 
@@ -101,8 +103,9 @@ class DatasetConfig:
         7-story returns separate single and double test loaders.
         Other datasets return a single ``[(dataset_name, test_dl)]`` pair.
         """
-        if self.name == "7story":
-            test_single, test_double = _7story_test_loaders(**kwargs)
+        if self.name in ("7story", "7story-sparse"):
+            si = SPARSE_7STORY_SENSOR_INDICES if self.name == "7story-sparse" else None
+            test_single, test_double = _7story_test_loaders(**kwargs, sensor_indices=si)
             return [("single", test_single), ("double", test_double)]
         _, _, test_dl = self.get_dataloaders(**kwargs)
         return [(self.name, test_dl)]
@@ -119,9 +122,9 @@ class DatasetConfig:
 # Translate the uniform dl_kwargs dict into each data module's call signature. #
 # --------------------------------------------------------------------------- #
 
-def _loader_7story(root, snr, num_workers, train_batch_size, eval_batch_size, seed, **_):
+def _loader_7story(root, snr, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **_):
     return get_combined_dataloaders(
-        ["single", "double"], snr,
+        subsets or ["single", "double"], snr,
         root=root,
         num_workers=num_workers,
         train_batch_size=train_batch_size,
@@ -130,21 +133,39 @@ def _loader_7story(root, snr, num_workers, train_batch_size, eval_batch_size, se
     )
 
 
-def _7story_cal_loaders(root, snr, num_workers, eval_batch_size, seed, **_) -> list:
+def _loader_7story_sparse(root, snr, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **_):
+    return get_combined_dataloaders(
+        subsets or ["single", "double"], snr,
+        root=root,
+        num_workers=num_workers,
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        seed=seed,
+        sensor_indices=SPARSE_7STORY_SENSOR_INDICES,
+    )
+
+
+def _7story_cal_loaders(root, snr, num_workers, eval_batch_size, seed,
+                        sensor_indices=None, **_) -> list:
     """Separate single + double val loaders for 7-story calibration."""
     _, val_s, _ = _get_split_loader("single", snr, root=root, num_workers=num_workers,
-                                    eval_batch_size=eval_batch_size, seed=seed)
+                                    eval_batch_size=eval_batch_size, seed=seed,
+                                    sensor_indices=sensor_indices)
     _, val_d, _ = _get_split_loader("double", snr, root=root, num_workers=num_workers,
-                                    eval_batch_size=eval_batch_size, seed=seed)
+                                    eval_batch_size=eval_batch_size, seed=seed,
+                                    sensor_indices=sensor_indices)
     return [val_s, val_d]
 
 
-def _7story_test_loaders(root, snr, num_workers, eval_batch_size, seed, **_):
+def _7story_test_loaders(root, snr, num_workers, eval_batch_size, seed,
+                         sensor_indices=None, **_):
     """Separate single + double test loaders for 7-story evaluation."""
     _, _, test_s = _get_split_loader("single", snr, root=root, num_workers=num_workers,
-                                     eval_batch_size=eval_batch_size, seed=seed)
+                                     eval_batch_size=eval_batch_size, seed=seed,
+                                     sensor_indices=sensor_indices)
     _, _, test_d = _get_split_loader("double", snr, root=root, num_workers=num_workers,
-                                     eval_batch_size=eval_batch_size, seed=seed)
+                                     eval_batch_size=eval_batch_size, seed=seed,
+                                     sensor_indices=sensor_indices)
     return test_s, test_d
 
 
@@ -160,7 +181,9 @@ def _loader_tower(root, tower_excitation, num_workers, train_batch_size, eval_ba
 
 
 def _loader_qatar(root, window_size, overlap, downsample,
-                  num_workers, train_batch_size, eval_batch_size, seed, **_):
+                  num_workers, train_batch_size, eval_batch_size, seed,
+                  p_mix=0.0, held_out_double=None, split_double=False,
+                  targeted_mix=False, **_):
     return get_qatar_dataloaders(
         root=root,
         window_size=window_size, overlap=overlap, downsample=downsample,
@@ -168,16 +191,23 @@ def _loader_qatar(root, window_size, overlap, downsample,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
+        p_mix=p_mix,
+        held_out_double=held_out_double,
+        split_double=split_double,
+        targeted_mix=targeted_mix,
     )
 
 
 def _extra_test_qatar(root, window_size, overlap, downsample,
-                      num_workers, eval_batch_size, **_):
+                      num_workers, eval_batch_size, held_out_double=None,
+                      split_double=False, **_):
     return get_qatar_double_test_dataloader(
         root=root,
         window_size=window_size, overlap=overlap, downsample=downsample,
         num_workers=num_workers,
         eval_batch_size=eval_batch_size,
+        held_out_index=held_out_double,
+        split_second_half=split_double,
     )
 
 
@@ -195,6 +225,16 @@ DATASETS: dict[str, DatasetConfig] = {
         supports_real_benchmark=True,
         default_root="data/7-story-frame/safetensors/unc=0",
         _loader_fn=_loader_7story,
+    ),
+    "7story-sparse": DatasetConfig(
+        name="7story-sparse",
+        n_sensors=9,           # only the 9 sensors matching the real physical benchmark
+        n_locations=70,
+        time_len=500,
+        label_type="continuous",
+        supports_real_benchmark=True,
+        default_root="data/7-story-frame/safetensors/unc=0",
+        _loader_fn=_loader_7story_sparse,
     ),
     "tower": DatasetConfig(
         name="tower",

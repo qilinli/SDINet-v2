@@ -16,8 +16,8 @@ Usage
     python inspect_predictions.py --model dr --dataset safetensors
     python inspect_predictions.py --model c  --dataset safetensors
 
-Tower output  → saved_results_{model}/tower/predictions_{grid,scatter}.png
-Safetensors   → saved_results_{model}/safetensors/predictions_{damaged,scatter}.png
+Tower output  → saved_results/tower/{model}/predictions_{grid,scatter}.png
+Safetensors   → saved_results/safetensors/{model}/predictions_{damaged,scatter}.png
 
 Tower plots (L=4 locations, 9 damage states)
 --------------------------------------------
@@ -49,7 +49,11 @@ from lib.data_tower import (
     _load_arrays, _stratified_case_split,
     TOWER_DEFAULT_ROOT, TOWER_TIME_LEN, TOWER_N_SENSORS, TOWER_N_LOCATIONS,
 )
-from lib.model import ModelConfigDR, ModelConfigC, build_model
+from lib.data_qatar import (
+    get_qatar_dataloaders, get_qatar_double_test_dataloader,
+    QATAR_DEFAULT_ROOT, QATAR_N_SENSORS, QATAR_N_LOCATIONS,
+)
+from lib.model import ModelConfig, ModelConfigDR, ModelConfigC, build_model
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -155,26 +159,29 @@ def run_dr(model: torch.nn.Module, X: np.ndarray, batch_size: int = 256) -> np.n
 
 
 @torch.inference_mode()
-def run_c(model: torch.nn.Module, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
+def run_c(model: torch.nn.Module, X: np.ndarray, batch_size: int = 256,
+          use_severity: bool = True) -> np.ndarray:
     """
-    Returns per-location severity in [0,1] space for model C.
+    Returns per-location score in [0,1] space for model C.
     MidnC outputs (slot_loc_logits, slot_sev) — we convert to a dense (N, L) map.
+
+    use_severity=True  (default, for 7-story):
+        damage_map[l] = Σ_k  is_obj[k] * sev[k] * loc_probs[k, l]
+    use_severity=False (for Qatar, where sev_weight=0.0 so sev head is untrained):
+        damage_map[l] = Σ_k  is_obj[k] * loc_probs[k, l]
     """
     device = next(model.parameters()).device
     x_t = torch.from_numpy(X).float()
     if x_t.ndim == 3:
         x_t = x_t.unsqueeze(1)
-    all_loc, all_sev = [], []
+    all_loc = []
     for i in range(0, len(x_t), batch_size):
         loc_logits, sev = model(x_t[i:i+batch_size].to(device))
         # loc_logits: (B, K, L+1);  sev: (B, K)
-        # Formula from MidnC docstring:
-        #   is_obj[k]       = 1 − softmax(loc_logits[k])[∅]
-        #   damage_map[l]   = Σ_k  is_obj[k] * sev[k] * loc_probs[k, l]
         loc_prob = loc_logits.softmax(-1)               # (B, K, L+1)
         is_obj   = 1.0 - loc_prob[..., -1]             # (B, K)
-        weighted = (is_obj * sev).unsqueeze(-1)         # (B, K, 1)
-        dense    = (loc_prob[..., :-1] * weighted).sum(dim=1)  # (B, L)
+        scale    = (is_obj * sev) if use_severity else is_obj  # (B, K)
+        dense    = (loc_prob[..., :-1] * scale.unsqueeze(-1)).sum(dim=1)  # (B, L)
         all_loc.append(dense.cpu().numpy())
     return np.concatenate(all_loc, axis=0)
 
@@ -337,8 +344,8 @@ def load_safetensors_test(
     return np.stack(Xs), np.stack(Ys), np.array(subsets)
 
 
-def load_dr_model_safetensors(ckpt_path: Path) -> torch.nn.Module:
-    cfg = ModelConfigDR()   # defaults: time_len=500, n_sensors=65, num_locations=70
+def load_dr_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
+    cfg = ModelConfigDR(n_sensors=n_sensors)
     model = build_model(cfg)
     model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
     model.eval()
@@ -361,11 +368,11 @@ def _infer_c_arch(state_dict: dict, num_locations: int) -> dict:
                 nhead=nhead, num_locations=num_locations)
 
 
-def load_c_model_safetensors(ckpt_path: Path) -> torch.nn.Module:
+def load_c_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
     from lib.model import ModelConfigC
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     arch = _infer_c_arch(sd, num_locations=70)
-    cfg = ModelConfigC(**arch)
+    cfg = ModelConfigC(**arch, n_sensors=n_sensors)
     model = build_model(cfg)
     model.load_state_dict(sd)
     model.eval()
@@ -381,6 +388,7 @@ def plot_safetensors_damaged_vs_undamaged(
     y_norm: np.ndarray,  # (N, L) in [-1,1]
     subsets: np.ndarray, # (N,) "single"/"double"
     out_path: Path,
+    dataset_label: str = "safetensors test set, L=70",
 ) -> None:
     """
     Violin plot: predicted severity at damaged vs undamaged locations.
@@ -423,8 +431,7 @@ def plot_safetensors_damaged_vs_undamaged(
         ax.text(1, med_d + 0.03, f"med={med_d:.3f}", ha="center", fontsize=7, color="darkorange")
 
     fig.suptitle(
-        "Prediction distribution: damaged vs undamaged locations\n"
-        "(safetensors test set, L=70)",
+        f"Prediction distribution: damaged vs undamaged locations\n({dataset_label})",
         fontsize=10,
     )
     fig.tight_layout()
@@ -439,6 +446,7 @@ def plot_safetensors_scatter(
     y_norm: np.ndarray,
     subsets: np.ndarray,
     out_path: Path,
+    dataset_label: str = "safetensors test set",
 ) -> None:
     """
     Scatter: predicted value vs true value (mapped to [0,1]) for every
@@ -462,7 +470,7 @@ def plot_safetensors_scatter(
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("True severity  (0 = undamaged, 1 = damaged)", fontsize=9)
     ax.set_ylabel("Predicted severity", fontsize=9)
-    ax.set_title("Predicted vs True — all locations (safetensors test set)", fontsize=9)
+    ax.set_title(f"Predicted vs True — all locations ({dataset_label})", fontsize=9)
     ax.set_aspect("equal")
 
     handles = [mpatches.Patch(color=colors[n], label=n) for n in ("single", "double") if n in subsets]
@@ -490,6 +498,218 @@ def print_safetensors_table(pred: np.ndarray, y_norm: np.ndarray, subsets: np.nd
     print()
 
 
+# ── Qatar data loading ────────────────────────────────────────────────────────
+
+def load_qatar_test(
+    root: str | Path,
+    window_size: int = 2048,
+    overlap: float = 0.5,
+    downsample: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns X_test (N,1,T,30), Y_norm (N,30) in {-1,+1}, subsets (N,) strings.
+    Combines the single-damage test split (Dataset B last 50%) and the
+    double-damage test set into one array, tagged by 'single' / 'double'.
+    """
+    dl_kwargs = dict(root=root, window_size=window_size, overlap=overlap,
+                     downsample=downsample, eval_batch_size=256, num_workers=0)
+
+    _, _, test_dl   = get_qatar_dataloaders(**dl_kwargs, train_batch_size=256)
+    double_dl       = get_qatar_double_test_dataloader(**dl_kwargs)
+
+    def _collect(dl):
+        Xs, Ys = [], []
+        for x, y in dl:
+            Xs.append(x.numpy()); Ys.append(y.numpy())
+        return np.concatenate(Xs), np.concatenate(Ys)
+
+    X_s, Y_s = _collect(test_dl)
+    X_d, Y_d = _collect(double_dl)
+
+    X       = np.concatenate([X_s, X_d])
+    Y       = np.concatenate([Y_s, Y_d])
+    subsets = np.array(["single"] * len(X_s) + ["double"] * len(X_d))
+    return X, Y, subsets
+
+
+# ── Qatar model loading ────────────────────────────────────────────────────────
+
+def load_v1_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
+    cfg = ModelConfig(n_sensors=n_sensors)
+    model = build_model(cfg)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
+def load_v1_model_qatar(ckpt_path: Path, time_len: int = 512) -> torch.nn.Module:
+    cfg = ModelConfig(
+        n_sensors=QATAR_N_SENSORS,
+        time_len=time_len,
+        out_channels=QATAR_N_LOCATIONS + 1,
+    )
+    model = build_model(cfg)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
+def load_dr_model_qatar(ckpt_path: Path, time_len: int = 512) -> torch.nn.Module:
+    cfg = ModelConfigDR(
+        n_sensors=QATAR_N_SENSORS,
+        time_len=time_len,
+        num_locations=QATAR_N_LOCATIONS,
+    )
+    model = build_model(cfg)
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
+def load_c_model_qatar(ckpt_path: Path) -> torch.nn.Module:
+    from lib.model import load_model_c_from_checkpoint
+    return load_model_c_from_checkpoint(ckpt_path)
+
+
+# ── v1 inference ──────────────────────────────────────────────────────────────
+
+@torch.inference_mode()
+def run_v1(model: torch.nn.Module, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    """
+    Returns per-location score in [0,1] for the v1 head.
+    Map = softmax(loc_pred) scaled by (dmg_pred + 1) / 2, so undamaged samples
+    produce near-zero scores and damaged samples concentrate mass on the
+    predicted location.
+    """
+    device = next(model.parameters()).device
+    x_t = torch.from_numpy(X).float()
+    if x_t.ndim == 3:
+        x_t = x_t.unsqueeze(1)
+    preds = []
+    for i in range(0, len(x_t), batch_size):
+        dmg, loc = model(x_t[i:i+batch_size].to(device))  # (B,1), (B,L)
+        dmg_scale = (dmg + 1.0) / 2.0                      # (B,1) ∈ [0,1]
+        pred = dmg_scale * loc.softmax(-1)                  # (B,L)
+        preds.append(pred.cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+# ── Real .mat benchmark ────────────────────────────────────────────────────────
+
+def plot_real_benchmark(
+    pred_single: np.ndarray,   # (70,) predicted scores in [0,1]
+    pred_two:    np.ndarray,   # (70,) predicted scores in [0,1]
+    model_name:  str,
+    out_path:    Path,
+) -> None:
+    """
+    Bar chart of predicted damage map vs ground truth for both real .mat benchmarks.
+
+    Ground truth locations are highlighted in red; all others in steel blue.
+    The ground truth label is in physical units (severity ∈ [0,1]); the normalised
+    presence threshold maps to severity > 0 (i.e. any non-zero label is "damaged").
+
+    Single-damage benchmark: joint 12 (0-indexed: 11), severity=0.125
+    Two-damage benchmark:    joints 6 & 12 (0-indexed: 5 & 11), severity=0.125 each
+    """
+    from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, \
+        DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
+
+    _, y_single = load_real_test_tensors(spec=DEFAULT_BENCHMARK)
+    _, y_two    = load_real_test_tensors(spec=TWO_DAMAGE_BENCHMARK)
+
+    # Convert physical label to boolean damage presence
+    gt_single = (y_single.squeeze().numpy() > 0)   # (70,) bool
+    gt_two    = (y_two.squeeze().numpy()    > 0)   # (70,) bool
+
+    # Raw physical severity for annotation (as stored in the .mat file)
+    sev_single = y_single.squeeze().numpy()   # e.g. 0.125
+    sev_two    = y_two.squeeze().numpy()
+
+    L = 70
+    xs = np.arange(L)
+
+    fig, axes = plt.subplots(2, 1, figsize=(18, 6), sharex=True)
+
+    for ax, pred, gt, sev, title_suffix in zip(
+        axes,
+        [pred_single, pred_two],
+        [gt_single,   gt_two],
+        [sev_single,  sev_two],
+        ["Single-damage benchmark (joint 12, severity=0.125)",
+         "Two-damage benchmark (joints 6 & 12, severity=0.125 each)"],
+    ):
+        colors = ["#e87171" if gt[i] else "#7eb5e8" for i in range(L)]
+        ax.bar(xs, pred, color=colors, width=0.8, alpha=0.85, zorder=2)
+
+        # mark ground-truth locations with vertical lines and severity label
+        for loc in np.where(gt)[0]:
+            ax.axvline(loc, color="red", linewidth=1.5, linestyle="--", alpha=0.7, zorder=3)
+            ax.text(loc + 0.3, pred[loc] + 0.03,
+                    f"GT={sev[loc]:.3f}", fontsize=7, color="red", va="bottom")
+
+        ax.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_ylim(0, 1.1)
+        ax.set_ylabel("Predicted score", fontsize=9)
+        ax.set_title(title_suffix, fontsize=9)
+        ax.set_xlim(-1, L)
+        ax.tick_params(labelsize=7)
+        ax.grid(axis="y", linewidth=0.4, alpha=0.4, zorder=0)
+
+    axes[-1].set_xlabel("Location index (0-indexed, 0–69)", fontsize=9)
+
+    from matplotlib.patches import Patch
+    fig.legend(
+        handles=[Patch(facecolor="#e87171", label="Damaged (GT)"),
+                 Patch(facecolor="#7eb5e8", label="Undamaged (GT)")],
+        loc="upper right", fontsize=8,
+    )
+    v1_note = "  (V1: bar = softmax location probability, independent of global damage score)" if model_name == "v1" else ""
+    fig.suptitle(
+        f"{model_name.upper()} — Real physical benchmark\n"
+        f"Bar height = model predicted score  |  Bar colour = ground truth (red=damaged, blue=undamaged){v1_note}",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[inspect] Saved real benchmark plot → {out_path}")
+
+
+def _run_real_inference(model, model_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """Run model on both real .mat benchmarks, return (pred_single, pred_two) each (70,)."""
+    from lib.data_safetensors import load_real_test_tensors, DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
+
+    device = next(model.parameters()).device
+
+    def _infer(spec):
+        x_raw, _ = load_real_test_tensors(spec=spec)   # (T, S_real)
+        x = x_raw[None, None, ...].to(device)           # (1, 1, T, S_real)
+        with torch.inference_mode():
+            if model_name == "v1":
+                dmg, loc = model(x)
+                dmg_val = float(((dmg + 1.0) / 2.0).squeeze().item())
+                # Distributed map: dmg_scale * softmax(loc) over L locations.
+                # Consistent with distributed_map_v1 in metrics and run_v1.
+                # Note: softmax here is post-hoc over locations (L dim); the
+                # model's internal softmax is over sensors (S dim) for importance.
+                pred = (dmg_val * loc.softmax(-1)).squeeze().cpu().numpy()
+                print(f"  [v1] global dmg_scale={dmg_val:.4f}  "
+                      f"({'damaged' if dmg_val > 0.5 else 'undamaged'})")
+            elif model_name == "c":
+                loc_logits, sev = model(x)
+                loc_prob = loc_logits.softmax(-1)
+                is_obj   = 1.0 - loc_prob[..., -1]
+                scale    = is_obj * sev
+                pred = (loc_prob[..., :-1] * scale.unsqueeze(-1)).sum(dim=1).squeeze().cpu().numpy()
+            else:  # dr
+                pred = model(x).squeeze().cpu().numpy()
+        return pred
+
+    return _infer(DEFAULT_BENCHMARK), _infer(TWO_DAMAGE_BENCHMARK)
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def latest_ckpt(model_type: str, dataset: str = "tower") -> Path:
@@ -510,21 +730,65 @@ def latest_ckpt(model_type: str, dataset: str = "tower") -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",   choices=["dr", "c"], default="dr")
-    parser.add_argument("--dataset", choices=["tower", "safetensors"], default="tower")
+    parser.add_argument("--model",   choices=["v1", "dr", "c"], default="dr")
+    parser.add_argument("--dataset", choices=["tower", "safetensors", "qatar", "7story-real", "7story-sparse-real"],
+                        default="tower")
     parser.add_argument("--ckpt",    type=Path, default=None)
     parser.add_argument("--root",    type=Path, default=None)
-    parser.add_argument("--seed",    type=int, default=42)
+    parser.add_argument("--seed",    type=int,  default=42)
+    parser.add_argument("--window-size", type=int,   default=2048,
+                        help="Qatar window size in samples (default 2048=2s @ 1024 Hz)")
+    parser.add_argument("--downsample", type=int,   default=4,
+                        help="Qatar decimation factor (default 4 → 256 Hz)")
+    parser.add_argument("--overlap",    type=float, default=0.5,
+                        help="Qatar window overlap fraction (default 0.5)")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Override output directory (default: saved_results/{dataset}/{model}/)")
     args = parser.parse_args()
 
-    ckpt = args.ckpt or latest_ckpt(args.model, args.dataset)
+    if args.dataset == "7story-real":
+        dataset_for_ckpt = "7story"
+    elif args.dataset == "7story-sparse-real":
+        dataset_for_ckpt = "7story-sparse"
+    else:
+        dataset_for_ckpt = args.dataset
+    ckpt = args.ckpt or latest_ckpt(args.model, dataset_for_ckpt)
     print(f"[inspect] Loading {args.model.upper()} checkpoint: {ckpt}")
 
-    out_dir = Path(f"saved_results_{args.model}/{args.dataset}")
+    if args.dataset == "7story-real":
+        default_out_dir = Path(f"saved_results/7story/real/{args.model}")
+    elif args.dataset == "7story-sparse-real":
+        default_out_dir = Path(f"saved_results/7story-sparse/real/{args.model}")
+    else:
+        default_out_dir = Path(f"saved_results/{args.dataset}/{args.model}")
+    out_dir = args.out_dir if args.out_dir is not None else default_out_dir
     device  = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # ── Real .mat benchmark ────────────────────────────────────────────────────
+    if args.dataset in ("7story-real", "7story-sparse-real"):
+        n_sensors = 9 if args.dataset == "7story-sparse-real" else 65
+        if args.model == "v1":
+            model = load_v1_model_safetensors(ckpt, n_sensors=n_sensors)
+        elif args.model == "c":
+            model = load_c_model_safetensors(ckpt, n_sensors=n_sensors)
+        else:
+            model = load_dr_model_safetensors(ckpt, n_sensors=n_sensors)
+
+        model = model.to(device)
+        pred_single, pred_two = _run_real_inference(model, args.model)
+
+        print(f"\n[real-single]  top-3 predicted locations: {np.argsort(pred_single)[-3:][::-1].tolist()}")
+        print(f"               GT damaged location: 11 (1-indexed: 12), severity=0.125")
+        print(f"               predicted score at GT loc: {pred_single[11]:.4f}")
+        print(f"\n[real-two]     top-3 predicted locations: {np.argsort(pred_two)[-3:][::-1].tolist()}")
+        print(f"               GT damaged locations: 5, 11 (1-indexed: 6, 12), severity=0.125 each")
+        print(f"               predicted scores at GT locs: {pred_two[5]:.4f}, {pred_two[11]:.4f}")
+
+        plot_real_benchmark(pred_single, pred_two, args.model,
+                            out_dir / "real_benchmark.png")
+
     # ── Tower ──────────────────────────────────────────────────────────────────
-    if args.dataset == "tower":
+    elif args.dataset == "tower":
         if args.model == "dr":
             model = load_dr_model(ckpt)
             run_fn = run_dr
@@ -543,6 +807,38 @@ def main() -> None:
         print_table(pred, Y_test, states)
         plot_predictions(pred, Y_test, states, out_dir / "predictions_grid.png")
         plot_scatter(pred, Y_test, states,     out_dir / "predictions_scatter.png")
+
+    # ── Qatar ──────────────────────────────────────────────────────────────────
+    elif args.dataset == "qatar":
+        time_len = args.window_size // args.downsample
+        if args.model == "v1":
+            model  = load_v1_model_qatar(ckpt, time_len=time_len)
+            run_fn = run_v1
+        elif args.model == "dr":
+            model  = load_dr_model_qatar(ckpt, time_len=time_len)
+            run_fn = run_dr
+        else:
+            model  = load_c_model_qatar(ckpt)
+            run_fn = lambda m, X: run_c(m, X, use_severity=False)
+
+        model = model.to(device)
+        root  = str(args.root) if args.root else QATAR_DEFAULT_ROOT
+
+        print("[inspect] Loading Qatar test splits (single + double) …")
+        X_test, Y_norm, subsets = load_qatar_test(
+            root, window_size=args.window_size,
+            overlap=args.overlap, downsample=args.downsample,
+        )
+        print(f"[inspect] single={( subsets=='single').sum()}  double={(subsets=='double').sum()} windows")
+
+        pred = run_fn(model, X_test)
+        print_safetensors_table(pred, Y_norm, subsets)
+        plot_safetensors_damaged_vs_undamaged(pred, Y_norm, subsets,
+                                              out_dir / "predictions_damaged.png",
+                                              dataset_label="Qatar SHM Benchmark, L=30")
+        plot_safetensors_scatter(pred, Y_norm, subsets,
+                                 out_dir / "predictions_scatter.png",
+                                 dataset_label="Qatar SHM Benchmark")
 
     # ── Safetensors ────────────────────────────────────────────────────────────
     else:

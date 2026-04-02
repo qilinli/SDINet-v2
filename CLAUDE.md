@@ -1,5 +1,13 @@
 # SDINet-v2 — Claude Code Guide
 
+## Architecture reference
+
+See **`MODEL_ARCHITECTURE.md`** for annotated diagrams of all three heads (v1, DR, C) — input/output shapes, sensor independence, importance weighting, and softmax clarification.
+
+## Research framing
+
+See **`RESEARCH.md`** for the evolving research problem statement, central thesis, dataset roles, and open questions. Update it as the research discussion develops.
+
 ## What this repo is
 
 Structural Damage Identification (SHM) neural network. Sensor accelerometer data → damage location + severity. Three model heads:
@@ -18,7 +26,9 @@ Current development focus: **v1, DR, C on the Qatar SHM Benchmark** — single-d
 | `python train.py --model c  --dataset qatar  [--epochs N]` | e.g. Approach-C on Qatar |
 | `python train.py --model dr --dataset tower  [--epochs N]` | e.g. DR on Tower |
 | `python train_all.py --dataset 7story [--models v1 c dr] [--epochs N]` | Train multiple models sequentially |
-| `python evaluate.py --dataset 7story --v1 <ckpt> --c <ckpt> --dr <ckpt>` | Side-by-side metric table |
+| `python evaluate.py --dataset 7story --v1 <ckpt> --c <ckpt> --dr <ckpt>` | Side-by-side metric table, saves JSON+CSV |
+| `python inspect_predictions.py --model c --dataset tower [--ckpt <ckpt>]` | Prediction visualisation plots |
+| `python sweep_c_threshold.py --c <ckpt>` | Sweep `is_obj` threshold for C-head on Qatar double-damage |
 
 ### Dataset registry
 
@@ -79,21 +89,75 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - Processed output: `data/Qatar/processed/` (default)
 - 30 sensors, 30 joints, 1024 Hz, white noise excitation
 - Labels: binary {0,1} → y_norm {-1,+1}; no severity grading
-- Dataset A (31 files: 1 undamaged + 30 single-damage) → train/val split
-- Dataset B (31 files, same scenarios, independent run) → test
-- Double Damage (5 files, real double-damage) → `get_qatar_double_test_dataloader()`
+- Dataset A (31 files: 1 undamaged + 30 single-damage) → train only
+- Dataset B (31 files, same scenarios, independent run) → val (first 50%) / test (last 50%)
+- Double Damage (5 files, real double-damage) → by default test only; can be added to training via `--held-out-double` or `--split-double`
 - Windowing: `window_size` (default 2048=2s) + `overlap` (default 0.5) in data loader
-- Augmentation: amplitude scaling + Gaussian noise + random channel masking + structured row/col masking
+- Augmentation: amplitude scaling + Gaussian noise + random channel masking + structured row/col masking + synthetic double-damage mixing (see `--p-mix`)
 - Use `--dataset qatar` in `train.py` / `train_all.py`; `--root` overrides default path
 - `--window-size` and `--overlap` flags on `train.py` to vary parametrically
 
 ## Training output
 
-- Checkpoints: `states/<dataset>/<model>-combined-<uuid>.pt`
-- Plots: `saved_results/<dataset>/<model>/` — loss curves, val_map_mse, val_acc
+- Checkpoints: `states/<run_name>/<model>-combined-<uuid>.pt`
+- Calibration: `states/<run_name>/<model>-combined-<uuid>.json` (alongside checkpoint)
+- Plots: `saved_results/<run_name>/<model>/` — loss curves, val_map_mse, val_acc
 - Per-epoch progress bar: `train_loss | val_loss | val_map_mse | val_top_k_recall` (v1) or `val_f1` (C/DR)
 - Final eval after training: test split(s) + real benchmark (7-story only) + double-damage test (Qatar only)
 
+`<run_name>` = `<dataset>` by default, or `<dataset>-<tag>` when `--tag` is used (e.g. `qatar-pmix`).
+
+## Key train.py flags
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--tag <str>` | `""` | Suffix for output dirs — keeps experimental runs separate from baseline |
+| `--p-mix <float>` | `0.0` | Qatar only: fraction of training windows replaced by synthetic K=2 samples |
+| `--held-out-double <0-4>` | `None` | Qatar only: hold out one double-damage recording for test, add other 4 to training |
+| `--split-double` | `False` | Qatar only: use first½ of all 5 double-damage recordings for training, second½ for test. Mutually exclusive with `--held-out-double` |
+| `--no-obj-weight` | `0.1` | C-head: down-weight for ∅ class in location CE |
+| `--sev-weight` | `0.0`* | C-head severity loss weight (`*` Qatar registry default) |
+| `--num-slots` | `5` | C-head: K_max detection slots |
+
+## Evaluation output
+
+`evaluate.py` prints a metric table **and** saves results automatically:
+- `saved_results/<dataset>/eval_<timestamp>.json` — full nested dict (NaN → null)
+- `saved_results/<dataset>/eval_<timestamp>.csv` — same table as printed
+
+Use `--out <stem>` to override the filename (e.g. `--out saved_results/qatar/eval_pmix`).
+
+`inspect_predictions.py` saves plots to `saved_results/<dataset>/<model>/` (consistent with training output).
+Use `--out-dir` to override for non-standard paths.
+
+## Multi-damage training modes (Qatar)
+
+Three modes for incorporating double-damage data, controlled by flags on `train.py` / `train_all.py` / `train_loo.py`:
+
+### Synthetic mixing only (`--p-mix`)
+Each training window has `p_mix` probability of replacement by a synthetic K=2 sample:
+1. Partner drawn from K=1 windows of a *different* recording (K=2 windows excluded from pool to prevent K=3).
+2. `x_mix = (x_i + x_j) / √2` — energy-preserving sum.
+3. `y_mix = max(y_i, y_j)` — label union.
+Result: C-head double-damage F1 improves from 0.317 → 0.508 (200 ep, p_mix=0.5).
+
+### LOO with real double-damage (`--held-out-double <0-4>`)
+Hold out one double-damage recording for test, add the other 4 to training alongside `--p-mix`.
+Use `train_loo.py` to run all 5 folds automatically.
+Result: mean F1=0.439 (range 0.055–0.740) — high variance due to spatial specificity.
+
+### All-5 time split (`--split-double`)
+First 50% of each of the 5 double-damage recordings → training. Second 50% → test.
+Mutually exclusive with `--held-out-double`.
+Result: F1=0.9996 — near-perfect, confirming spatial specificity as root cause (see Insight 18).
+
+**Key finding**: C-head achieves near-perfect double-damage detection when it has seen the specific joint pair during training. Synthetic augmentation alone cannot substitute for real recordings of the target damage combinations.
+
 ## Checkpoints in states/
 
-- `states/single-damage-sparse-f8a04590-....pt` — v1 trained on single only (old)
+- `states/qatar/` — baseline Qatar models (v1, C, DR trained on single-damage only)
+- `states/qatar-pmix/` — Qatar C model trained with synthetic double-damage mixing (p_mix=0.5, 200ep)
+- `states/qatar-dd/` — Qatar C LOO models (4 real double-damage recordings in training, 1 held out per fold)
+- `states/qatar-dd-split/` — Qatar C trained with first½ of all 5 double-damage recordings
+- `states/7story/` — 7-story frame models
+- `states/tower/` — tower models
