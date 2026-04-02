@@ -13,6 +13,12 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
+# Sensor indices (0-indexed, out of 65) that match the 9 sensors used in the
+# real physical benchmark .mat file.  Used by the "7story-sparse" dataset config
+# to train models on the same sensor subset as the benchmark.
+SPARSE_7STORY_SENSOR_INDICES: list[int] = [4, 7, 9, 11, 17, 47, 50, 53, 56]
+
+
 def add_noise(signal: npt.NDArray[np.float32], snr: float) -> npt.NDArray[np.float32]:
     linear_snr = 10.0 ** (snr / 10.0)
     noise_var = signal.var(1)[:, None, :] / linear_snr
@@ -42,9 +48,12 @@ def input_preprocess(
     n_sensors: int = 65,
     sensor_dim: int = 1,
     snr: float = -1.0,
+    sensor_indices: list[int] | None = None,
 ) -> npt.NDArray[np.float32]:
     accel = data.get_tensor("acc").reshape(1000, n_sensors, 3).transpose(2, 0, 1)
-    accel = accel[:sensor_dim, :500]
+    accel = accel[:sensor_dim, :500]          # (sensor_dim, 500, n_sensors)
+    if sensor_indices is not None:
+        accel = accel[:, :, sensor_indices]   # (sensor_dim, 500, len(sensor_indices))
     if snr > 0.0:
         accel = add_noise(accel, snr)
     return accel.astype(np.float32)  # type: ignore
@@ -55,9 +64,12 @@ def val_input_preprocess(
     n_sensors: int = 65,
     sensor_dim: int = 1,
     snr: float = -1.0,
+    sensor_indices: list[int] | None = None,
 ) -> npt.NDArray[np.float32]:
     accel = data.get_tensor("acc").reshape(1000, n_sensors, 3).transpose(2, 0, 1)
     accel = accel[:sensor_dim, :500]
+    if sensor_indices is not None:
+        accel = accel[:, :, sensor_indices]
     if snr > 0.0:
         accel = add_noise(accel, snr)
     return accel.astype(np.float32)
@@ -76,6 +88,7 @@ def get_combined_dataloaders(
     train_batch_size: int = 128,
     eval_batch_size: int = 32,
     seed: int = 42,
+    sensor_indices: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders from multiple subsets combined.
@@ -83,6 +96,10 @@ def get_combined_dataloaders(
     Each subset is split independently (70 / 15 / 15) with the same seed
     before concatenation, so the splits are reproducible and there is no
     leakage between train and eval across subsets.
+
+    sensor_indices: if provided, only these sensor columns (0-indexed out of 65)
+        are returned.  Used by the "7story-sparse" config to match the 9 sensors
+        available in the real physical benchmark.
     """
     from torch.utils.data import ConcatDataset
 
@@ -92,10 +109,12 @@ def get_combined_dataloaders(
     for name in subset_names:
         ds_root = root / name
         train_ds = SafetensorsDataset(
-            ds_root, [lambda x: input_preprocess(x, snr=snr), target_preprocess]
+            ds_root, [lambda x, _si=sensor_indices: input_preprocess(x, snr=snr, sensor_indices=_si),
+                      target_preprocess]
         )
         val_ds = SafetensorsDataset(
-            ds_root, [lambda x: val_input_preprocess(x, snr=snr), target_preprocess]
+            ds_root, [lambda x, _si=sensor_indices: val_input_preprocess(x, snr=snr, sensor_indices=_si),
+                      target_preprocess]
         )
 
         indices = np.arange(len(train_ds))
@@ -127,16 +146,19 @@ def get_dataloaders(
     train_batch_size: int = 128,
     eval_batch_size: int = 32,
     seed: int = 42,
+    sensor_indices: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     root = Path(root)
     ds_root = root / subset_name
     train_ds = SafetensorsDataset(
         ds_root,
-        [lambda x: input_preprocess(x, snr=snr), target_preprocess],
+        [lambda x, _si=sensor_indices: input_preprocess(x, snr=snr, sensor_indices=_si),
+         target_preprocess],
     )
     val_ds = SafetensorsDataset(
         ds_root,
-        [lambda x: val_input_preprocess(x, snr=snr), target_preprocess],
+        [lambda x, _si=sensor_indices: val_input_preprocess(x, snr=snr, sensor_indices=_si),
+         target_preprocess],
     )
 
     train, valtest = train_test_split(

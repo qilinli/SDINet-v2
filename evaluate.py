@@ -24,6 +24,9 @@ Optional flags::
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -40,6 +43,9 @@ from lib.calibration import (
 from lib.datasets import DATASETS, get_dataset
 from lib.data_safetensors import DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
 from lib.model import (
+    ModelConfig,
+    ModelConfigC,
+    ModelConfigDR,
     load_model_from_checkpoint,
     load_model_c_from_checkpoint,
     load_model_dr_from_checkpoint,
@@ -71,7 +77,7 @@ _CAL_LABEL = {
         f"v1 (T={cal['temperature']:.2f}, α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
         if "ratio_alpha" in cal else "v1 (uncalibrated)"
     ),
-    "c": lambda cal: f"C (obj_θ={cal.get('obj_threshold', 0.5):.3f})",
+    "c": lambda cal: "C (pure DETR argmax)",
     "dr": lambda cal: (
         f"DR (α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
         if "ratio_alpha" in cal else f"DR (θ={cal.get('threshold', 0.5):.2f})"
@@ -123,12 +129,21 @@ def run_evaluation(
 
     results: dict[str, dict[str, float]] = {}
 
+    time_len = dataset.time_len if dataset.time_len is not None else window_size // downsample
+    _model_cfg = {
+        "v1": ModelConfig(n_sensors=dataset.n_sensors, time_len=time_len,
+                          out_channels=dataset.n_locations + 1),
+        "dr": ModelConfigDR(n_sensors=dataset.n_sensors, time_len=time_len,
+                            num_locations=dataset.n_locations),
+        "c":  None,  # load_model_c_from_checkpoint infers from weights
+    }
+
     ckpts = {"v1": v1_ckpt, "c": c_ckpt, "dr": dr_ckpt}
     for model_name, ckpt in ckpts.items():
         if ckpt is None:
             continue
 
-        model = _LOAD_FN[model_name](ckpt, device=device)
+        model = _LOAD_FN[model_name](ckpt, device=device, model_cfg=_model_cfg[model_name])
         cal   = load_calibration(ckpt)
         print(f"[calibration] {_CAL_LABEL[model_name](cal)}")
 
@@ -166,6 +181,49 @@ def print_table(results: dict[str, dict[str, float]]) -> None:
         print(row)
 
 
+def save_results(
+    results: dict[str, dict[str, float]],
+    dataset_name: str,
+    out: str | Path | None = None,
+) -> None:
+    """Save evaluation results as JSON and CSV.
+
+    If *out* is given it is used as the path stem (e.g. ``path/to/run`` →
+    ``path/to/run.json`` + ``path/to/run.csv``).  Otherwise files are written
+    to ``saved_results/{dataset_name}/eval_{timestamp}``.
+    """
+    if out is not None:
+        stem = Path(out)
+    else:
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = Path("saved_results") / dataset_name / f"eval_{ts}"
+
+    stem.parent.mkdir(parents=True, exist_ok=True)
+
+    # JSON — full nested dict; NaN serialised as null
+    json_path = stem.with_suffix(".json")
+    with open(json_path, "w") as f:
+        json.dump(
+            {col: {m: (None if v != v else v) for m, v in metrics.items()}
+             for col, metrics in results.items()},
+            f, indent=2,
+        )
+
+    # CSV — metrics as rows, model/split columns (mirrors printed table)
+    csv_path = stem.with_suffix(".csv")
+    cols = list(results.keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric"] + cols)
+        for m in METRICS:
+            writer.writerow(
+                [m] + [results[c].get(m, float("nan")) for c in cols]
+            )
+
+    print(f"[results] Saved → {json_path}")
+    print(f"[results] Saved → {csv_path}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -191,6 +249,8 @@ def main() -> None:
     parser.add_argument("--overlap",     type=float, default=0.5)
     parser.add_argument("--downsample",  type=int,   default=4)
     parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"])
+    parser.add_argument("--out", default=None, metavar="STEM",
+                        help="Output path stem for .json/.csv (default: saved_results/{dataset}/eval_{timestamp})")
     args = parser.parse_args()
 
     if args.v1 is None and args.c is None and args.dr is None:
@@ -208,6 +268,7 @@ def main() -> None:
         tower_excitation=tuple(args.tower_excitation),
     )
     print_table(results)
+    save_results(results, args.dataset, out=args.out)
 
 
 if __name__ == "__main__":

@@ -348,7 +348,7 @@ def val_one_epoch_c(
         accum_loss += total.item() * B
 
         # Top-k recall: rank slots by is_obj, take top-K per sample
-        is_obj, pred_loc = _c_slot_decode(loc_logits)   # (B, K) each
+        active, pred_loc, is_obj = _c_slot_decode(loc_logits)   # (B, K) each
         y_pres = y > PRESENCE_NORM_THRESH                # (B, L) bool
         k_true = y_pres.sum(-1)                          # (B,)
         for b in range(B):

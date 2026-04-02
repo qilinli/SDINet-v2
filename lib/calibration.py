@@ -219,47 +219,49 @@ def calibrate_c_obj_threshold(
     device: torch.device | str,
 ) -> dict[str, float]:
     """
-    Find the is-object threshold that maximises F1 for the C-head.
+    Diagnostic calibration for the C-head (pure DETR — no threshold to tune).
 
-    In pure DETR decoding a slot is active when its is-object score exceeds
-    ``obj_threshold``.  We sweep over [0.01, 0.99] and pick the value with
-    the best val F1.
+    With pure argmax decoding a slot is active when no-object does not win —
+    there is no free detection parameter.  This function just reports the
+    model's natural mean_k_pred vs mean_k_true on the val set so training
+    quality can be assessed.  Returns an empty dict (eval functions accept
+    ``**_`` to absorb it).
 
-    Returns:
-        ``{"obj_threshold": θ}``
+    If mean_k_pred >> mean_k_true the model needs stronger no-object
+    supervision (increase ``--no-obj-weight``).
     """
     device = torch.device(device)
     model  = model.to(device)
     model.eval()
 
-    all_l, all_s, all_y = [], [], []
+    all_l, all_y = [], []
     for dl in val_loaders:
         for x, y in dl:
-            l, s = model(x.to(device))
-            all_l.append(l.cpu()); all_s.append(s.cpu()); all_y.append(y.cpu())
+            l, _ = model(x.to(device))
+            all_l.append(l.cpu()); all_y.append(y.cpu())
     loc_logits = torch.cat(all_l)
     y_norm     = torch.cat(all_y)
 
-    is_obj, pred_loc = _c_slot_decode(loc_logits)   # (N, K) each
-    y_pres = y_norm > PRESENCE_NORM_THRESH           # (N, L) bool
+    active, pred_loc, _ = _c_slot_decode(loc_logits)
+    y_pres = y_norm > PRESENCE_NORM_THRESH
+    N = y_norm.size(0)
 
-    thresholds = torch.linspace(0.01, 0.99, 99).tolist()
-    best_f1, best_theta = -1.0, 0.5
-    for theta in thresholds:
-        active = is_obj > theta
-        tp = fp = fn = 0
-        for b in range(y_norm.size(0)):
-            pred_set = set(pred_loc[b, active[b]].tolist())
-            true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
-            tp += len(pred_set & true_set)
-            fp += len(pred_set - true_set)
-            fn += len(true_set - pred_set)
-        _, _, f1 = f1_from_counts(tp, fp, fn)
-        if f1 > best_f1:
-            best_f1, best_theta = f1, theta
+    tp = fp = fn = 0
+    k_pred_sum = 0
+    for b in range(N):
+        pred_set = set(pred_loc[b, active[b]].tolist())
+        true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
+        tp += len(pred_set & true_set)
+        fp += len(pred_set - true_set)
+        fn += len(true_set - pred_set)
+        k_pred_sum += len(pred_set)
+    _, _, f1 = f1_from_counts(tp, fp, fn)
+    mean_k_pred = k_pred_sum / N
+    mean_k_true = y_pres.sum(-1).float().mean().item()
 
-    print(f"[calibration/C] obj_threshold={best_theta:.3f}  (val F1={best_f1:.4f})")
-    return {"obj_threshold": best_theta}
+    print(f"[calibration/C] mean_k_pred={mean_k_pred:.2f}  mean_k_true={mean_k_true:.2f}"
+          f"  val F1={f1:.4f}  (pure argmax, no threshold)")
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +406,9 @@ def eval_on_loader_c_calibrated(
     model: torch.nn.Module,
     dl,
     device: torch.device | str | None = None,
-    obj_threshold: float = 0.5,
     **_,
 ) -> dict[str, float]:
-    """``evaluate_all_c`` with calibrated is-object threshold."""
+    """``evaluate_all_c`` with pure DETR argmax decoding (no threshold)."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
@@ -419,20 +420,18 @@ def eval_on_loader_c_calibrated(
         l, s = model(x.to(device))
         L.append(l.cpu()); S.append(s.cpu()); Y.append(y.cpu())
 
-    return evaluate_all_c(torch.cat(L), torch.cat(S), torch.cat(Y),
-                          obj_threshold=obj_threshold)
+    return evaluate_all_c(torch.cat(L), torch.cat(S), torch.cat(Y))
 
 
 @torch.inference_mode()
 def do_real_test_c_calibrated(
     model: torch.nn.Module,
     device: torch.device | str | None = None,
-    obj_threshold: float = 0.5,
     print_result: bool = True,
     spec=None,
     **_,
 ) -> dict[str, float]:
-    """Real .mat benchmark eval for C-head with calibrated is-object threshold."""
+    """Real .mat benchmark eval for C-head with pure DETR argmax decoding."""
     from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
 
     if device is None:
@@ -447,7 +446,7 @@ def do_real_test_c_calibrated(
     loc_logits, severity = model(x)
     y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
 
-    result = evaluate_all_c(loc_logits, severity, y_norm, obj_threshold=obj_threshold)
+    result = evaluate_all_c(loc_logits, severity, y_norm)
 
     if print_result:
         from lib.data_safetensors import _print_eval_results

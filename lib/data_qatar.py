@@ -68,6 +68,22 @@ QATAR_N_LOCATIONS: int = 30
 QATAR_GRID_ROWS: int   = 6   # rows front→back
 QATAR_GRID_COLS: int   = 5   # columns right→left
 
+# The 5 real double-damage recordings (0-indexed joint positions in the label vector).
+# Used by targeted synthetic mixing (--targeted-mix) to bias the partner pool toward
+# the exact joint combinations that appear in the double-damage test set.
+#   j03+j26 → (2, 25)
+#   j07+j14 → (6, 13)
+#   j13+j23 → (12, 22)
+#   j21+j25 → (20, 24)
+#   j23+j24 → (22, 23)
+QATAR_DOUBLE_DAMAGE_PAIRS: list[tuple[int, int]] = [
+    (2, 25),
+    (6, 13),
+    (12, 22),
+    (20, 24),
+    (22, 23),
+]
+
 
 # ---------------------------------------------------------------------------
 # Sensor grid helpers  (used for structured masking and fault evaluation)
@@ -301,28 +317,91 @@ class _AugDataset(Dataset):
 
     def __init__(
         self,
-        x: torch.Tensor,   # (N, 1, T, S)
-        y: torch.Tensor,   # (N, L)
+        x: torch.Tensor,            # (N, 1, T, S)
+        y: torch.Tensor,            # (N, L)
         p_random: float = 0.5,
         max_k: int = 10,
         p_struct: float = 0.3,
+        p_mix: float = 0.0,
+        case_ids: torch.Tensor | None = None,  # (N,) int recording index
+        target_pairs: list[tuple[int, int]] | None = None,  # targeted mix pairs (0-indexed joint positions)
     ) -> None:
         self.x = x
         self.y = y
         self.p_random = p_random
         self.max_k    = max_k
         self.p_struct = p_struct
+        self.p_mix    = p_mix
         # All possible structured masks: 6 rows + 5 columns
         self._struct_masks: list[list[int]] = (
             [row_sensors(r) for r in range(QATAR_GRID_ROWS)]
             + [col_sensors(c) for c in range(QATAR_GRID_COLS)]
         )
 
+        # Pre-compute per-recording mix pools (used only when p_mix > 0).
+        # Pool for recording c = indices of damaged windows NOT from recording c.
+        # Excludes: same recording (avoids K=1 duplicates) and healthy windows
+        # (y.max == -1, which would leave K unchanged after label union).
+        self._case_ids      = None
+        self._mix_pools: dict[int, torch.Tensor] = {}
+        self._partner_pools: dict[int, torch.Tensor] = {}  # joint_pos → targeted partner indices
+
+        if p_mix > 0.0 and case_ids is not None:
+            # Only K=1 windows as mix partners — K=2 windows would create K=3 synthetic samples
+            damaged_mask = (y > -1.0 + 1e-4).sum(dim=-1) == 1   # (N,) bool: exactly one damaged loc
+            damaged_idx  = damaged_mask.nonzero(as_tuple=False)[:, 0]  # indices
+            self._case_ids = case_ids
+            for c in case_ids.unique():
+                c_int = int(c.item())
+                not_same_rec = case_ids[damaged_idx] != c_int
+                self._mix_pools[c_int] = damaged_idx[not_same_rec]
+
+            # Targeted pools: restrict partner selection to the specific joint of each
+            # known target pair.  For each joint in a pair, its partner pool = all K=1
+            # windows whose label is active at the partner joint.  Because Dataset A has
+            # one recording per joint, the "different recording" constraint is automatically
+            # satisfied (different joints → different recordings).
+            if target_pairs is not None:
+                joint_to_idx: dict[int, list[int]] = {}
+                for wi in damaged_idx.tolist():
+                    jp = int(y[wi].argmax().item())
+                    joint_to_idx.setdefault(jp, []).append(wi)
+
+                partner_idx_map: dict[int, list[int]] = {}
+                for (a, b) in target_pairs:
+                    if b in joint_to_idx:
+                        partner_idx_map.setdefault(a, []).extend(joint_to_idx[b])
+                    if a in joint_to_idx:
+                        partner_idx_map.setdefault(b, []).extend(joint_to_idx[a])
+
+                for jp, idxs in partner_idx_map.items():
+                    self._partner_pools[jp] = torch.tensor(idxs, dtype=torch.long)
+
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, idx: int):
-        x = self.x[idx].clone()   # (1, T, S)
+        # Signal superposition augmentation: add a second random sample.
+        # Partner drawn from pre-computed pool: damaged windows from a different
+        # recording than idx.  Sum divided by √2 to keep RMS comparable to
+        # single-damage windows seen at val/test time.
+        if self.p_mix > 0.0 and torch.rand(1).item() < self.p_mix and self._mix_pools:
+            rec_id = int(self._case_ids[idx].item())
+            # Targeted mixing: if this window's joint is in a known target pair,
+            # draw the partner exclusively from windows of the paired joint.
+            # Healthy windows (all labels == -1) fall back to random pool.
+            pool = None
+            if self._partner_pools and self.y[idx].max().item() > -1.0 + 1e-4:
+                joint_pos = int(self.y[idx].argmax().item())
+                pool = self._partner_pools.get(joint_pos)
+            if pool is None:
+                pool = self._mix_pools[rec_id]
+            j      = int(pool[torch.randint(0, len(pool), (1,)).item()].item())
+            x = (self.x[idx].clone() + self.x[j].clone()) * (2 ** -0.5)
+            y = torch.maximum(self.y[idx], self.y[j])
+        else:
+            x = self.x[idx].clone()
+            y = self.y[idx]
 
         # 1. Amplitude scaling
         x = x * (0.8 + 0.4 * torch.rand(1))
@@ -342,7 +421,7 @@ class _AugDataset(Dataset):
             mask_idx = int(torch.randint(0, len(self._struct_masks), (1,)).item())
             x[:, :, self._struct_masks[mask_idx]] = 0.0
 
-        return x, self.y[idx]
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +443,11 @@ def get_qatar_dataloaders(
     p_random_mask: float = 0.5,
     max_random_mask: int = 10,
     p_struct_mask: float = 0.3,
+    p_mix: float = 0.0,
+    held_out_double: int | None = None,
+    split_double: bool = False,
+    targeted_mix: bool = False,
+    **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders from the Qatar SHM Benchmark.
@@ -393,11 +477,14 @@ def get_qatar_dataloaders(
         max_random_mask: Training augmentation: max channels zeroed per sample.
         p_struct_mask:   Training augmentation: prob of row/column structured masking.
     """
+    if split_double and held_out_double is not None:
+        raise ValueError("split_double and held_out_double are mutually exclusive")
+
     root   = Path(root)
     stride = max(1, int(window_size * (1.0 - overlap)))
 
     # Load Dataset A (all → train) and Dataset B (time-split → val/test)
-    X_a, Y_a, _          = _load_group(root, "dataset_a", window_size, stride, normalize, downsample)
+    X_a, Y_a, case_ids_a = _load_group(root, "dataset_a", window_size, stride, normalize, downsample)
     X_b, Y_b, case_ids_b = _load_group(root, "dataset_b", window_size, stride, normalize, downsample)
 
     # Convert to tensors; add channel dim; map labels {0,1} → {-1,+1}
@@ -409,10 +496,53 @@ def get_qatar_dataloaders(
     # Time-based split of Dataset B into val and test
     val_idx, test_idx = _time_split_b(case_ids_b, val_frac)
 
+    case_ids_a_t = torch.from_numpy(case_ids_a).long()
+
+    # Optionally append 4 of 5 real double-damage recordings to the training set.
+    # The held-out recording (held_out_double) is reserved for test evaluation.
+    dd_note = ""
+    if held_out_double is not None:
+        X_dd, Y_dd, case_ids_dd = _load_group(
+            root, "double_damage", window_size, stride, normalize, downsample
+        )
+        train_mask = case_ids_dd != held_out_double
+        x_dd = torch.from_numpy(X_dd[train_mask]).float().unsqueeze(1)
+        y_dd = torch.from_numpy(Y_dd[train_mask] * 2.0 - 1.0).float()
+        # Offset case_ids so they don't collide with Dataset A IDs
+        dd_case_ids = (torch.from_numpy(case_ids_dd[train_mask]).long()
+                       + int(case_ids_a_t.max()) + 1)
+        x_a = torch.cat([x_a, x_dd], dim=0)
+        y_a = torch.cat([y_a, y_dd], dim=0)
+        case_ids_a_t = torch.cat([case_ids_a_t, dd_case_ids])
+        dd_note = f" + 4×K=2 real ({len(x_dd)} segs)"
+
+    # Optionally append first 50% of all 5 double-damage recordings (split_double mode).
+    # Second 50% is reserved as the test set in get_qatar_double_test_dataloader.
+    if split_double:
+        X_dd, Y_dd, case_ids_dd = _load_group(
+            root, "double_damage", window_size, stride, normalize, downsample
+        )
+        train_idx_dd, _ = _time_split_b(case_ids_dd, val_frac=0.5)
+        x_dd = torch.from_numpy(X_dd[train_idx_dd]).float().unsqueeze(1)
+        y_dd = torch.from_numpy(Y_dd[train_idx_dd] * 2.0 - 1.0).float()
+        dd_case_ids = (torch.from_numpy(case_ids_dd[train_idx_dd]).long()
+                       + int(case_ids_a_t.max()) + 1)
+        x_a = torch.cat([x_a, x_dd], dim=0)
+        y_a = torch.cat([y_a, y_dd], dim=0)
+        case_ids_a_t = torch.cat([case_ids_a_t, dd_case_ids])
+        dd_note = f" + 5×K=2 first½ ({len(x_dd)} segs)"
+
     eff_fs = QATAR_FS // downsample
     eff_T  = window_size // downsample
+    target_pairs = QATAR_DOUBLE_DAMAGE_PAIRS if targeted_mix else None
+    if p_mix > 0.0 and targeted_mix:
+        mix_note = f", {p_mix:.0%} targeted K=2 ({len(QATAR_DOUBLE_DAMAGE_PAIRS)} pairs)"
+    elif p_mix > 0.0:
+        mix_note = f", {p_mix:.0%} synthetic K=2"
+    else:
+        mix_note = ""
     print(
-        f"[qatar] train=Dataset A ({len(X_a)} segs) | "
+        f"[qatar] train=Dataset A ({len(X_a)} segs){dd_note}{mix_note} | "
         f"val=Dataset B first {val_frac:.0%} ({len(val_idx)} segs) | "
         f"test=Dataset B last {1.0 - val_frac:.0%} ({len(test_idx)} segs)  "
         f"[window={window_size}→{eff_T} @ {eff_fs} Hz, norm={normalize!r}]"
@@ -421,7 +551,9 @@ def get_qatar_dataloaders(
     def _dl(x, y, batch_size, shuffle, augment=False):
         ds = (
             _AugDataset(x, y, p_random=p_random_mask,
-                        max_k=max_random_mask, p_struct=p_struct_mask)
+                        max_k=max_random_mask, p_struct=p_struct_mask,
+                        p_mix=p_mix, case_ids=case_ids_a_t,
+                        target_pairs=target_pairs)
             if augment
             else TensorDataset(x, y)
         )
@@ -444,27 +576,42 @@ def get_qatar_double_test_dataloader(
     normalize: str | None = "rms",
     eval_batch_size: int = 32,
     num_workers: int = 0,
+    held_out_index: int | None = None,
+    split_second_half: bool = False,
+    **_,
 ) -> DataLoader:
     """
-    DataLoader for the 5 double-damage recordings.
+    DataLoader for double-damage recordings.
 
-    Used to evaluate multi-damage generalisation: the model is trained on
-    single-damage data only, then tested here without any retraining.
-    Each sample has exactly 2 entries of +1 in y (two damaged joints).
+    Default: all 5 recordings (~1275 windows).
+    held_out_index (0-4): only that one recording (~255 windows) — used with --held-out-double.
+    split_second_half=True: last 50% of each recording by time (~635 windows) — used with --split-double.
 
     Batches: x (B, 1, window_size // downsample, 30),  y (B, 30) ∈ {−1, +1}.
     """
     root   = Path(root)
     stride = max(1, int(window_size * (1.0 - overlap)))
 
-    X, Y, _ = _load_group(root, "double_damage", window_size, stride, normalize, downsample)
+    X, Y, case_ids = _load_group(root, "double_damage", window_size, stride, normalize, downsample)
+
+    if held_out_index is not None:
+        mask = case_ids == held_out_index
+        X, Y = X[mask], Y[mask]
+        n_rec_label = "1"
+    elif split_second_half:
+        _, test_idx = _time_split_b(case_ids, val_frac=0.5)
+        X, Y = X[test_idx], Y[test_idx]
+        n_rec_label = "5 (second half)"
+    else:
+        n_rec_label = "5"
+
     x_t = torch.from_numpy(X).float().unsqueeze(1)
     y_t = torch.from_numpy(Y * 2.0 - 1.0).float()
 
     eff_fs = QATAR_FS // downsample
     eff_T  = window_size // downsample
     print(
-        f"[qatar-double] {len(x_t)} windows from 5 double-damage recordings  "
+        f"[qatar-double] {len(x_t)} windows from {n_rec_label} double-damage recording(s)  "
         f"[window={window_size}→{eff_T} @ {eff_fs} Hz, norm={normalize!r}]"
     )
 

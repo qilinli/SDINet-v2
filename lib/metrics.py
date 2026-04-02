@@ -451,24 +451,31 @@ def evaluate_all_dr(
 # Approach-C slot decoding
 # ---------------------------------------------------------------------------
 
-def _c_slot_decode(loc_logits: Tensor) -> tuple[Tensor, Tensor]:
+def _c_slot_decode(loc_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """
     Pure DETR slot decoding for the C-head.
 
-    Each slot independently outputs a probability over L locations + 1 no-object
-    class.  This function returns the per-slot is-object score and argmax location
-    so callers can apply whatever threshold or ranking they need.
+    A slot is active when the no-object class does NOT win the argmax
+    competition — no threshold, no free parameter.
+
+        active[b, k] = (argmax over L+1 classes) ≠ L   (the ∅ index)
+
+    ``is_obj`` (= 1 − P(∅)) is returned only for ranking slots by confidence
+    in top-K recall; it is NOT used for the active/inactive decision.
 
     Args:
-        loc_logits: (B, K, L+1)  raw location logits (last dim = no-object)
+        loc_logits: (B, K, L+1)  raw location logits (last dim = no-object ∅)
     Returns:
-        is_obj   : (B, K) — P(slot is not no-object) ∈ [0, 1]
-        pred_loc : (B, K) — argmax location index for each slot (0-indexed)
+        active   : (B, K) bool  — slot fires (argmax ≠ ∅)
+        pred_loc : (B, K) int   — argmax location index (valid when active)
+        is_obj   : (B, K) float — P(not ∅) for ranking only
     """
-    slot_probs = loc_logits.softmax(dim=-1)        # (B, K, L+1)
-    is_obj     = 1.0 - slot_probs[..., -1]         # (B, K)
-    pred_loc   = slot_probs[..., :-1].argmax(-1)   # (B, K)
-    return is_obj, pred_loc
+    no_obj_idx = loc_logits.size(-1) - 1
+    argmax     = loc_logits.argmax(-1)                 # (B, K)
+    active     = argmax != no_obj_idx                  # (B, K) bool
+    pred_loc   = loc_logits[..., :-1].argmax(-1)       # (B, K) best location
+    is_obj     = 1.0 - loc_logits.softmax(-1)[..., -1] # (B, K) for ranking
+    return active, pred_loc, is_obj
 
 
 @torch.no_grad()
@@ -478,30 +485,27 @@ def evaluate_all_c(
     y_norm: Tensor,
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
-    obj_threshold: float = 0.5,
+    **_,
 ) -> dict[str, float]:
     """
     Full evaluation for the C-head using pure DETR slot decoding.
 
-    Each slot independently predicts a location OR no-object (∅).
-    A slot is active when its is-object score exceeds ``obj_threshold``.
-    The predicted damage set for sample b is the set of locations pointed
-    to by active slots — naturally bounded by K_max.
+    A slot is active when the no-object class does NOT win the argmax —
+    no threshold, no free parameter.  The predicted damage set is the set
+    of locations pointed to by active slots, naturally bounded by K_max.
 
     map_mse and ap are not applicable with discrete slot decoding and are
     returned as NaN so comparison tables can display them as such.
 
     Args:
-        loc_logits:    (N, K_max, L+1)  raw location logits (last = ∅)
-        severity:      (N, K_max)       sigmoid-activated severity ∈ [0, 1]
-        y_norm:        (N, L)           normalized ground-truth ∈ [-1, 1]
-        k:             Fixed K for top-K recall.  None = use true K per sample.
-        obj_threshold: Slot fires when is_obj > obj_threshold (default 0.5).
+        loc_logits: (N, K_max, L+1)  raw location logits (last = ∅)
+        severity:   (N, K_max)       sigmoid-activated severity ∈ [0, 1]
+        y_norm:     (N, L)           normalized ground-truth ∈ [-1, 1]
+        k:          Fixed K for top-K recall.  None = use true K per sample.
     """
     NaN = float("nan")
 
-    is_obj, pred_loc = _c_slot_decode(loc_logits)       # (N, K) each
-    active = is_obj > obj_threshold                      # (N, K) bool
+    active, pred_loc, is_obj = _c_slot_decode(loc_logits)   # (N, K) each
 
     y_pres_bool = y_norm > presence_norm_thresh          # (N, L) bool
     k_true_per  = y_pres_bool.sum(-1).float()            # (N,)
