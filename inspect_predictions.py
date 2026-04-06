@@ -53,7 +53,13 @@ from lib.data_qatar import (
     get_qatar_dataloaders, get_qatar_double_test_dataloader,
     QATAR_DEFAULT_ROOT, QATAR_N_SENSORS, QATAR_N_LOCATIONS,
 )
-from lib.model import ModelConfig, ModelConfigDR, ModelConfigC, build_model
+from lib.data_safetensors import (
+    load_real_test_tensors, DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK,
+)
+from lib.model import (
+    ModelConfig, ModelConfigDR, ModelConfigC, build_model,
+    load_model_from_checkpoint, load_model_dr_from_checkpoint, load_model_c_from_checkpoint,
+)
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -345,11 +351,7 @@ def load_safetensors_test(
 
 
 def load_dr_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
-    cfg = ModelConfigDR(n_sensors=n_sensors)
-    model = build_model(cfg)
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    model.eval()
-    return model
+    return load_model_dr_from_checkpoint(ckpt_path, model_cfg=ModelConfigDR(n_sensors=n_sensors)).eval()
 
 
 def _infer_c_arch(state_dict: dict, num_locations: int) -> dict:
@@ -369,7 +371,6 @@ def _infer_c_arch(state_dict: dict, num_locations: int) -> dict:
 
 
 def load_c_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
-    from lib.model import ModelConfigC
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     arch = _infer_c_arch(sd, num_locations=70)
     cfg = ModelConfigC(**arch, n_sensors=n_sensors)
@@ -535,40 +536,21 @@ def load_qatar_test(
 # ── Qatar model loading ────────────────────────────────────────────────────────
 
 def load_v1_model_safetensors(ckpt_path: Path, n_sensors: int = 65) -> torch.nn.Module:
-    cfg = ModelConfig(n_sensors=n_sensors)
-    model = build_model(cfg)
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    model.eval()
-    return model
+    return load_model_from_checkpoint(ckpt_path, model_cfg=ModelConfig(n_sensors=n_sensors)).eval()
 
 
 def load_v1_model_qatar(ckpt_path: Path, time_len: int = 512) -> torch.nn.Module:
-    cfg = ModelConfig(
-        n_sensors=QATAR_N_SENSORS,
-        time_len=time_len,
-        out_channels=QATAR_N_LOCATIONS + 1,
-    )
-    model = build_model(cfg)
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    model.eval()
-    return model
+    cfg = ModelConfig(n_sensors=QATAR_N_SENSORS, time_len=time_len, out_channels=QATAR_N_LOCATIONS + 1)
+    return load_model_from_checkpoint(ckpt_path, model_cfg=cfg).eval()
 
 
 def load_dr_model_qatar(ckpt_path: Path, time_len: int = 512) -> torch.nn.Module:
-    cfg = ModelConfigDR(
-        n_sensors=QATAR_N_SENSORS,
-        time_len=time_len,
-        num_locations=QATAR_N_LOCATIONS,
-    )
-    model = build_model(cfg)
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
-    model.eval()
-    return model
+    cfg = ModelConfigDR(n_sensors=QATAR_N_SENSORS, time_len=time_len, num_locations=QATAR_N_LOCATIONS)
+    return load_model_dr_from_checkpoint(ckpt_path, model_cfg=cfg).eval()
 
 
 def load_c_model_qatar(ckpt_path: Path) -> torch.nn.Module:
-    from lib.model import load_model_c_from_checkpoint
-    return load_model_c_from_checkpoint(ckpt_path)
+    return load_model_c_from_checkpoint(ckpt_path).eval()
 
 
 # ── v1 inference ──────────────────────────────────────────────────────────────
@@ -612,9 +594,6 @@ def plot_real_benchmark(
     Single-damage benchmark: joint 12 (0-indexed: 11), severity=0.125
     Two-damage benchmark:    joints 6 & 12 (0-indexed: 5 & 11), severity=0.125 each
     """
-    from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, \
-        DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
-
     _, y_single = load_real_test_tensors(spec=DEFAULT_BENCHMARK)
     _, y_two    = load_real_test_tensors(spec=TWO_DAMAGE_BENCHMARK)
 
@@ -658,10 +637,9 @@ def plot_real_benchmark(
 
     axes[-1].set_xlabel("Location index (0-indexed, 0–69)", fontsize=9)
 
-    from matplotlib.patches import Patch
     fig.legend(
-        handles=[Patch(facecolor="#e87171", label="Damaged (GT)"),
-                 Patch(facecolor="#7eb5e8", label="Undamaged (GT)")],
+        handles=[mpatches.Patch(facecolor="#e87171", label="Damaged (GT)"),
+                 mpatches.Patch(facecolor="#7eb5e8", label="Undamaged (GT)")],
         loc="upper right", fontsize=8,
     )
     v1_note = "  (V1: bar = softmax location probability, independent of global damage score)" if model_name == "v1" else ""
@@ -679,8 +657,6 @@ def plot_real_benchmark(
 
 def _run_real_inference(model, model_name: str) -> tuple[np.ndarray, np.ndarray]:
     """Run model on both real .mat benchmarks, return (pred_single, pred_two) each (70,)."""
-    from lib.data_safetensors import load_real_test_tensors, DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
-
     device = next(model.parameters()).device
 
     def _infer(spec):
@@ -746,27 +722,26 @@ def main() -> None:
                         help="Override output directory (default: saved_results/{dataset}/{model}/)")
     args = parser.parse_args()
 
-    if args.dataset == "7story-real":
-        dataset_for_ckpt = "7story"
-    elif args.dataset == "7story-sparse-real":
-        dataset_for_ckpt = "7story-sparse"
+    # Maps "real" dataset aliases → (ckpt_dir_name, output_subpath, n_sensors)
+    _REAL_MAP = {
+        "7story-real":        ("7story",        "7story/real",        65),
+        "7story-sparse-real": ("7story-sparse", "7story-sparse/real", 9),
+    }
+    if args.dataset in _REAL_MAP:
+        ckpt_base, out_subpath, n_sensors = _REAL_MAP[args.dataset]
+        dataset_for_ckpt = ckpt_base
+        default_out_dir  = Path(f"saved_results/{out_subpath}/{args.model}")
     else:
         dataset_for_ckpt = args.dataset
+        default_out_dir  = Path(f"saved_results/{args.dataset}/{args.model}")
     ckpt = args.ckpt or latest_ckpt(args.model, dataset_for_ckpt)
     print(f"[inspect] Loading {args.model.upper()} checkpoint: {ckpt}")
 
-    if args.dataset == "7story-real":
-        default_out_dir = Path(f"saved_results/7story/real/{args.model}")
-    elif args.dataset == "7story-sparse-real":
-        default_out_dir = Path(f"saved_results/7story-sparse/real/{args.model}")
-    else:
-        default_out_dir = Path(f"saved_results/{args.dataset}/{args.model}")
     out_dir = args.out_dir if args.out_dir is not None else default_out_dir
     device  = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ── Real .mat benchmark ────────────────────────────────────────────────────
-    if args.dataset in ("7story-real", "7story-sparse-real"):
-        n_sensors = 9 if args.dataset == "7story-sparse-real" else 65
+    if args.dataset in _REAL_MAP:
         if args.model == "v1":
             model = load_v1_model_safetensors(ckpt, n_sensors=n_sensors)
         elif args.model == "c":
