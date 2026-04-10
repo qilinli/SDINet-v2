@@ -65,28 +65,47 @@ def _sweep_threshold(
     return best_thr, best_f1
 
 
-def _sweep_ratio_threshold(probs, y_norm, alphas, betas):
+def _sweep_ratio_threshold(probs, y_norm, alphas, betas, dmg_pred=None):
     """
-    Return (best_alpha, best_beta, best_F1) by 2D grid search.
+    Return (best_alpha, best_beta, best_F1, best_dmg_gate) by grid search.
 
     Works on any per-location probability/score in [0,1] — sigmoid(logits) for B/DR.
     Ratio rule: predict l if probs[l] > alpha * max(probs)  AND  max(probs) > beta.
+
+    When ``dmg_pred`` is provided (v1 head), an additional damage-scalar gate is
+    swept: predict K=0 for any sample where ``dmg_pred < dmg_gate``.  This is
+    critical for small L (e.g. L=3) where ``max(softmax) >= 1/L`` always, making
+    the beta gate ineffective — the damage scalar is the only way to express
+    "no damage anywhere".
     """
-    best_alpha, best_beta, best_f1 = 0.5, 0.0, -1.0
+    best_alpha, best_beta, best_dmg_gate, best_f1 = 0.5, 0.0, None, -1.0
     max_prob = probs.max(dim=-1, keepdim=True).values
     y_pres   = y_norm > PRESENCE_NORM_THRESH
 
-    for alpha in alphas:
-        for beta in betas:
-            pred = (probs > alpha * max_prob) & (max_prob > beta)
-            tp   = (pred &  y_pres).sum().long()
-            fp   = (pred & ~y_pres).sum().long()
-            fn   = (~pred & y_pres).sum().long()
-            f1, _, _ = f1_from_counts(tp, fp, fn)
-            if f1 > best_f1:
-                best_f1, best_alpha, best_beta = f1, alpha, beta
+    # Damage-gate values: None (no gate) + a sweep from -0.8 to +0.8
+    dmg_gates = [None]
+    if dmg_pred is not None:
+        dmg_gates += [-0.8, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1,
+                      0.0, 0.1, 0.2, 0.3, 0.5, 0.8]
 
-    return best_alpha, best_beta, best_f1
+    for dmg_gate in dmg_gates:
+        if dmg_gate is not None:
+            window_active = (dmg_pred[:, 0] > dmg_gate).unsqueeze(-1)  # (N, 1)
+        else:
+            window_active = None
+        for alpha in alphas:
+            for beta in betas:
+                pred = (probs > alpha * max_prob) & (max_prob > beta)
+                if window_active is not None:
+                    pred = pred & window_active
+                tp   = (pred &  y_pres).sum().long()
+                fp   = (pred & ~y_pres).sum().long()
+                fn   = (~pred & y_pres).sum().long()
+                f1, _, _ = f1_from_counts(tp, fp, fn)
+                if f1 > best_f1:
+                    best_f1, best_alpha, best_beta, best_dmg_gate = f1, alpha, beta, dmg_gate
+
+    return best_alpha, best_beta, best_f1, best_dmg_gate
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +152,22 @@ def calibrate_v1_ratio(
     best_T, _ = _sweep_temperature(map_fn, loc, dmg, y_norm,
                                    torch.linspace(lo, hi, _FINE_STEPS).tolist())
 
-    # Step 2: 2D sweep over (α, β) on temperature-scaled softmax probs
+    # Step 2: 2D (or 3D with dmg gate) sweep on temperature-scaled softmax probs
     probs = torch.softmax(loc / best_T, dim=-1)             # (N, L) ∈ [0, 1]
     alphas = torch.linspace(0.10, 0.90, _ALPHA_STEPS).tolist()
-    best_alpha, best_beta, best_f1 = _sweep_ratio_threshold(
-        probs, y_norm, alphas, _BETA_VALUES
+    best_alpha, best_beta, best_f1, best_dmg_gate = _sweep_ratio_threshold(
+        probs, y_norm, alphas, _BETA_VALUES, dmg_pred=dmg,
     )
 
+    cal = {"temperature": best_T, "ratio_alpha": best_alpha, "ratio_beta": best_beta}
+    gate_str = "none"
+    if best_dmg_gate is not None:
+        cal["dmg_gate"] = best_dmg_gate
+        gate_str = f"{best_dmg_gate:.3f}"
     print(f"[calibration/v1/ratio] temperature={best_T:.3f}  "
-          f"alpha={best_alpha:.3f}  beta={best_beta:.3f}  (val F1={best_f1:.4f})")
-    return {"temperature": best_T, "ratio_alpha": best_alpha, "ratio_beta": best_beta}
+          f"alpha={best_alpha:.3f}  beta={best_beta:.3f}  dmg_gate={gate_str}  "
+          f"(val F1={best_f1:.4f})")
+    return cal
 
 
 @torch.inference_mode()
@@ -153,6 +178,7 @@ def eval_on_loader_v1_calibrated(
     temperature: float = 1.0,
     ratio_alpha: float | None = None,
     ratio_beta: float = 0.0,
+    dmg_gate: float | None = None,
 ) -> dict[str, float]:
     """``evaluate_all_v1`` with temperature scaling + ratio thresholding."""
     if device is None:
@@ -166,8 +192,8 @@ def eval_on_loader_v1_calibrated(
         d, l = model(x.to(device))
         D.append(d.cpu()); L.append(l.cpu()); Y.append(y.cpu())
 
-    kwargs = {"ratio_alpha": ratio_alpha, "ratio_beta": ratio_beta} \
-             if ratio_alpha is not None else {}
+    kwargs = {"ratio_alpha": ratio_alpha, "ratio_beta": ratio_beta,
+              "dmg_gate": dmg_gate} if ratio_alpha is not None else {}
     return evaluate_all_v1(torch.cat(D), torch.cat(L), torch.cat(Y),
                            temperature=temperature, **kwargs)
 
@@ -179,11 +205,12 @@ def do_real_test_v1_calibrated(
     temperature: float = 1.0,
     ratio_alpha: float | None = None,
     ratio_beta: float = 0.0,
+    dmg_gate: float | None = None,
     print_result: bool = True,
     spec=None,
 ) -> dict[str, float]:
     """Real .mat benchmark eval for v1 with temperature + ratio thresholding."""
-    from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
+    from lib.data_7story import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,12 +224,12 @@ def do_real_test_v1_calibrated(
     dmg_pred, loc_pred = model(x)
     y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
 
-    kwargs = {"ratio_alpha": ratio_alpha, "ratio_beta": ratio_beta} \
-             if ratio_alpha is not None else {}
+    kwargs = {"ratio_alpha": ratio_alpha, "ratio_beta": ratio_beta,
+              "dmg_gate": dmg_gate} if ratio_alpha is not None else {}
     result = evaluate_all_v1(dmg_pred, loc_pred, y_norm, temperature=temperature, **kwargs)
 
     if print_result:
-        from lib.data_safetensors import _print_eval_results
+        from lib.data_7story import _print_eval_results
         _print_eval_results(result)
 
     return result
@@ -237,7 +264,7 @@ def calibrate_c_obj_threshold(
     all_l, all_y = [], []
     for dl in val_loaders:
         for x, y in dl:
-            l, _ = model(x.to(device))
+            l, _, _fault = model(x.to(device))
             all_l.append(l.cpu()); all_y.append(y.cpu())
     loc_logits = torch.cat(all_l)
     y_norm     = torch.cat(all_y)
@@ -299,7 +326,7 @@ def calibrate_dr_ratio(
     y_norm = torch.cat(all_y)
 
     alphas = torch.linspace(0.10, 0.90, _ALPHA_STEPS).tolist()
-    best_alpha, best_beta, best_f1 = _sweep_ratio_threshold(
+    best_alpha, best_beta, best_f1, _ = _sweep_ratio_threshold(
         pred, y_norm, alphas, _BETA_VALUES
     )
 
@@ -372,7 +399,7 @@ def do_real_test_dr_calibrated(
     spec=None,
 ) -> dict[str, float]:
     """Real .mat benchmark eval for DR head with absolute or ratio thresholding."""
-    from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
+    from lib.data_7story import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -391,7 +418,7 @@ def do_real_test_dr_calibrated(
     result = evaluate_all_dr(pred, y_norm, **kwargs)
 
     if print_result:
-        from lib.data_safetensors import _print_eval_results
+        from lib.data_7story import _print_eval_results
         _print_eval_results(result)
 
     return result
@@ -417,7 +444,7 @@ def eval_on_loader_c_calibrated(
 
     L, S, Y = [], [], []
     for x, y in dl:
-        l, s = model(x.to(device))
+        l, s, _ = model(x.to(device))
         L.append(l.cpu()); S.append(s.cpu()); Y.append(y.cpu())
 
     return evaluate_all_c(torch.cat(L), torch.cat(S), torch.cat(Y))
@@ -432,7 +459,7 @@ def do_real_test_c_calibrated(
     **_,
 ) -> dict[str, float]:
     """Real .mat benchmark eval for C-head with pure DETR argmax decoding."""
-    from lib.data_safetensors import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
+    from lib.data_7story import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -443,13 +470,13 @@ def do_real_test_c_calibrated(
     test_data, test_target = load_real_test_tensors(spec=spec if spec is not None else DEFAULT_BENCHMARK)
     x = test_data[None, None, ...].to(device)
 
-    loc_logits, severity = model(x)
+    loc_logits, severity, _ = model(x)
     y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
 
     result = evaluate_all_c(loc_logits, severity, y_norm)
 
     if print_result:
-        from lib.data_safetensors import _print_eval_results
+        from lib.data_7story import _print_eval_results
         _print_eval_results(result)
 
     return result

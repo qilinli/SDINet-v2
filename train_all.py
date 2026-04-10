@@ -15,10 +15,6 @@ import subprocess
 import sys
 import os
 
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
-os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
-
 from lib.datasets import DATASETS
 
 
@@ -30,7 +26,7 @@ def main() -> None:
     parser.add_argument("--dataset", required=True, choices=list(DATASETS),
                         help="Dataset to train on")
     parser.add_argument("--models", nargs="+", default=["v1", "dr"],
-                        choices=["v1", "c", "dr"],
+                        choices=["v1", "c", "dr", "b"],
                         help="Which models to train")
     parser.add_argument("--epochs",          type=int,   default=200)
     parser.add_argument("--batch-size",      type=int,   default=128)
@@ -48,7 +44,6 @@ def main() -> None:
     parser.add_argument("--neck-dropout", type=float, default=0.0)
 
     # dataset-specific
-    parser.add_argument("--snr",              type=float, default=-1.0)
     parser.add_argument("--subsets",          nargs="+", default=None,
                         choices=["healthy", "single", "double"],
                         help="Training subsets for 7story datasets (default: single double)")
@@ -60,8 +55,6 @@ def main() -> None:
     # model-specific (passed through to train.py which ignores irrelevant ones)
     parser.add_argument("--tag",                 default="",
                         help="Output dir suffix, e.g. 'pmix' → states/qatar-pmix/")
-    parser.add_argument("--p-mix",              type=float, default=0.0,
-                        help="Synthetic double-damage mixing probability (Qatar only)")
     parser.add_argument("--held-out-double",    type=int,   default=None,
                         choices=[0, 1, 2, 3, 4],
                         help="Hold out this double-damage recording index (0-4) for test; "
@@ -69,8 +62,6 @@ def main() -> None:
     parser.add_argument("--split-double",       action="store_true", default=False,
                         help="Use first½ of all 5 double-damage recordings for training, "
                              "second½ for test (Qatar only).")
-    parser.add_argument("--targeted-mix",       action="store_true", default=False,
-                        help="Bias synthetic K=2 mixing toward the 5 known double-damage pairs (Qatar only).")
     parser.add_argument("--bce-pos-weight",     type=float, default=None)
     parser.add_argument("--num-slots",          type=int,   default=5)
     parser.add_argument("--num-decoder-layers", type=int,   default=2)
@@ -78,6 +69,19 @@ def main() -> None:
     parser.add_argument("--no-obj-weight",      type=float, default=0.1)
     parser.add_argument("--loc-weight",         type=float, default=1.0)
     parser.add_argument("--sev-weight",         type=float, default=None)
+    # --- sensor spatial reasoning ---
+    parser.add_argument("--use-spatial-layer",   action="store_true", default=False)
+    parser.add_argument("--num-spatial-layers",  type=int,   default=1)
+    parser.add_argument("--spatial-nhead",       type=int,   default=8)
+    # --- fault detection head ---
+    parser.add_argument("--use-fault-head",      action="store_true", default=False)
+    parser.add_argument("--fault-loss-weight",   type=float, default=1.0)
+    parser.add_argument("--fault-pos-weight",    type=float, default=5.0)
+    parser.add_argument("--use-structural-bias", action="store_true", default=False)
+    # --- fault augmentation ---
+    parser.add_argument("--p-hard",              type=float, default=0.0)
+    parser.add_argument("--p-soft",              type=float, default=0.0)
+    parser.add_argument("--p-struct-mask",       type=float, default=0.0)
 
     args = parser.parse_args()
 
@@ -93,7 +97,6 @@ def main() -> None:
         "--structure",      *[str(b) for b in args.structure],
         "--embed-dim",      str(args.embed_dim),
         "--neck-dropout",   str(args.neck_dropout),
-        "--snr",            str(args.snr),
     ]
     if args.subsets:
         shared += ["--subsets"] + args.subsets
@@ -109,14 +112,10 @@ def main() -> None:
     ]
     if args.tag:
         shared += ["--tag", args.tag]
-    if args.p_mix > 0.0:
-        shared += ["--p-mix", str(args.p_mix)]
     if args.held_out_double is not None:
         shared += ["--held-out-double", str(args.held_out_double)]
     if args.split_double:
         shared += ["--split-double"]
-    if args.targeted_mix:
-        shared += ["--targeted-mix"]
     if args.root is not None:
         shared += ["--root", args.root]
     if args.bce_pos_weight is not None:
@@ -125,6 +124,22 @@ def main() -> None:
         shared += ["--num-slots", str(args.num_slots)]
     if args.sev_weight is not None:
         shared += ["--sev-weight", str(args.sev_weight)]
+    if args.use_spatial_layer:
+        shared += ["--use-spatial-layer"]
+    shared += ["--num-spatial-layers", str(args.num_spatial_layers),
+               "--spatial-nhead",      str(args.spatial_nhead)]
+    if args.use_fault_head:
+        shared += ["--use-fault-head"]
+    shared += ["--fault-loss-weight", str(args.fault_loss_weight),
+               "--fault-pos-weight",  str(args.fault_pos_weight)]
+    if args.use_structural_bias:
+        shared += ["--use-structural-bias"]
+    if args.p_hard > 0.0:
+        shared += ["--p-hard", str(args.p_hard)]
+    if args.p_soft > 0.0:
+        shared += ["--p-soft", str(args.p_soft)]
+    if args.p_struct_mask > 0.0:
+        shared += ["--p-struct-mask", str(args.p_struct_mask)]
 
     for model in args.models:
         sep = "=" * 60

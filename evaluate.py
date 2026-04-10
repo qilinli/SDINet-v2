@@ -14,7 +14,6 @@ Usage::
 Optional flags::
 
     --root        override dataset root path
-    --snr         SNR for noise injection (7-story only; default -1.0 = off)
     --seed        dataloader split seed (default 42)
     --window-size Qatar window size in samples (default 2048)
     --overlap     Qatar window overlap fraction (default 0.5)
@@ -41,7 +40,7 @@ from lib.calibration import (
     load_calibration,
 )
 from lib.datasets import DATASETS, get_dataset
-from lib.data_safetensors import DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
+from lib.data_7story import DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK
 from lib.model import (
     ModelConfig,
     ModelConfigC,
@@ -65,13 +64,16 @@ METRICS = [
 
 _EVAL_FN  = {"v1": eval_on_loader_v1_calibrated,
              "c":  eval_on_loader_c_calibrated,
-             "dr": eval_on_loader_dr_calibrated}
+             "dr": eval_on_loader_dr_calibrated,
+             "b":  eval_on_loader_dr_calibrated}
 _REAL_FN  = {"v1": do_real_test_v1_calibrated,
              "c":  do_real_test_c_calibrated,
-             "dr": do_real_test_dr_calibrated}
+             "dr": do_real_test_dr_calibrated,
+             "b":  do_real_test_dr_calibrated}
 _LOAD_FN  = {"v1": load_model_from_checkpoint,
              "c":  load_model_c_from_checkpoint,
-             "dr": load_model_dr_from_checkpoint}
+             "dr": load_model_dr_from_checkpoint,
+             "b":  load_model_dr_from_checkpoint}
 _CAL_LABEL = {
     "v1": lambda cal: (
         f"v1 (T={cal['temperature']:.2f}, α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
@@ -81,6 +83,10 @@ _CAL_LABEL = {
     "dr": lambda cal: (
         f"DR (α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
         if "ratio_alpha" in cal else f"DR (θ={cal.get('threshold', 0.5):.2f})"
+    ),
+    "b": lambda cal: (
+        f"B (α={cal['ratio_alpha']:.2f}, β={cal['ratio_beta']:.2f})"
+        if "ratio_alpha" in cal else f"B (θ={cal.get('threshold', 0.5):.2f})"
     ),
 }
 
@@ -93,15 +99,17 @@ def run_evaluation(
     v1_ckpt: str | Path | None,
     c_ckpt:  str | Path | None = None,
     dr_ckpt: str | Path | None = None,
+    b_ckpt:  str | Path | None = None,
     *,
     dataset_name: str = "7story",
     root: str | None = None,
-    snr: float = -1.0,
     seed: int = 42,
     window_size: int = 2048,
     overlap: float = 0.5,
     downsample: int = 4,
     tower_excitation: tuple[str, ...] = ("EQ", "WN", "sine"),
+    split_double: bool = False,
+    held_out_double: int | None = None,
 ) -> dict[str, dict[str, float]]:
     """
     Evaluate any combination of checkpoints and return a nested metric dict.
@@ -119,11 +127,12 @@ def run_evaluation(
         eval_batch_size=32,
         seed=seed,
         # dataset-specific (ignored by non-matching loaders via **_)
-        snr=snr,
         tower_excitation=tower_excitation,
         window_size=window_size,
         overlap=overlap,
         downsample=downsample,
+        split_double=split_double,
+        held_out_double=held_out_double,
         train_batch_size=32,   # unused for test loaders
     )
 
@@ -136,9 +145,10 @@ def run_evaluation(
         "dr": ModelConfigDR(n_sensors=dataset.n_sensors, time_len=time_len,
                             num_locations=dataset.n_locations),
         "c":  None,  # load_model_c_from_checkpoint infers from weights
+        "b":  None,  # load_model_dr_from_checkpoint auto-detects plain from weights
     }
 
-    ckpts = {"v1": v1_ckpt, "c": c_ckpt, "dr": dr_ckpt}
+    ckpts = {"v1": v1_ckpt, "c": c_ckpt, "dr": dr_ckpt, "b": b_ckpt}
     for model_name, ckpt in ckpts.items():
         if ckpt is None:
             continue
@@ -241,31 +251,37 @@ def main() -> None:
                         help="Approach-C (MidnC) checkpoint path")
     parser.add_argument("--dr", default=None, metavar="CKPT",
                         help="Approach-DR (MidnDR) checkpoint path")
+    parser.add_argument("--b",  default=None, metavar="CKPT",
+                        help="Baseline plain regression (PlainDR) checkpoint path")
     parser.add_argument("--root", default=None,
                         help="Override dataset root path")
-    parser.add_argument("--snr",         type=float, default=-1.0)
     parser.add_argument("--seed",        type=int,   default=42)
     parser.add_argument("--window-size", type=int,   default=2048)
     parser.add_argument("--overlap",     type=float, default=0.5)
     parser.add_argument("--downsample",  type=int,   default=4)
     parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"])
+    parser.add_argument("--split-double", action="store_true", default=False,
+                        help="Qatar only: use second½ of double-damage recordings as extra test set")
+    parser.add_argument("--held-out-double", type=int, default=None, metavar="{0-4}",
+                        help="Qatar only: use this LOO fold's held-out recording as extra test set")
     parser.add_argument("--out", default=None, metavar="STEM",
                         help="Output path stem for .json/.csv (default: saved_results/{dataset}/eval_{timestamp})")
     args = parser.parse_args()
 
-    if args.v1 is None and args.c is None and args.dr is None:
-        parser.error("At least one of --v1, --c, --dr is required.")
+    if args.v1 is None and args.c is None and args.dr is None and args.b is None:
+        parser.error("At least one of --v1, --c, --dr, --b is required.")
 
     results = run_evaluation(
-        args.v1, args.c, args.dr,
+        args.v1, args.c, args.dr, args.b,
         dataset_name=args.dataset,
         root=args.root,
-        snr=args.snr,
         seed=args.seed,
         window_size=args.window_size,
         overlap=args.overlap,
         downsample=args.downsample,
         tower_excitation=tuple(args.tower_excitation),
+        split_double=args.split_double,
+        held_out_double=args.held_out_double,
     )
     print_table(results)
     save_results(results, args.dataset, out=args.out)

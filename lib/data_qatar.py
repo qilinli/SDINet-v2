@@ -33,7 +33,7 @@ Why this split?
     meaningful val signal (all 30 scenarios present) while keeping the evaluation
     independent from training data.
 
-Label convention (shared with lib/data_safetensors.py):
+Label convention (shared with lib/data_7story.py):
     Y ∈ {0, 1}^30  →  y_norm = 2Y − 1 ∈ {−1, +1}
     Undamaged location → −1,  Damaged location → +1
 
@@ -53,7 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from scipy.signal import decimate as _scipy_decimate
 
 # ---------------------------------------------------------------------------
@@ -67,23 +67,6 @@ QATAR_N_SENSORS: int   = 30
 QATAR_N_LOCATIONS: int = 30
 QATAR_GRID_ROWS: int   = 6   # rows front→back
 QATAR_GRID_COLS: int   = 5   # columns right→left
-
-# The 5 real double-damage recordings (0-indexed joint positions in the label vector).
-# Used by targeted synthetic mixing (--targeted-mix) to bias the partner pool toward
-# the exact joint combinations that appear in the double-damage test set.
-#   j03+j26 → (2, 25)
-#   j07+j14 → (6, 13)
-#   j13+j23 → (12, 22)
-#   j21+j25 → (20, 24)
-#   j23+j24 → (22, 23)
-QATAR_DOUBLE_DAMAGE_PAIRS: list[tuple[int, int]] = [
-    (2, 25),
-    (6, 13),
-    (12, 22),
-    (20, 24),
-    (22, 23),
-]
-
 
 # ---------------------------------------------------------------------------
 # Sensor grid helpers  (used for structured masking and fault evaluation)
@@ -109,6 +92,30 @@ def mask_sensors(x: torch.Tensor, indices: list[int]) -> torch.Tensor:
     x = x.clone()
     x[..., indices] = 0.0
     return x
+
+
+def build_structural_affinity(
+    n_rows: int = QATAR_GRID_ROWS,
+    n_cols: int = QATAR_GRID_COLS,
+) -> torch.Tensor:
+    """(L+1, S) binary location-sensor affinity for Qatar's 6×5 grid.
+
+    R[l, i] = 1 if sensor i is joint l itself or a 4-connected grid neighbor, else 0.
+    Last row (no-object class) is all zeros — no spatial preference for ∅.
+    Values are binary {0, 1}: pure adjacency prior; scale is learned during training.
+
+    Sensor/joint index j maps to grid position (row=j//n_cols, col=j%n_cols).
+    Qatar has a 1:1 sensor-to-joint mapping so sensor i monitors joint i.
+    """
+    L = S = n_rows * n_cols
+    R = torch.zeros(L + 1, S)
+    for l in range(L):
+        rl, cl = divmod(l, n_cols)
+        for i in range(S):
+            ri, ci = divmod(i, n_cols)
+            if abs(rl - ri) + abs(cl - ci) <= 1:   # self (dist=0) or 4-neighbor (dist=1)
+                R[l, i] = 1.0
+    return R  # shape (L+1, S); last row is zero
 
 
 # ---------------------------------------------------------------------------
@@ -287,141 +294,59 @@ def _time_split_b(
     return np.concatenate(val_list), np.concatenate(test_list)
 
 
+def get_qatar_test_by_recording(
+    root: str = QATAR_DEFAULT_ROOT,
+    window_size: int = 2048,
+    overlap: float = 0.5,
+    downsample: int = 4,
+    val_frac: float = 0.5,
+    normalize: str = "rms",
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Return test windows (Dataset B, second half) grouped by recording.
+
+    Uses the same split logic as get_qatar_dataloaders so results are
+    consistent.  Recording boundaries are preserved so evaluate_fault.py
+    can inject faults consistently across all windows of each recording
+    (matching the physical scenario where a sensor fault persists for the
+    full measurement session).
+
+    Returns:
+        List of (x, y) per recording.
+        x: (n_windows, 1, T, S)  pre-windowed, normalised
+        y: (n_windows, L)        label repeated for every window (constant
+                                 within a recording — same damage scenario)
+    """
+    stride = max(1, int(window_size * (1 - overlap)))
+    X, Y, case_ids = _load_group(Path(root), "dataset_b", window_size, stride, normalize, downsample)
+    _, test_idx = _time_split_b(case_ids, val_frac)
+
+    x_t = torch.from_numpy(X[test_idx]).unsqueeze(1).float()  # (N, 1, T, S)
+    y_t = torch.from_numpy(Y[test_idx]).float()                # (N, L)
+    y_t = y_t * 2.0 - 1.0                                     # {0,1} → {-1,+1} normalised
+
+    ids = case_ids[test_idx]
+    recordings = []
+    for c in np.unique(ids):
+        mask = ids == c
+        recordings.append((x_t[mask], y_t[mask]))
+    return recordings
+
+
 # ---------------------------------------------------------------------------
 # Augmentation dataset  (training only)
 # ---------------------------------------------------------------------------
 
-class _AugDataset(Dataset):
+def build_struct_masks_qatar() -> list[list[int]]:
+    """11 structured mask groups for Qatar's 6×5 sensor grid (0-indexed).
+
+    6 row groups (5 sensors each) + 5 column groups (6 sensors each).
     """
-    Wraps training tensors and applies four stochastic augmentations per sample.
+    return ([row_sensors(r) for r in range(QATAR_GRID_ROWS)]
+            + [col_sensors(c) for c in range(QATAR_GRID_COLS)])
 
-    Applied fresh every epoch so the same window looks different each time.
-    Val / test use plain TensorDataset — no augmentation.
 
-    Augmentations (applied in order):
-    1. Amplitude scaling  ×U(0.8, 1.2)
-       Simulates different excitation intensity between recordings.
-
-    2. Gaussian noise  σ = 5% of each sensor's RMS
-       Simulates sensor noise and small environmental fluctuations.
-       Per-sensor scaling preserves relative noise levels across channels.
-
-    3. Random channel masking  (prob p_random)
-       Zero out k ~ U(0, max_k) randomly chosen sensor channels.
-       Trains robustness to individual sensor failures.
-
-    4. Structured masking  (prob p_struct)
-       Zero out one complete grid row (5 sensors) or column (6 sensors).
-       Simulates a wiring harness or DAQ channel group going offline.
-    """
-
-    def __init__(
-        self,
-        x: torch.Tensor,            # (N, 1, T, S)
-        y: torch.Tensor,            # (N, L)
-        p_random: float = 0.5,
-        max_k: int = 10,
-        p_struct: float = 0.3,
-        p_mix: float = 0.0,
-        case_ids: torch.Tensor | None = None,  # (N,) int recording index
-        target_pairs: list[tuple[int, int]] | None = None,  # targeted mix pairs (0-indexed joint positions)
-    ) -> None:
-        self.x = x
-        self.y = y
-        self.p_random = p_random
-        self.max_k    = max_k
-        self.p_struct = p_struct
-        self.p_mix    = p_mix
-        # All possible structured masks: 6 rows + 5 columns
-        self._struct_masks: list[list[int]] = (
-            [row_sensors(r) for r in range(QATAR_GRID_ROWS)]
-            + [col_sensors(c) for c in range(QATAR_GRID_COLS)]
-        )
-
-        # Pre-compute per-recording mix pools (used only when p_mix > 0).
-        # Pool for recording c = indices of damaged windows NOT from recording c.
-        # Excludes: same recording (avoids K=1 duplicates) and healthy windows
-        # (y.max == -1, which would leave K unchanged after label union).
-        self._case_ids      = None
-        self._mix_pools: dict[int, torch.Tensor] = {}
-        self._partner_pools: dict[int, torch.Tensor] = {}  # joint_pos → targeted partner indices
-
-        if p_mix > 0.0 and case_ids is not None:
-            # Only K=1 windows as mix partners — K=2 windows would create K=3 synthetic samples
-            damaged_mask = (y > -1.0 + 1e-4).sum(dim=-1) == 1   # (N,) bool: exactly one damaged loc
-            damaged_idx  = damaged_mask.nonzero(as_tuple=False)[:, 0]  # indices
-            self._case_ids = case_ids
-            for c in case_ids.unique():
-                c_int = int(c.item())
-                not_same_rec = case_ids[damaged_idx] != c_int
-                self._mix_pools[c_int] = damaged_idx[not_same_rec]
-
-            # Targeted pools: restrict partner selection to the specific joint of each
-            # known target pair.  For each joint in a pair, its partner pool = all K=1
-            # windows whose label is active at the partner joint.  Because Dataset A has
-            # one recording per joint, the "different recording" constraint is automatically
-            # satisfied (different joints → different recordings).
-            if target_pairs is not None:
-                joint_to_idx: dict[int, list[int]] = {}
-                for wi in damaged_idx.tolist():
-                    jp = int(y[wi].argmax().item())
-                    joint_to_idx.setdefault(jp, []).append(wi)
-
-                partner_idx_map: dict[int, list[int]] = {}
-                for (a, b) in target_pairs:
-                    if b in joint_to_idx:
-                        partner_idx_map.setdefault(a, []).extend(joint_to_idx[b])
-                    if a in joint_to_idx:
-                        partner_idx_map.setdefault(b, []).extend(joint_to_idx[a])
-
-                for jp, idxs in partner_idx_map.items():
-                    self._partner_pools[jp] = torch.tensor(idxs, dtype=torch.long)
-
-    def __len__(self) -> int:
-        return len(self.x)
-
-    def __getitem__(self, idx: int):
-        # Signal superposition augmentation: add a second random sample.
-        # Partner drawn from pre-computed pool: damaged windows from a different
-        # recording than idx.  Sum divided by √2 to keep RMS comparable to
-        # single-damage windows seen at val/test time.
-        if self.p_mix > 0.0 and torch.rand(1).item() < self.p_mix and self._mix_pools:
-            rec_id = int(self._case_ids[idx].item())
-            # Targeted mixing: if this window's joint is in a known target pair,
-            # draw the partner exclusively from windows of the paired joint.
-            # Healthy windows (all labels == -1) fall back to random pool.
-            pool = None
-            if self._partner_pools and self.y[idx].max().item() > -1.0 + 1e-4:
-                joint_pos = int(self.y[idx].argmax().item())
-                pool = self._partner_pools.get(joint_pos)
-            if pool is None:
-                pool = self._mix_pools[rec_id]
-            j      = int(pool[torch.randint(0, len(pool), (1,)).item()].item())
-            x = (self.x[idx].clone() + self.x[j].clone()) * (2 ** -0.5)
-            y = torch.maximum(self.y[idx], self.y[j])
-        else:
-            x = self.x[idx].clone()
-            y = self.y[idx]
-
-        # 1. Amplitude scaling
-        x = x * (0.8 + 0.4 * torch.rand(1))
-
-        # 2. Per-sensor noise
-        sensor_rms = x.pow(2).mean(dim=1, keepdim=True).sqrt()   # (1, 1, S)
-        x = x + torch.randn_like(x) * (0.05 * sensor_rms)
-
-        # 3. Random channel masking
-        if self.max_k > 0 and torch.rand(1).item() < self.p_random:
-            k = int(torch.randint(0, self.max_k + 1, (1,)).item())
-            if k > 0:
-                x[:, :, torch.randperm(QATAR_N_SENSORS)[:k].tolist()] = 0.0
-
-        # 4. Structured masking
-        if torch.rand(1).item() < self.p_struct:
-            mask_idx = int(torch.randint(0, len(self._struct_masks), (1,)).item())
-            x[:, :, self._struct_masks[mask_idx]] = 0.0
-
-        return x, y
+_struct_masks_qatar = build_struct_masks_qatar()  # precompute once
 
 
 # ---------------------------------------------------------------------------
@@ -440,13 +365,11 @@ def get_qatar_dataloaders(
     eval_batch_size: int = 32,
     seed: int = 42,         # kept for API compatibility; split is deterministic by time
     val_frac: float = 0.5,
-    p_random_mask: float = 0.5,
-    max_random_mask: int = 10,
-    p_struct_mask: float = 0.3,
-    p_mix: float = 0.0,
+    p_hard: float = 0.0,
+    p_struct_mask: float = 0.0,
+    p_soft: float = 0.0,
     held_out_double: int | None = None,
     split_double: bool = False,
-    targeted_mix: bool = False,
     **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -457,25 +380,9 @@ def get_qatar_dataloaders(
         val    —  Dataset B, first val_frac of windows per recording
         test   —  Dataset B, remaining windows per recording (1-window gap at boundary)
 
-    Batch format:
-        x : (B, 1, window_size // downsample, 30)   float32
-        y : (B, 30)                                  float32  ∈ {−1, +1}
-
-    Args:
-        root:            Path to processed/ directory (output of build_dataset.py).
-        window_size:     Physical window in original samples at 1024 Hz
-                         (1024=1 s, 2048=2 s, 4096=4 s).
-        overlap:         Fraction overlap between adjacent windows (0 = non-overlapping).
-        downsample:      Decimation factor applied before windowing (default 4).
-                         4 → 256 Hz, 512 samples: captures structural modes up to
-                         128 Hz at 4× smaller model input than raw 1024 Hz.
-                         Must divide window_size evenly; use 1 to disable.
-        normalize:       "rms" | "zscore" | None  (see _normalize for details).
-        val_frac:        Fraction of Dataset B windows per recording used for val
-                         (time-ordered: first val_frac → val, rest → test).
-        p_random_mask:   Training augmentation: prob of random channel dropout.
-        max_random_mask: Training augmentation: max channels zeroed per sample.
-        p_struct_mask:   Training augmentation: prob of row/column structured masking.
+    Training set is always wrapped in ``_AugDataset`` which applies signal
+    augmentation (amplitude scaling + per-sensor noise) and optionally fault
+    augmentation when any fault flag is > 0.
     """
     if split_double and held_out_double is not None:
         raise ValueError("split_double and held_out_double are mutually exclusive")
@@ -496,8 +403,6 @@ def get_qatar_dataloaders(
     # Time-based split of Dataset B into val and test
     val_idx, test_idx = _time_split_b(case_ids_b, val_frac)
 
-    case_ids_a_t = torch.from_numpy(case_ids_a).long()
-
     # Optionally append 4 of 5 real double-damage recordings to the training set.
     # The held-out recording (held_out_double) is reserved for test evaluation.
     dd_note = ""
@@ -508,12 +413,8 @@ def get_qatar_dataloaders(
         train_mask = case_ids_dd != held_out_double
         x_dd = torch.from_numpy(X_dd[train_mask]).float().unsqueeze(1)
         y_dd = torch.from_numpy(Y_dd[train_mask] * 2.0 - 1.0).float()
-        # Offset case_ids so they don't collide with Dataset A IDs
-        dd_case_ids = (torch.from_numpy(case_ids_dd[train_mask]).long()
-                       + int(case_ids_a_t.max()) + 1)
         x_a = torch.cat([x_a, x_dd], dim=0)
         y_a = torch.cat([y_a, y_dd], dim=0)
-        case_ids_a_t = torch.cat([case_ids_a_t, dd_case_ids])
         dd_note = f" + 4×K=2 real ({len(x_dd)} segs)"
 
     # Optionally append first 50% of all 5 double-damage recordings (split_double mode).
@@ -525,40 +426,30 @@ def get_qatar_dataloaders(
         train_idx_dd, _ = _time_split_b(case_ids_dd, val_frac=0.5)
         x_dd = torch.from_numpy(X_dd[train_idx_dd]).float().unsqueeze(1)
         y_dd = torch.from_numpy(Y_dd[train_idx_dd] * 2.0 - 1.0).float()
-        dd_case_ids = (torch.from_numpy(case_ids_dd[train_idx_dd]).long()
-                       + int(case_ids_a_t.max()) + 1)
         x_a = torch.cat([x_a, x_dd], dim=0)
         y_a = torch.cat([y_a, y_dd], dim=0)
-        case_ids_a_t = torch.cat([case_ids_a_t, dd_case_ids])
         dd_note = f" + 5×K=2 first½ ({len(x_dd)} segs)"
 
     eff_fs = QATAR_FS // downsample
     eff_T  = window_size // downsample
-    target_pairs = QATAR_DOUBLE_DAMAGE_PAIRS if targeted_mix else None
-    if p_mix > 0.0 and targeted_mix:
-        mix_note = f", {p_mix:.0%} targeted K=2 ({len(QATAR_DOUBLE_DAMAGE_PAIRS)} pairs)"
-    elif p_mix > 0.0:
-        mix_note = f", {p_mix:.0%} synthetic K=2"
-    else:
-        mix_note = ""
     print(
-        f"[qatar] train=Dataset A ({len(X_a)} segs){dd_note}{mix_note} | "
+        f"[qatar] train=Dataset A ({len(x_a)} segs){dd_note} | "
         f"val=Dataset B first {val_frac:.0%} ({len(val_idx)} segs) | "
         f"test=Dataset B last {1.0 - val_frac:.0%} ({len(test_idx)} segs)  "
         f"[window={window_size}→{eff_T} @ {eff_fs} Hz, norm={normalize!r}]"
     )
 
     def _dl(x, y, batch_size, shuffle, augment=False):
+        from lib.faults import AugDataset
         ds = (
-            _AugDataset(x, y, p_random=p_random_mask,
-                        max_k=max_random_mask, p_struct=p_struct_mask,
-                        p_mix=p_mix, case_ids=case_ids_a_t,
-                        target_pairs=target_pairs)
+            AugDataset(x, y, QATAR_N_SENSORS, _struct_masks_qatar,
+                       p_hard=p_hard, p_struct=p_struct_mask, p_soft=p_soft)
             if augment
             else TensorDataset(x, y)
         )
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=num_workers)
+                          num_workers=num_workers, pin_memory=True,
+                          persistent_workers=num_workers > 0)
 
     return (
         _dl(x_a,              y_a,              train_batch_size, shuffle=True,  augment=True),
@@ -616,4 +507,5 @@ def get_qatar_double_test_dataloader(
     )
 
     return DataLoader(TensorDataset(x_t, y_t), batch_size=eval_batch_size,
-                      shuffle=False, num_workers=num_workers)
+                      shuffle=False, num_workers=num_workers, pin_memory=True,
+                      persistent_workers=num_workers > 0)

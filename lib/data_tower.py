@@ -11,7 +11,7 @@ Each directory contains .npz files with:
     X:  (N, 400, 6)  float32  — N windows × T time-steps × S sensors
     Y:  (N, 4)       float32  — damage severity ∈ [0, 1] per structural location
 
-Label convention (identical to lib/data_safetensors.py):
+Label convention (identical to lib/data_7story.py):
     y_norm = Y * 2 − 1  ∈ [−1, 1]
     Undamaged (Y = 0)   →  y_norm = −1
     Max damaged (Y = 1) →  y_norm = +1
@@ -28,13 +28,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 
 TOWER_DEFAULT_ROOT: str = "data/tower"
 
 TOWER_TIME_LEN: int    = 400
 TOWER_N_SENSORS: int   = 6
 TOWER_N_LOCATIONS: int = 4
+
+
+def build_struct_masks_tower() -> list[list[int]]:
+    """3 structured mask groups for the tower's 6 sensors (0-indexed).
+
+    Floor-level pairs: 2 sensors per physical story of the 3-story tower.
+    C1/C2 = floor 1, C3/C4 = floor 2, C5/C6 = floor 3.
+    """
+    return [[0, 1], [2, 3], [4, 5]]
 
 
 def _load_arrays(
@@ -132,36 +141,7 @@ def _stratified_case_split(
     return np.array(train_list), np.array(val_list), np.array(test_list)
 
 
-class _AugDataset(Dataset):
-    """
-    Training-only dataset with on-the-fly augmentation.
-
-    Two augmentations applied independently per sample:
-    1. Amplitude scaling — multiply all channels by Uniform(0.8, 1.2).
-       Simulates different excitation gain settings without altering inter-channel ratios.
-    2. Gaussian noise — add per-sensor noise with σ = 5 % of that sensor's RMS.
-       Since C1 is normalised to RMS ≈ 1, this injects ~0.05 g of noise on C1 and
-       proportionally less on the weaker channels (C3, C6), preserving relative SNR.
-    """
-
-    def __init__(self, x: torch.Tensor, y: torch.Tensor) -> None:
-        self.x = x   # (N, 1, T, S)
-        self.y = y   # (N, L)
-
-    def __len__(self) -> int:
-        return len(self.x)
-
-    def __getitem__(self, idx: int):
-        x = self.x[idx].clone()   # (1, T, S)
-
-        # 1. Amplitude scaling
-        x = x * (0.8 + 0.4 * torch.rand(1))
-
-        # 2. Per-sensor Gaussian noise (5 % of each sensor's RMS)
-        sensor_rms = x.pow(2).mean(dim=1, keepdim=True).sqrt()   # (1, 1, S)
-        x = x + torch.randn_like(x) * (0.05 * sensor_rms)
-
-        return x, self.y[idx]
+_struct_masks_tower = build_struct_masks_tower()  # precompute once
 
 
 def get_tower_dataloaders(
@@ -173,6 +153,10 @@ def get_tower_dataloaders(
     eval_batch_size: int = 32,
     seed: int = 42,
     include_healthy: bool = True,
+    p_hard: float = 0.0,
+    p_struct_mask: float = 0.0,
+    p_soft: float = 0.0,
+    **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders from the tower dataset.
@@ -214,9 +198,13 @@ def get_tower_dataloaders(
     test_idx  = np.where(np.isin(case_ids, test_cases))[0]
 
     def _dl(idx, batch_size, shuffle, augment=False):
-        ds = _AugDataset(x_t[idx], y_t[idx]) if augment else TensorDataset(x_t[idx], y_t[idx])
+        from lib.faults import AugDataset
+        ds = (AugDataset(x_t[idx], y_t[idx], TOWER_N_SENSORS, _struct_masks_tower,
+                         p_hard=p_hard, p_struct=p_struct_mask, p_soft=p_soft)
+              if augment else TensorDataset(x_t[idx], y_t[idx]))
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=num_workers)
+                          num_workers=num_workers, pin_memory=True,
+                          persistent_workers=num_workers > 0)
 
     # Report category breakdown per split
     def _cat_counts(cases):

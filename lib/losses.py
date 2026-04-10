@@ -6,7 +6,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
 # ---------------------------------------------------------------------------
-# Label-space constants — must match data_safetensors.target_preprocess:
+# Label-space constants — must match data_7story.target_preprocess:
 #   y_norm = raw_damage / 0.15 - 1
 #   Undamaged → -1.0,  max-damaged → +1.0
 # ---------------------------------------------------------------------------
@@ -158,3 +158,43 @@ class SetCriterion(nn.Module):
 
         total = self.loc_weight * loc_loss + self.sev_weight * sev_loss
         return total, loc_loss, sev_loss
+
+
+# ---------------------------------------------------------------------------
+# Fault detection: per-sensor binary BCE
+# ---------------------------------------------------------------------------
+
+class FaultBCELoss(nn.Module):
+    """
+    Per-sensor binary cross-entropy loss for the fault detection head.
+
+    fault_prob is already sigmoid-activated (output of MidnC.fault_head),
+    so we use binary_cross_entropy rather than binary_cross_entropy_with_logits.
+
+    pos_weight upweights the faulty-sensor class to compensate for sparsity
+    (typically ~5 sensors out of 30 are faulted per augmented window).
+
+    Args:
+        pos_weight: BCE positive-class weight. Default 5.0 ≈ (S - mean_faults) / mean_faults.
+    """
+
+    def __init__(self, pos_weight: float = 5.0) -> None:
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor(pos_weight))
+
+    def forward(self, fault_prob: Tensor, y_fault: Tensor) -> Tensor:
+        """
+        Args:
+            fault_prob: (B, S) sigmoid-activated fault probabilities ∈ [0, 1]
+            y_fault:    (B, S) binary ground truth ∈ {0, 1}
+
+        Returns:
+            Scalar weighted BCE loss.
+        """
+        y = y_fault.float()
+        # Manual pos_weight: scale positive terms
+        loss = -(
+            self.pos_weight * y * torch.log(fault_prob.clamp(min=1e-7))
+            + (1.0 - y) * torch.log((1.0 - fault_prob).clamp(min=1e-7))
+        )
+        return loss.mean()

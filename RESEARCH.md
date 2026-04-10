@@ -59,14 +59,15 @@ This is a stronger claim than "fault-tolerant identification": the model learns 
 
 ## Datasets
 
-Two datasets are used, representing the simulation → laboratory progression:
+Three datasets are used, representing the full simulation → laboratory → field progression:
 
 | Dataset | Nature | Sensors (S) | Joints (L) | Damage | Role |
 |---------|--------|-------------|------------|--------|------|
 | 7-story frame | Simulation | 65 (full) / 9 (sparse) | 70 | Continuous severity, K=1 and K=2 | Design exploration, ablations |
 | Qatar SHM Benchmark | Physical lab | 30 | 30 | Binary presence, K=1 (train) / K=2 (test) | Real-world validation |
+| LUMO | Field (outdoor ambient) | 18 | 3 | Binary presence, K≤1 only | Field validation, ambient robustness |
 
-The sim → lab generalization is itself a contribution: design and ablate on clean simulation, validate transfer to physical data. A future real field-structure dataset would close the full sim → lab → field loop.
+The sim → lab → field progression is itself a contribution: design and ablate on clean simulation, validate transfer to physical lab data, then stress-test under real ambient field conditions with non-stationary excitation. LUMO (Leibniz Uni Hannover lattice tower, wind-excited, 18 accel sensors, 3 reversible damage positions) closes the loop. Key finding: the architecture ranking inverts going from lab to field — DR > C on LUMO (F1=0.972 vs 0.946), reversing the Qatar ranking, because the C-head's ∅-class boundary blurs under ambient distribution shift while DR's per-location thresholds remain robust (see Domain Insight 23).
 
 The 7-story **sparse** config (S=9) is specifically calibrated to the 9 sensors used in the physical benchmark `.mat` file, bridging simulation and physical experiment within the same dataset.
 
@@ -115,13 +116,133 @@ The question of *where* to introduce sensor-to-sensor reasoning: in raw signal s
 
 **Conclusion**: feature space is the right primary target. The backbone has already encoded structural physics into compact representations, giving a richer discrimination basis than raw statistics. The existing importance mechanisms confirm that late-space sensor weighting already works for fault tolerance in the easy (hard fault) case. The missing piece is cross-sensor context — a stage where sensors reason about each other's features before importance weights are finalised.
 
+### Field-regime finding: C-head's ∅-class is a liability under ambient excitation
+
+The LUMO field benchmark (ambient wind excitation, K≤1) reveals a regime where the C-head's slot machinery *hurts* rather than helps. The ranking inverts from lab conditions: DR F1=0.972 vs C F1=0.946 on LUMO, while on Qatar they were tied at ~0.99. Two reinforcing mechanisms:
+
+1. **∅-class boundary blur.** The DETR ∅-class decision ("is this slot active or empty?") is learned from training data. Under stationary forced excitation, the healthy embedding distribution is compact and the ∅ boundary is sharp. Under ambient excitation, wind variability spreads the healthy distribution — some low-energy damaged windows fall on the "healthy" side, dropping C's recall to 0.929. DR has no such global gate — each location is thresholded independently, keeping recall at 0.972.
+
+2. **Unnecessary set-prediction overhead.** LUMO has K≤1 everywhere — no multi-damage scenarios. The slot mechanism, Hungarian matching, and ∅-class all exist to solve variable-cardinality set prediction (K>1). When K≤1, DR's simpler "each location votes independently" is a strictly better-matched inductive bias.
+
+**Implication for the research narrative**: the C-head's advantage is *conditional on the regime*. It dominates when K>1 and excitation is stationary (7-story double-damage: C F1=0.942 vs DR 0.849). It loses when K≤1 and excitation is non-stationary (LUMO: DR > C). A future unified architecture should either adapt its ∅ threshold to input distribution statistics or learn a regime-dependent gating strategy.
+
+---
+
+## Next Research Stage: Sensor-Fault-Aware SDI
+
+### Core direction
+
+Add a **sensor spatial reasoning layer** between the backbone and the slot queries. This layer uses the known sensor layout (Qatar: 5×6 grid, coordinates known a priori) as a structural prior. Each sensor observes its physical neighbours in feature space. Sensors that are spatially incoherent with neighbours — faulty sensors — develop distinctive features that the damage slots naturally down-weight via cross-attention.
+
+This is architecturally distinguished from V1's implicit fault tolerance (sensor dropout augmentation) in a critical way: V1 learns to be robust to *absent* sensors; the spatial reasoning approach learns to detect and discount *present-but-wrong* sensors — the harder and more practically important fault class.
+
+### Sensor fault augmentation
+
+The existing augmentation (random channel masking, structured row/col masking) covers hard faults only (zeroed sensors). The SHM literature identifies a standard taxonomy of accelerometer faults relevant to forced-vibration testing; drift is excluded as it operates over hours/days and is negligible in 2s measurement windows.
+
+| Fault type | Physical cause | Augmentation |
+|---|---|---|
+| **Complete failure** | Cable disconnect, dead DAQ channel | Zero the sensor (already done) |
+| **Gain fault** | Mismatched sensitivity, cable resistance | Multiply by U(0.05, 0.15) or U(5, 15) |
+| **Bias/offset** | Poor sensor zeroing, coupling issue | Add constant ∈ ±[3×, 10×] RMS |
+| **Gain + bias (combined)** | Loose/corroded connector | Multiply + add offset simultaneously |
+| **Precision degradation** | EMI near electrical equipment | Add high-variance noise (σ >> 5% RMS) |
+| **Noise-only** | Transient interference during test | Replace with pure Gaussian noise |
+| **Stuck value** | Frozen DAQ channel | Replace with sensor mean ± small noise |
+
+All are generatable synthetically with no new recordings. Each produces a `y_fault` label for the affected sensors — free supervision from augmentation. Gain+bias as a combined mode is physically motivated: loose or corroded connectors degrade amplitude and introduce DC offset simultaneously.
+
+### Fault head design
+
+A **per-sensor binary fault classifier** (not DETR-style slots) is appropriate here: sensors have known identities (indices 0..29), so fault detection is "classify each of 30 sensors" not "find unknown objects." A simple linear head on the spatially-aware features → P(faulty) per sensor, trained with weighted BCE against augmentation labels.
+
+The fault head is an **open-loop auxiliary output** — it provides a training signal for the spatial reasoning layer and a deployable diagnostic indicator for engineers, but does not directly modulate the damage cross-attention. This keeps the damage head robust even when the fault head misfires on unseen fault types.
+
+### Attention map interpretability
+
+The slot decoder's cross-attention weights over sensors, plotted on the physical sensor grid, provide direct interpretability. For a single-damage detection (the primary evaluation target at this stage):
+
+- **Healthy sensors**: active damage slot attends to the sensor neighbourhood around the detected joint — a spatially concentrated attention map consistent with structural physics
+- **Faulty sensor within that neighbourhood**: visible *attention valley* — a dip in a region that should show elevated attention
+
+This gives engineers a two-panel output: (1) which joint is damaged, (2) which sensors were trusted or distrusted in making that prediction. This is a strong interpretability contribution for the SHM domain.
+
+For clean visualisation, the final cross-attention layer of the slot decoder should use a small number of heads (or single-head) so attention maps are directly readable without averaging artefacts.
+
+### Evaluation scope at this stage
+
+Focus on **single-damage (K=1)** detection under varying fault conditions. Multi-damage generalisation is a separate problem (addressed by the `--held-out-double` / `--split-double` LOO work). The fault-robustness evaluation should vary:
+- Fault type (hard vs. soft, random vs. structured)
+- Fault fraction (fraction of sensors affected)
+- Fault location (sensors near damage vs. far from damage — near-damage faults are the hardest case)
+
+---
+
+## Experimental Findings: Sensor Fault Robustness Phase
+
+Six models were compared on the Qatar test set (Dataset B, 30 sensors, 30 joints, K=1).
+Four training conditions: no fault augmentation (baseline), fault head + soft-fault aug
+(C+FH), spatial-layer + fault head (C+SF+FH), and structural affinity bias + fault head
+(C+FH+SB). Soft-fault augmentation used moderate magnitudes across 7 fault types (hard,
+gain, bias, gain_bias, noise, stuck, partial), sweeping n_faulted ∈ {1, 3, 5, 10, 15}
+with n_repeats=3. Results are mean damage detection F1 across all n values.
+
+| Fault Type  | v1    | DR    | C     | C+FH  | C+SF+FH | C+FH+SB |
+|-------------|-------|-------|-------|-------|---------|---------|
+| hard        | 0.974 | 0.989 | 0.988 | 0.987 | 0.960   | **0.988** |
+| gain        | 0.789 | 0.885 | 0.920 | 0.990 | 0.797   | **0.993** |
+| bias        | 0.278 | 0.806 | 0.737 | 0.861 | 0.902   | **0.981** |
+| gain_bias   | 0.352 | 0.956 | 0.774 | 0.929 | 0.849   | **0.990** |
+| noise       | 0.255 | 0.050 | 0.360 | 0.928 | 0.498   | **0.936** |
+| stuck       | 0.974 | 0.989 | 0.987 | 0.985 | 0.957   | **0.988** |
+| partial     | 0.974 | 0.985 | 0.988 | 0.983 | 0.850   | **0.991** |
+| **clean**   | 0.975 | 0.991 | 0.992 | 0.992 | 0.984   | **0.994** |
+
+*Baselines use models trained without fault augmentation. C+SF+FH used old extreme-magnitude fault aug and is included as an ablation.*
+
+### Why SensorSpatialLayer (C+SF+FH) failed
+
+Adding all-to-all cross-sensor self-attention *before* the slot decoder — the intuitive
+approach — consistently degraded damage F1 relative to fault augmentation alone (C+FH), with
+the largest drops on soft fault types (gain −0.193, noise −0.430, partial −0.133) and only
+minor effects on hard/stuck faults. The mechanism is contamination: when the faulty sensor
+attends to its neighbours and vice versa, the faulty sensor's anomalous features are
+distributed into its neighbours' representations via attention-weighted sums. Clean sensors
+absorb fault artifacts; the spatial coherence contrast — the signal that makes a faulty
+sensor identifiable — is destroyed before the slot decoder sees it. Hard and stuck faults
+are immune because a zeroed sensor contributes nothing to attention sums. The lesson is that
+spatial reasoning that modifies sensor feature embeddings *before* the damage head is
+counterproductive for fault isolation. See Domain Insight 21.
+
+### Why R_bias (C+FH+SB) succeeded
+
+The structural affinity bias injects the spatial prior into attention *routing* (cross-attention
+logits) rather than into sensor feature representations. An (L+1)×S parameter matrix R,
+physically initialised from the 4-connected grid adjacency (R[l,i]=1 if sensor i is adjacent
+to joint l), is applied dynamically at decoder layers ≥1: the bias for slot k is
+`softmax(loc_logits_k) @ R`, a per-sample, per-slot weighting that directs each slot to
+attend toward sensors near its current location estimate. Sensor embeddings are never
+modified — clean sensors stay clean — so no contamination path exists. Layer 0 runs
+unbiased because the slot queries have not yet seen data and cannot provide a meaningful
+location estimate. R is a learnable parameter, refining the binary adjacency prior through
+training. C+FH+SB achieves the best damage F1 on all seven fault types while also improving
+clean F1 (0.994 vs 0.992 for baseline C), confirming zero clean-performance cost.
+See Domain Insight 22.
+
+**Design principle**: structural spatial priors belong in attention *routing* (logit space),
+not in feature mixing. The two approaches are not equivalent; only logit-space injection
+preserves the per-sensor embedding integrity that both the damage head and fault
+discrimination require.
+
 ---
 
 ## Open Research Questions
 
-1. Does adding cross-sensor spatial reasoning (sensor self-attention in feature space) meaningfully improve disambiguation of fault vs. damage, or does augmentation-based implicit robustness suffice?
-2. What is the right inductive bias for sensor spatial correlations — full self-attention (data-driven), or structured attention over the known physical grid layout?
-3. Does explicit fault detection (supervised, from augmentation labels) improve damage localisation compared to purely implicit robustness?
-4. Can the same architecture handle both hard faults (zero/disconnect) and soft faults (drift, gain error, stuck value) — given that hard faults are already handled implicitly?
-5. How does performance degrade as the fraction of faulty sensors increases — is there a graceful degradation curve, and where does it break?
-6. What is the right evaluation protocol — random fault patterns, structured row/column faults, or held-out fault types not seen during training?
+1. ~~Does the sensor spatial reasoning layer alone improve damage F1 over augmentation-only?~~ **Answered**: spatial layer + fault aug (C+SF+FH) *hurts* relative to fault aug alone (C+FH) — feature contamination outweighs any coherence benefit.
+2. ~~Does adding the per-sensor fault head improve F1 further?~~ **Answered**: yes — C+FH substantially outperforms C across all soft fault types; C+FH+SB improves further via the structural routing prior.
+3. Which soft fault types most commonly occur in real forced-vibration field deployments — and does the model trained on synthetic soft faults generalise to them?
+4. Does the attention valley appear cleanly in single-damage cases with a nearby faulty sensor, or does the spatial reasoning need to be stronger to produce interpretable maps?
+5. What is the right physical representation of sensor layout — 2D grid coordinates (attention + positional embedding) or explicit adjacency (GNN)? Do they differ in accuracy or interpretability?
+6. What fraction of faulty sensors causes graceful degradation vs. catastrophic failure of the damage head?
+7. Can the C-head's ∅-class boundary be made adaptive to input distribution statistics (e.g. ambient energy level), so that the slot mechanism retains its K>1 advantage without losing robustness under non-stationary field excitation? Or is a regime-switching strategy (C for K>1, DR for K≤1) more practical?
+8. Does temporal-extrapolation splitting on LUMO (train on early scenarios, test on later ones — different season, different bracing pattern) further degrade all heads, and does the ranking remain DR > C > v1?

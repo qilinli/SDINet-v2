@@ -127,6 +127,95 @@ class MidnDR(nn.Module):
         return (pred_raw * imp).sum(-1)                        # (B, L)
 
 
+class PlainDR(nn.Module):
+    """
+    Plain regression baseline (Approach B).
+
+    Simplest possible head: mean-pool over sensors, linear projection to L
+    locations, sigmoid activation.  No learned sensor attention — isolates
+    the contribution of the MIL importance-weighted aggregation in MidnDR.
+
+    Output shape and value range are identical to MidnDR ((B, L) ∈ [0, 1]),
+    so the entire DR training, calibration, and evaluation pipeline is reused.
+    """
+
+    def __init__(self, in_channels: int, num_locations: int = 70) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_channels, num_locations)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, in_channels, S) per-sensor neck features.
+        Returns:
+            pred: (B, L) damage severity ∈ [0, 1]
+        """
+        return torch.sigmoid(self.linear(x.mean(dim=-1)))
+
+
+class SensorPositionalEncoding(nn.Module):
+    """
+    Learned per-sensor positional embedding added to sensor feature memory.
+
+    Each of the S sensor positions gets a learnable embed_dim vector.
+    Initialised small (std=0.02) so it perturbs rather than dominates early in training.
+
+    Args:
+        n_sensors:  Number of sensors S (dataset-specific: 30 for Qatar, 65 for 7-story).
+        embed_dim:  Feature dimension (must match the neck output).
+    """
+
+    def __init__(self, n_sensors: int, embed_dim: int) -> None:
+        super().__init__()
+        self.pos_emb = nn.Parameter(torch.randn(n_sensors, embed_dim) * 0.02)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, S, embed_dim) sensor features from neck.
+        Returns:
+            (B, S, embed_dim) with positional embedding added.
+        """
+        return x + self.pos_emb  # broadcast over batch
+
+
+class SensorSpatialLayer(nn.Module):
+    """
+    Cross-sensor self-attention layer for spatial coherence reasoning.
+
+    Placed between the neck output and the slot decoder. Each sensor attends
+    to all other sensors, updating its representation based on what its
+    neighbours (in feature space) are reading. Spatially incoherent sensors
+    (faults) develop distinctive features after this layer, allowing the
+    damage slots to naturally down-weight them via cross-attention.
+
+    Args:
+        embed_dim:   Feature dimension (must match neck output).
+        nhead:       Number of attention heads (embed_dim must be divisible).
+        num_layers:  TransformerEncoder depth (1–2 typically sufficient).
+    """
+
+    def __init__(self, embed_dim: int, nhead: int, num_layers: int) -> None:
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True,
+            norm_first=True,   # pre-norm for stability
+        )
+        self.layers = nn.TransformerEncoder(encoder_layer, num_layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, S, embed_dim) sensor features (positional embeddings already added).
+        Returns:
+            (B, S, embed_dim) spatially-aware sensor features.
+        """
+        return self.layers(x)
+
+
 class MidnC(nn.Module):
     """
     DETR-style damage slot predictor (Approach C).
@@ -155,6 +244,13 @@ class MidnC(nn.Module):
         num_locations:       Structural locations L (default 70).
         num_decoder_layers:  Transformer decoder depth (default 2).
         nhead:               Attention heads (default 8; embed_dim must be divisible).
+        n_sensors:           Number of sensors S — required when use_spatial_layer
+                             or use_fault_head is True (default 0).
+        use_spatial_layer:   Enable SensorPositionalEncoding + SensorSpatialLayer
+                             before the slot decoder (default False).
+        num_spatial_layers:  Depth of the SensorSpatialLayer encoder (default 1).
+        spatial_nhead:       Attention heads in SensorSpatialLayer (default 8).
+        use_fault_head:      Enable per-sensor binary fault classifier (default False).
     """
 
     def __init__(
@@ -164,11 +260,19 @@ class MidnC(nn.Module):
         num_locations: int = 70,
         num_decoder_layers: int = 2,
         nhead: int = 8,
+        n_sensors: int = 0,
+        use_spatial_layer: bool = False,
+        num_spatial_layers: int = 1,
+        spatial_nhead: int = 8,
+        use_fault_head: bool = False,
+        structural_affinity: "Tensor | None" = None,
     ) -> None:
         super().__init__()
-        self.num_slots     = num_slots
-        self.num_locations = num_locations
-        self.no_obj_idx    = num_locations
+        self.num_slots         = num_slots
+        self.num_locations     = num_locations
+        self.no_obj_idx        = num_locations
+        self.use_spatial_layer = use_spatial_layer
+        self.use_fault_head    = use_fault_head
 
         # Learnable slot queries — one per potential damage
         self.queries = nn.Parameter(torch.randn(num_slots, embed_dim))
@@ -190,27 +294,73 @@ class MidnC(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        # Optional: sensor spatial reasoning (positional encoding + self-attention)
+        if use_spatial_layer:
+            self.pos_enc = SensorPositionalEncoding(n_sensors, embed_dim)
+            self.spatial = SensorSpatialLayer(embed_dim, spatial_nhead, num_spatial_layers)
+
+        # Optional: per-sensor binary fault classifier
+        if use_fault_head:
+            self.fault_head = nn.Linear(embed_dim, 1)
+
+        # Optional: structural location-sensor affinity bias in slot cross-attention
+        # R_bias[l, i]: affinity of sensor i for structural location l.
+        # At decoder layer k≥1, bias = softmax(loc_logits) @ R_bias is added to
+        # cross-attention logits, directing each slot toward structurally relevant sensors.
+        self.use_structural_bias = structural_affinity is not None
+        if self.use_structural_bias:
+            self.R_bias = nn.Parameter(structural_affinity.clone())  # (L+1, S), learnable
+            self._nhead = nhead
+
+    def forward(self, x: Tensor) -> tuple:
         """
         Args:
             x: (B, embed_dim, S) per-sensor features from the neck.
 
         Returns:
-            loc_logits: (B, K_max, L+1)  raw location logits (∅ = index L)
-            severity:   (B, K_max)       sigmoid-activated severity ∈ [0, 1]
+            loc_logits:  (B, K_max, L+1)  raw location logits (∅ = index L)
+            severity:    (B, K_max)       sigmoid-activated severity ∈ [0, 1]
+            fault_prob:  (B, S)           per-sensor fault probability ∈ [0, 1],
+                                          or None when use_fault_head=False
         """
         B = x.size(0)
 
         # Sensor features as transformer memory: (B, S, embed_dim)
         memory = x.permute(0, 2, 1)
 
-        # Expand slot queries to batch: (B, K_max, embed_dim)
+        # Optional: add positional embeddings and cross-sensor self-attention
+        if self.use_spatial_layer:
+            memory = self.pos_enc(memory)
+            memory = self.spatial(memory)
+
+        # Slot queries → batch: (B, K_max, embed_dim)
         tgt = self.queries.unsqueeze(0).expand(B, -1, -1)
 
-        # Cross-attend: slots gather information from sensor memory
-        slots = self.decoder(tgt, memory)             # (B, K_max, embed_dim)
+        # Cross-attend: slots gather information from sensor memory.
+        # With structural bias: layer 0 is unbiased (slot queries haven't seen data yet);
+        # layers ≥1 add a dynamic location-conditioned bias to cross-attention logits so
+        # each slot attends more to sensors near its current predicted location.
+        if self.use_structural_bias:
+            S_mem = memory.size(1)
+            bias_compatible = (S_mem == self.R_bias.size(-1))
+            for i, layer in enumerate(self.decoder.layers):
+                if i == 0 or not bias_compatible:
+                    tgt = layer(tgt, memory)
+                else:
+                    loc_probs = self.loc_head(tgt).softmax(-1)          # (B, K, L+1)
+                    bias = loc_probs @ self.R_bias                       # (B, K, S)
+                    bias = bias.unsqueeze(1).expand(-1, self._nhead, -1, -1)
+                    bias = bias.reshape(B * self._nhead, -1, S_mem)     # (B*H, K, S)
+                    tgt = layer(tgt, memory, memory_mask=bias)
+            slots = tgt
+        else:
+            slots = self.decoder(tgt, memory)                           # (B, K_max, embed_dim)
 
         loc_logits = self.loc_head(slots)             # (B, K_max, L+1)
         severity   = self.sev_head(slots).squeeze(-1) # (B, K_max)
 
-        return loc_logits, severity
+        fault_prob = None
+        if self.use_fault_head:
+            fault_prob = torch.sigmoid(self.fault_head(memory)).squeeze(-1)  # (B, S)
+
+        return loc_logits, severity, fault_prob

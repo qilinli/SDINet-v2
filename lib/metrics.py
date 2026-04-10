@@ -64,7 +64,7 @@ def map_mse(pred_map: Tensor, target_norm: Tensor) -> Tensor:
 
     Both are aligned in [0, 1] space:
     - ``pred_map``     — output of :func:`distributed_map_v1` or :func:`distributed_map_dr`
-    - ``target_norm``  — ``(y_norm + 1) / 2``, where y_norm is the model's raw label
+    - ``target_norm``  — raw normalized labels ``y_norm ∈ [-1, 1]`` (converted to [0, 1] internally)
 
     When ``pred_map`` is (B, L, N) (subset evaluation), ``target_norm`` (B, L)
     is broadcast along the N dimension.
@@ -125,6 +125,32 @@ def f1_from_counts(
     recall    = tp / (tp + fn + eps)
     f1        = 2.0 * precision * recall / (precision + recall + eps)
     return f1, precision, recall
+
+
+@torch.no_grad()
+def fault_detection_metrics(
+    fault_prob: Tensor,
+    y_fault: Tensor,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """
+    Per-sensor binary fault detection metrics.
+
+    Args:
+        fault_prob: (B, S) sigmoid-activated fault probabilities ∈ [0, 1]
+        y_fault:    (B, S) binary ground truth ∈ {0, 1}
+        threshold:  decision threshold (default 0.5)
+
+    Returns:
+        dict with keys: fault_f1, fault_precision, fault_recall
+    """
+    pred = fault_prob >= threshold
+    gt   = y_fault > 0.5
+    tp = int((pred &  gt).sum())
+    fp = int((pred & ~gt).sum())
+    fn = int((~pred & gt).sum())
+    f1, prec, rec = f1_from_counts(tp, fp, fn)
+    return {"fault_f1": f1, "fault_precision": prec, "fault_recall": rec}
 
 
 @torch.no_grad()
@@ -245,6 +271,7 @@ def evaluate_all_v1(
     temperature: float = 1.0,
     ratio_alpha: float | None = None,
     ratio_beta: float = 0.0,
+    dmg_gate: float | None = None,
 ) -> dict[str, float]:
     """
     Compute the evaluation suite for the v1 head using the same metric keys
@@ -270,6 +297,9 @@ def evaluate_all_v1(
         y_norm:   (B, L) normalized ground-truth labels ∈ [-1, 1]
         k:        Fixed K for top-K metrics. None = use true K per sample.
         presence_norm_thresh: Threshold separating undamaged from damaged labels.
+        dmg_gate: If set, predict K=0 for windows where ``dmg_pred < dmg_gate``.
+                  Critical for small L where softmax max ≥ 1/L always, making
+                  the beta gate ineffective.
     """
     loc_scaled = loc_pred / temperature
     dist_map  = distributed_map_v1(dmg_pred, loc_scaled)  # (B, L) in [0, 1]
@@ -320,6 +350,11 @@ def evaluate_all_v1(
         pred_pres = (loc_probs > ratio_alpha * max_prob) & (max_prob > ratio_beta)
     else:
         pred_pres = torch.sigmoid(loc_scaled) > 0.5
+    # Damage-scalar gate: predict K=0 for windows where dmg_pred < dmg_gate.
+    # Essential for small L where softmax(max) >= 1/L always, making beta
+    # ineffective — the damage scalar is the only way to express "no damage".
+    if dmg_gate is not None:
+        pred_pres = pred_pres & (dmg_pred > dmg_gate)
     y_pres_bool_f1 = y_norm > presence_norm_thresh
     tp = (pred_pres &  y_pres_bool_f1).sum().long()
     fp = (pred_pres & ~y_pres_bool_f1).sum().long()

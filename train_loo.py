@@ -7,8 +7,8 @@ table at the end.
 
 Usage::
 
-    CUDA_VISIBLE_DEVICES=2 python train_loo.py --epochs 200 --p-mix 0.5 --tag dd
-    CUDA_VISIBLE_DEVICES=2 python train_loo.py --epochs 200 --p-mix 0.5 --tag dd --held-out 0 1 2
+    CUDA_VISIBLE_DEVICES=2 python train_loo.py --epochs 200 --tag dd
+    CUDA_VISIBLE_DEVICES=2 python train_loo.py --epochs 200 --tag dd --held-out 0 1 2
 
 Double-damage recording index → file mapping:
     0: j03_j26.npz  (joints 3 & 26)
@@ -23,10 +23,6 @@ import argparse
 import subprocess
 import sys
 import os
-
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
-os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
 
 DOUBLE_FILES = [
     "j03_j26 (joints 3 & 26)",
@@ -66,7 +62,6 @@ def main() -> None:
     parser.add_argument("--downsample",  type=int,   default=4)
 
     # C-head knobs
-    parser.add_argument("--p-mix",              type=float, default=0.5)
     parser.add_argument("--num-slots",          type=int,   default=5)
     parser.add_argument("--num-decoder-layers", type=int,   default=2)
     parser.add_argument("--nhead",              type=int,   default=8)
@@ -94,7 +89,6 @@ def main() -> None:
         "--window-size",    str(args.window_size),
         "--overlap",        str(args.overlap),
         "--downsample",     str(args.downsample),
-        "--p-mix",          str(args.p_mix),
         "--num-slots",      str(args.num_slots),
         "--num-decoder-layers", str(args.num_decoder_layers),
         "--nhead",          str(args.nhead),

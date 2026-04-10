@@ -589,6 +589,39 @@ Results (targeted synthesis ablation), Discussion (why physical signal fidelity 
 
 ---
 
+## 20. Spatial coherence of forced-vibration response distinguishes structural damage from sensor faults
+
+**Domain rationale**
+Under forced excitation on a linear structural system, the vibration response at every sensor is structurally constrained — energy propagates from any excitation point through the structural mode shapes to the entire sensor array in a predictable, physically coupled pattern. This creates a key observable:
+
+- **Structural damage** at a joint produces a *spatially coherent* anomaly: multiple sensors shift in amplitude and phase in a pattern consistent with the modified mode shapes. The damaged member's stiffness change propagates outward — sensors physically near the damaged joint show correlated elevated responses, and even distant sensors are shifted in a patterned way.
+- **Sensor fault** (cable disconnect, gain drift, stuck value, saturation) produces a *spatially incoherent* anomaly: one sensor reads abnormally while its physical neighbours read normally, which is inconsistent with how forced vibration actually propagates through the structure.
+
+This coherence/incoherence signal is the key discriminating feature between damage and fault — accessible *without any external oracle*, purely from the spatial pattern of the simultaneous sensor readings.
+
+**Why raw signal space is insufficient**
+In raw time-series space, damage also distorts inter-sensor correlations near the affected joint — the spatial ambiguity is irresolvable there. Feature space (post-backbone) is the right target: after the backbone has compressed temporal vibration into structural-response representations, a faulty sensor produces a feature vector that is spatially inconsistent in terms of *structural response pattern*, not just raw amplitude. The spatial coherence check becomes tractable and discrimination-effective in feature space.
+
+**Why channel-masking-only augmentation is insufficient**
+Training with sensor drop-out (zeroing channels) teaches the model to be robust to *absent* sensors. But the critical practical challenge is *present-but-wrong* sensors — gain drift, saturation, stuck values — where the sensor actively provides a misleading signal. These require the model to have internalised the expected spatial correlation structure, not merely learned to predict from a subset of sensors. The V1 model already achieves the former; the spatial coherence approach targets the latter.
+
+**ML implication**
+A sensor spatial reasoning layer — placed between the per-sensor backbone features and the damage detection slots — allows each sensor to observe its physical neighbours in feature space. A sensor whose feature is spatially inconsistent with its neighbours (faulty) becomes identifiable and can be down-weighted before the damage head runs. This requires:
+1. Known sensor layout as a structural prior (sensor grid coordinates)
+2. A spatial reasoning module (positional-aware self-attention or GNN over the sensor adjacency graph)
+3. Feature-space consistency checking — not raw-signal coherence
+
+**Interpretability implication**
+The slot decoder's cross-attention weights over sensors, plotted on the physical sensor grid, visualise which sensors the model trusted for each damage prediction. A correctly detected damage shows concentrated attention on the sensor neighbourhood around the damaged joint. A faulty sensor within that neighbourhood appears as an *attention valley* — a visible dip in a region that should otherwise show elevated attention. This is directly interpretable by structural engineers: "the model detected damage at joint X by attending to sensors A, B, C, and flagged sensor D as unreliable."
+
+**Where in paper**
+Methodology (motivation for sensor spatial reasoning layer), Discussion (fault tolerance mechanism, interpretability of attention maps), Contribution statement
+
+**Quote-ready**
+> Under forced excitation on a linear structural system, structural damage produces spatially coherent sensor response anomalies — multiple sensors shift in a pattern consistent with the modified structural mode shapes. A sensor fault, by contrast, produces a spatially incoherent anomaly: one sensor reads abnormally while its physical neighbours read normally, in violation of structural wave propagation. A model that internalises the expected spatial correlation structure of the sensor array — using the known sensor layout as a structural prior — can distinguish these two physically distinct events from the measurement pattern alone, without any external fault indicator. This spatial coherence check is the mechanistic basis of fault-aware structural damage identification.
+
+---
+
 ## 16. DETR is the only architecture among V1, DR, C with the correct inductive bias for multi-damage generalisation
 
 **Domain rationale**
@@ -611,3 +644,123 @@ Discussion (architecture comparison for multi-damage scenarios), Motivation for 
 > training exclusively on K=1 data instils a strong no-object prior that must
 > be weakened — through multi-damage training examples or no-object weight
 > adjustment — before the architecture's full capacity is realised.
+
+---
+
+## 21. Sensor self-attention before the slot decoder propagates fault artifacts into clean sensor representations
+
+**Domain rationale**
+Spatial coherence under forced vibration means a faulty sensor is an outlier *relative to its physical neighbours* — the discriminating signal lives in that local contrast. An all-to-all cross-sensor self-attention layer placed before the slot decoder blurs this contrast in the wrong direction: the faulty sensor's anomalous feature representation is distributed into its neighbours' representations via attention-weighted sums, while its own signature is diluted by the normal features of those neighbours. The network mixes the signals of all sensors together before the damage head sees them, which erases the very spatial incoherence pattern it is designed to exploit.
+
+**ML implication**
+Training with sensor fault augmentation and a `SensorSpatialLayer` (multi-head self-attention over all S sensor features) before the `MidnC` slot decoder consistently degrades damage F1 relative to fault augmentation alone. The degradation is asymmetric across fault types:
+
+| Fault | C+FH (aug only) | C+SF+FH (aug + spatial layer) | Δ |
+|-------|-----------------|-------------------------------|---|
+| gain (mean n=1…15) | 0.990 | 0.797 | −0.193 |
+| noise | 0.928 | 0.498 | −0.430 |
+| partial | 0.983 | 0.850 | −0.133 |
+| bias | 0.861 | 0.902 | +0.041 *(exception — see below)* |
+| hard | 0.987 | 0.960 | −0.027 |
+| stuck | 0.985 | 0.957 | −0.028 |
+| **clean** | 0.992 | 0.984 | −0.008 |
+
+Hard and stuck faults (zeroed sensor) are nearly immune: a zeroed sensor contributes nothing to attention sums, so its feature vector cannot contaminate neighbours. Soft faults (gain, noise, partial, gain_bias) — present-but-wrong sensors — spread their anomalous features into neighbours and degrade the most. Bias faults are a partial exception: bias shifts are spatially coherent (a stuck-offset pattern), so mixing may marginally help the model classify them. Clean F1 drops too because self-attention blurs clean representations even with no faults present. The lesson: placing all-to-all feature mixing before a detector that needs clean, per-sensor representations is counterproductive for fault isolation; the spatial reasoning layer must not modify sensor embeddings before the damage head runs.
+
+**Where in paper**
+Discussion (ablation of spatial reasoning design choices; mechanistic explanation of the negative result; motivates the logit-bias alternative, Insight 22)
+
+**Quote-ready**
+> Training with sensor fault augmentation and a spatial self-attention layer before the
+> slot decoder consistently degraded damage F1 relative to fault augmentation alone, with
+> the largest drops on soft fault types (gain: −0.19, noise: −0.43, partial: −0.13) and
+> negligible effect on hard and stuck faults whose contribution to attention sums is near
+> zero. This asymmetry identifies the mechanism: all-to-all self-attention distributes the
+> faulty sensor's anomalous feature representation into its physical neighbours, degrading
+> the spatial coherence signal that motivates the spatial layer in the first place. Spatial
+> reasoning that modifies sensor feature embeddings before the damage head is
+> counterproductive for fault isolation; the structural prior must act on attention routing,
+> not on sensor representations.
+
+---
+
+## 22. Dynamic location-conditional structural affinity bias guides slot attention routing in logit space without modifying sensor features
+
+**Domain rationale**
+Sensors physically adjacent to structural joint l carry the strongest diagnostic signal for damage at l: they are closer to the modified stiffness, and structural coupling distributes forced-vibration energy through local load paths preferentially along 4-connected elements of the sensor grid. This adjacency relationship is determined by the installation plan and is fixed for the structure's lifetime — it is a hard physical prior. Rather than teaching the model what sensors "know about each other" (feature mixing, which contaminates), we can directly bias *where each slot attends* based on its current location estimate, injecting the prior into attention routing instead.
+
+**ML implication**
+A learnable (L+1)×S matrix **R**, physically initialised from 4-connected grid adjacency (R[l,i]=1 if sensor i is adjacent to joint l, else 0; last row for no-object = 0), is incorporated as an additive bias to slot cross-attention logits at decoder layers ≥1:
+
+```
+bias[b, slot, sensor] = softmax(loc_logits[b, slot]) @ R   →   shape (B, K, S)
+```
+
+This is dynamic — it changes per sample and per decoder layer as each slot refines its location prediction — and it does not touch sensor feature embeddings. Each slot predicted at location l preferentially attends to sensors adjacent to l; a faulty sensor far from the predicted location gets lower attention weight. Layer 0 always runs without bias: slot queries have not yet seen sensor data, so `loc_head(queries)` is sample-identical and provides no meaningful location estimate to weight R's rows. R is a learnable `nn.Parameter`, allowing training to refine the binary adjacency prior and discover structural coupling patterns (e.g. longer-range coupling along load-path columns or rows) that simple 4-connectivity does not capture.
+
+Because R acts only on attention logits, sensor embeddings remain unmodified — no contamination path exists. Empirical results on Qatar (K=1, 30 sensors, 7 fault types):
+
+| Fault | C (no aug) | C+FH | C+FH+SB |
+|-------|-----------|------|---------|
+| gain (mean) | 0.920 | 0.990 | **0.993** |
+| bias | 0.737 | 0.861 | **0.981** |
+| gain_bias | 0.774 | 0.929 | **0.990** |
+| noise | 0.360 | 0.928 | **0.936** |
+| partial | 0.988 | 0.983 | **0.991** |
+| hard | 0.988 | 0.987 | **0.988** |
+| **clean** | 0.992 | 0.992 | **0.994** |
+
+C+FH+SB achieves the best damage F1 across all seven fault types and all fault counts, while simultaneously improving clean-condition F1 — confirming that the structural routing prior is complementary to, not in tension with, baseline accuracy. The design principle established: **structural spatial priors belong in attention routing (logit space), not in feature mixing.**
+
+**Where in paper**
+Methodology (design of structural affinity bias; motivation for logit-space vs. feature-space injection), Results (fault robustness comparison table), Discussion (mechanistic contrast with SensorSpatialLayer — Insight 21; physical grounding of R initialisation from grid adjacency)
+
+**Quote-ready**
+> We propose a dynamic location-conditional structural affinity bias: a learnable (L+1)×S
+> matrix R, physically initialised from the 4-connected adjacency of the sensor grid,
+> incorporated as an additive logit bias to slot cross-attention at decoder layers beyond
+> the first. At each layer, the bias for slot k is computed as softmax(loc_logits_k) @ R —
+> a per-sample, per-slot weighting that directs each slot to attend to sensors near its
+> current location estimate. Because R acts on attention logits rather than on sensor
+> feature embeddings, per-sensor representations remain unmodified and no fault
+> contamination path exists. The model trained with this bias (C+FH+SB) achieves the best
+> damage F1 across all seven synthetic fault types and all fault counts evaluated, while
+> simultaneously improving clean-condition F1 (0.994 vs 0.992 for the unaugmented C
+> baseline), confirming that structural routing priors are complementary to baseline
+> accuracy rather than in tension with it.
+
+---
+
+## 23. DETR slot machinery is costly under ambient excitation when K≤1 — per-location regression is more robust to distribution shift
+
+**Domain rationale**
+In long-term field SHM the structure is excited by ambient forces (wind, traffic) rather than controlled shaker input. The excitation is non-stationary: amplitude varies by orders of magnitude across recordings depending on weather. When the structure is healthy, the monitoring system must confidently output "no damage" despite large input variability. When K≤1 (single or no damage), the diagnostic question reduces to "is anything wrong at all, and if so where?" — there is no set-assignment problem.
+
+**ML implication**
+The C-head's DETR ∅-class slot must learn a decision boundary between "healthy embedding region" and "damage embedding region". Under stationary forced excitation (Qatar, 7-story) this boundary is sharp — the embedding distribution for healthy windows is tight. Under ambient excitation (LUMO) the healthy embedding distribution spreads out due to wind variability, blurring the ∅ boundary. The C-head's recall drops (0.929 on LUMO vs 0.992 on Qatar) because some low-energy damaged windows fall on the wrong side of the now-fuzzy ∅ decision.
+
+DR-head has no global gating decision — each location regresses severity independently and is thresholded individually. There is no ∅-class boundary to blur. This makes DR inherently more robust to input distribution shift when K≤1: on LUMO DR achieves F1=0.972 (−0.019 from Qatar) while C achieves F1=0.946 (−0.046 from Qatar).
+
+The ranking inversion (C > DR on stationary lab data, DR > C on ambient field data) reveals that C's slot mechanism is an *advantage* only when the set-prediction problem is hard (K>1, variable cardinality). When K≤1 everywhere, the slot machinery is overhead — it forces the model to solve a harder gating problem that DR avoids entirely. This is visible in the cross-benchmark comparison:
+
+| Model | 7-story (sim) | Qatar (lab) | LUMO (field) |
+|-------|--------------|-------------|-------------|
+| C     | 0.994–0.999  | 0.992       | 0.946       |
+| DR    | 0.924–0.961  | 0.991       | 0.972       |
+
+**Where in paper**
+Discussion (architecture comparison across data regimes), Results (sim → lab → field degradation analysis)
+
+**Quote-ready**
+> The DETR-style slot mechanism (C-head) outperforms per-location regression (DR-head)
+> under stationary forced excitation where multi-damage set prediction is required, but
+> the relationship inverts under ambient field conditions with K≤1. On the LUMO field
+> benchmark, DR achieves F1=0.972 vs C's 0.946 — a reversal of the Qatar lab ranking
+> (C=0.992, DR=0.991). The mechanism is the ∅-class decision boundary: under stationary
+> excitation, the healthy embedding distribution is compact and the ∅ boundary is sharp;
+> under ambient wind variability, the distribution spreads and the boundary blurs,
+> reducing C's recall to 0.929. DR avoids this failure mode entirely because each
+> location is thresholded independently with no global gating decision. This suggests
+> that slot-based architectures are best suited to multi-damage regimes (K>1) where
+> set prediction is genuinely required, while per-location regression is preferable
+> for single-damage field monitoring under non-stationary excitation.

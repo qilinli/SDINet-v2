@@ -53,7 +53,7 @@ from lib.data_qatar import (
     get_qatar_dataloaders, get_qatar_double_test_dataloader,
     QATAR_DEFAULT_ROOT, QATAR_N_SENSORS, QATAR_N_LOCATIONS,
 )
-from lib.data_safetensors import (
+from lib.data_7story import (
     load_real_test_tensors, DEFAULT_BENCHMARK, TWO_DAMAGE_BENCHMARK,
 )
 from lib.model import (
@@ -182,7 +182,7 @@ def run_c(model: torch.nn.Module, X: np.ndarray, batch_size: int = 256,
         x_t = x_t.unsqueeze(1)
     all_loc = []
     for i in range(0, len(x_t), batch_size):
-        loc_logits, sev = model(x_t[i:i+batch_size].to(device))
+        loc_logits, sev, _ = model(x_t[i:i+batch_size].to(device))
         # loc_logits: (B, K, L+1);  sev: (B, K)
         loc_prob = loc_logits.softmax(-1)               # (B, K, L+1)
         is_obj   = 1.0 - loc_prob[..., -1]             # (B, K)
@@ -322,9 +322,9 @@ def load_safetensors_test(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns X_test (N,1,500,65), Y_test_norm (N,70) in [-1,1], subset (N,) strings.
-    Uses the identical split as get_combined_dataloaders.
+    Uses the identical split as get_7story_dataloaders.
     """
-    from lib.data_safetensors import SafetensorsDataset, val_input_preprocess, target_preprocess
+    from lib.data_7story import SevenStoryDataset, val_input_preprocess, target_preprocess
     from sklearn.model_selection import train_test_split
     from pathlib import Path as _Path
     from torch.utils.data import Subset
@@ -336,7 +336,7 @@ def load_safetensors_test(
         ds_root = root_p / name
         if not ds_root.exists():
             continue
-        ds = SafetensorsDataset(ds_root, [val_input_preprocess, target_preprocess])
+        ds = SevenStoryDataset(ds_root, [val_input_preprocess, target_preprocess])
         indices = np.arange(len(ds))
         _, valtest = train_test_split(indices, test_size=0.3, random_state=seed)
         _, test_idx = train_test_split(valtest, test_size=0.5, random_state=seed)
@@ -674,7 +674,7 @@ def _run_real_inference(model, model_name: str) -> tuple[np.ndarray, np.ndarray]
                 print(f"  [v1] global dmg_scale={dmg_val:.4f}  "
                       f"({'damaged' if dmg_val > 0.5 else 'undamaged'})")
             elif model_name == "c":
-                loc_logits, sev = model(x)
+                loc_logits, sev, _ = model(x)
                 loc_prob = loc_logits.softmax(-1)
                 is_obj   = 1.0 - loc_prob[..., -1]
                 scale    = is_obj * sev

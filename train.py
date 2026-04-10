@@ -10,7 +10,7 @@ Usage::
     python train.py --model dr  --dataset tower  [--epochs N]
     python train.py --model v1  --dataset 7story --epochs 1   # smoke-test
 
-Dataset-specific flags (window-size, overlap, downsample, tower-excitation, snr)
+Dataset-specific flags (window-size, overlap, downsample, tower-excitation)
 are only meaningful for their respective datasets; other datasets ignore them.
 """
 from __future__ import annotations
@@ -20,10 +20,6 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-# Must be set before any torch import to take effect
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
-os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -32,7 +28,7 @@ torch._dynamo.config.disable = True
 import torch
 
 from lib.datasets import get_dataset
-from lib.model import ModelConfig, ModelConfigC, ModelConfigDR, build_model, build_criterion_c
+from lib.model import ModelConfig, ModelConfigC, ModelConfigDR, build_model, build_criterion_c, build_criterion_fault
 from lib.training import do_training, do_training_c, do_training_dr, get_opt_and_sched
 from lib.visualization import plot_training_results
 
@@ -43,7 +39,7 @@ from lib.visualization import plot_training_results
 
 def _calibrate_fn(model_name: str):
     from lib.calibration import calibrate_v1_ratio, calibrate_c_obj_threshold, calibrate_dr_ratio
-    return {"v1": calibrate_v1_ratio, "c": calibrate_c_obj_threshold, "dr": calibrate_dr_ratio}[model_name]
+    return {"v1": calibrate_v1_ratio, "c": calibrate_c_obj_threshold, "dr": calibrate_dr_ratio, "b": calibrate_dr_ratio}[model_name]
 
 
 def _eval_loader_fn(model_name: str):
@@ -56,6 +52,7 @@ def _eval_loader_fn(model_name: str):
         "v1": eval_on_loader_v1_calibrated,
         "c":  eval_on_loader_c_calibrated,
         "dr": eval_on_loader_dr_calibrated,
+        "b":  eval_on_loader_dr_calibrated,
     }[model_name]
 
 
@@ -69,6 +66,7 @@ def _real_test_fn(model_name: str):
         "v1": do_real_test_v1_calibrated,
         "c":  do_real_test_c_calibrated,
         "dr": do_real_test_dr_calibrated,
+        "b":  do_real_test_dr_calibrated,
     }[model_name]
 
 
@@ -91,20 +89,26 @@ def _build_dl_kwargs(args, dataset) -> dict:
         eval_batch_size=args.eval_batch_size,
         seed=args.seed,
     )
+    # fault augmentation — shared across all datasets (loaders ignore irrelevant ones via **_)
+    base["p_hard"]        = args.p_hard
+    base["p_soft"]        = args.p_soft
+    base["p_struct_mask"] = args.p_struct_mask
+
     if dataset.name in ("7story", "7story-sparse"):
-        base["snr"] = args.snr
         if args.subsets:
             base["subsets"] = args.subsets
     elif dataset.name == "tower":
         base["tower_excitation"] = tuple(args.tower_excitation)
+    elif dataset.name == "lumo":
+        base["window_size"] = args.window_size
+        base["overlap"]     = args.overlap
+        base["downsample"]  = args.downsample
     elif dataset.name == "qatar":
         base["window_size"]     = args.window_size
         base["overlap"]         = args.overlap
         base["downsample"]      = args.downsample
-        base["p_mix"]           = args.p_mix
         base["held_out_double"] = args.held_out_double
         base["split_double"]    = args.split_double
-        base["targeted_mix"]    = args.targeted_mix
     return base
 
 
@@ -141,6 +145,9 @@ def _build_model_config(args, dataset):
         )
 
     elif args.model == "c":
+        if args.use_structural_bias and args.num_decoder_layers < 2:
+            print("[warning] --use-structural-bias has no effect with --num-decoder-layers < 2 "
+                  "(layer 0 is always unbiased; need at least one biased layer).")
         registry_overrides = dataset.model_config_overrides("c")
         # CLI flags win over registry defaults
         sev_weight = args.sev_weight if args.sev_weight is not None else registry_overrides.get("sev_weight", 1.0)
@@ -153,6 +160,13 @@ def _build_model_config(args, dataset):
             no_obj_weight=args.no_obj_weight,
             loc_weight=args.loc_weight,
             sev_weight=sev_weight,
+            use_spatial_layer=args.use_spatial_layer,
+            num_spatial_layers=args.num_spatial_layers,
+            spatial_nhead=args.spatial_nhead,
+            use_fault_head=args.use_fault_head,
+            fault_loss_weight=args.fault_loss_weight,
+            fault_pos_weight=args.fault_pos_weight,
+            use_structural_bias=args.use_structural_bias,
         )
 
     elif args.model == "dr":
@@ -164,6 +178,13 @@ def _build_model_config(args, dataset):
             val_temperature=args.val_temperature if args.val_temperature is not None else args.temperature,
         )
 
+    elif args.model == "b":
+        return ModelConfigDR(
+            **shared,
+            num_locations=dataset.n_locations,
+            plain=True,
+        )
+
     raise ValueError(f"Unknown model {args.model!r}")
 
 
@@ -171,13 +192,17 @@ def _build_model_config(args, dataset):
 # Training dispatcher
 # ---------------------------------------------------------------------------
 
-def _run_training(args, model, ema, opt, sched, train_dl, val_dl, criterion=None):
+def _run_training(args, model, ema, opt, sched, train_dl, val_dl, criterion=None, fault_criterion=None):
     kwargs = dict(drop_rate=args.drop_rate)
     if args.model == "v1":
         return do_training(model, opt, sched, train_dl, val_dl, args.epochs, ema=ema, **kwargs)
     elif args.model == "c":
-        return do_training_c(model, opt, sched, train_dl, val_dl, args.epochs, criterion, ema=ema, **kwargs)
-    elif args.model == "dr":
+        return do_training_c(
+            model, opt, sched, train_dl, val_dl, args.epochs, criterion, ema=ema,
+            fault_criterion=fault_criterion, fault_loss_weight=args.fault_loss_weight,
+            **kwargs,
+        )
+    elif args.model in ("dr", "b"):
         return do_training_dr(model, opt, sched, train_dl, val_dl, args.epochs, ema=ema, **kwargs,
                               pos_weight=_dr_pos_weight(args))
     raise ValueError(f"Unknown model {args.model!r}")
@@ -248,8 +273,23 @@ def main(args) -> None:
     train_dl, val_dl, _ = dataset.get_dataloaders(**dl_kwargs)
 
     model_cfg = _build_model_config(args, dataset)
-    model = build_model(model_cfg)
+    if getattr(args, "use_structural_bias", False):
+        if dataset.name in ("7story", "7story-sparse"):
+            from lib.data_7story import build_structural_affinity_7story
+            structural_affinity = build_structural_affinity_7story()
+        elif dataset.name == "qatar":
+            from lib.data_qatar import build_structural_affinity
+            structural_affinity = build_structural_affinity()
+        else:
+            raise ValueError(
+                f"--use-structural-bias is not supported for dataset {dataset.name!r}. "
+                "Define a structural affinity for this dataset first."
+            )
+    else:
+        structural_affinity = None
+    model = build_model(model_cfg, structural_affinity=structural_affinity)
     criterion = build_criterion_c(model_cfg) if args.model == "c" else None
+    fault_criterion = build_criterion_fault(model_cfg) if args.model == "c" else None
 
     ema = torch.optim.swa_utils.AveragedModel(
         model,
@@ -259,7 +299,7 @@ def main(args) -> None:
     opt, sched = get_opt_and_sched(model, train_dl, args.epochs)
 
     train_losses, val_losses, _, val_accs, val_mses, trained_model = _run_training(
-        args, model, ema, opt, sched, train_dl, val_dl, criterion
+        args, model, ema, opt, sched, train_dl, val_dl, criterion, fault_criterion=fault_criterion
     )
 
     # Save checkpoint
@@ -301,17 +341,17 @@ if __name__ == "__main__":
     )
 
     # --- required ---
-    parser.add_argument("--model",   required=True, choices=["v1", "c", "dr"],
+    parser.add_argument("--model",   required=True, choices=["v1", "c", "dr", "b"],
                         help="Model head to train")
     parser.add_argument("--dataset", required=True, choices=list(DATASETS),
                         help="Dataset to train on")
 
     # --- shared training ---
     parser.add_argument("--epochs",          type=int,   default=200)
-    parser.add_argument("--batch-size",      type=int,   default=256)
+    parser.add_argument("--batch-size",      type=int,   default=128)
     parser.add_argument("--eval-batch-size", type=int,   default=32)
     parser.add_argument("--drop-rate",       type=float, default=0.0)
-    parser.add_argument("--num-workers",     type=int,   default=0)
+    parser.add_argument("--num-workers",     type=int,   default=8)
     parser.add_argument("--seed",            type=int,   default=42)
     parser.add_argument("--no-checkpoint",   dest="save_checkpoint", action="store_false",
                         help="Skip saving a UUID checkpoint")
@@ -351,8 +391,6 @@ if __name__ == "__main__":
                         help="BCE pos_weight for binary datasets (default: L-1 from registry; 0=use MSE)")
 
     # --- dataset-specific ---
-    parser.add_argument("--snr",              type=float, default=-1.0,
-                        help="SNR for noise injection (7-story only; -1=off)")
     parser.add_argument("--subsets",          nargs="+", default=None,
                         choices=["healthy", "single", "double"],
                         help="Training subsets for 7story datasets (default: single double)")
@@ -364,8 +402,6 @@ if __name__ == "__main__":
                         help="Window overlap fraction (qatar only)")
     parser.add_argument("--downsample",       type=int,   default=4,
                         help="Decimation factor (qatar only; 4=256 Hz)")
-    parser.add_argument("--p-mix",            type=float, default=0.0,
-                        help="Prob of synthetic double-damage mixing per sample (qatar only)")
     parser.add_argument("--held-out-double",  type=int,   default=None,
                         choices=[0, 1, 2, 3, 4],
                         help="Hold out this double-damage recording index (0-4) for test; "
@@ -373,9 +409,31 @@ if __name__ == "__main__":
     parser.add_argument("--split-double",     action="store_true", default=False,
                         help="Use first½ of all 5 double-damage recordings for training, "
                              "second½ for test (qatar only). Mutually exclusive with --held-out-double.")
-    parser.add_argument("--targeted-mix",     action="store_true", default=False,
-                        help="Bias synthetic K=2 mixing toward the 5 known double-damage joint pairs "
-                             "(qatar only). Requires --p-mix > 0.")
+    # --- sensor spatial reasoning (C-head only) ---
+    parser.add_argument("--use-spatial-layer",   action="store_true", default=False,
+                        help="Enable SensorPositionalEncoding + SensorSpatialLayer before slot decoder.")
+    parser.add_argument("--num-spatial-layers",  type=int,   default=1,
+                        help="Depth of the SensorSpatialLayer TransformerEncoder (default 1).")
+    parser.add_argument("--spatial-nhead",       type=int,   default=8,
+                        help="Attention heads in SensorSpatialLayer (default 8).")
+    # --- fault detection head (C-head only) ---
+    parser.add_argument("--use-fault-head",      action="store_true", default=False,
+                        help="Enable per-sensor binary fault classifier head.")
+    parser.add_argument("--use-structural-bias", action="store_true", default=False,
+                        help="C-head: learnable location-sensor affinity bias in slot "
+                             "cross-attention, initialised from Qatar 6×5 grid 4-connectivity. "
+                             "Qatar only; requires --num-decoder-layers >= 2.")
+    parser.add_argument("--fault-loss-weight",   type=float, default=1.0,
+                        help="Scale factor for fault BCE loss (default 1.0).")
+    parser.add_argument("--fault-pos-weight",    type=float, default=5.0,
+                        help="BCE pos_weight for sparse faulty sensors (default 5.0).")
+    # --- fault augmentation (all datasets) ---
+    parser.add_argument("--p-hard",              type=float, default=0.0,
+                        help="Per-sensor probability of hard fault (zero-out) during training.")
+    parser.add_argument("--p-soft",              type=float, default=0.0,
+                        help="Per-sensor probability of soft fault during training.")
+    parser.add_argument("--p-struct-mask",       type=float, default=0.0,
+                        help="Per-window probability of structured group masking (default 0.0 = off).")
     parser.add_argument("--tag",              default="",
                         help="Suffix appended to output dirs, e.g. 'pmix' → states/qatar-pmix/")
 

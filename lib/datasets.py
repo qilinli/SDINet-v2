@@ -16,9 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-from lib.data_safetensors import (
-    get_combined_dataloaders,
-    get_dataloaders as _get_split_loader,
+from lib.data_7story import (
+    get_7story_dataloaders,
+    get_7story_single_dataloaders as _get_split_loader,
     SPARSE_7STORY_SENSOR_INDICES,
 )
 from lib.data_tower import (
@@ -34,6 +34,13 @@ from lib.data_qatar import (
     QATAR_N_SENSORS,
     get_qatar_dataloaders,
     get_qatar_double_test_dataloader,
+)
+from lib.data_lumo import (
+    LUMO_DEFAULT_ROOT,
+    LUMO_N_LOCATIONS,
+    LUMO_N_SENSORS,
+    LUMO_TIME_LEN,
+    get_lumo_dataloaders,
 )
 
 
@@ -122,54 +129,56 @@ class DatasetConfig:
 # Translate the uniform dl_kwargs dict into each data module's call signature. #
 # --------------------------------------------------------------------------- #
 
-def _loader_7story(root, snr, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **_):
-    return get_combined_dataloaders(
-        subsets or ["single", "double"], snr,
+def _loader_7story(root, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **kw):
+    return get_7story_dataloaders(
+        subsets or ["single", "double"],
         root=root,
         num_workers=num_workers,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
+        **kw,
     )
 
 
-def _loader_7story_sparse(root, snr, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **_):
-    return get_combined_dataloaders(
-        subsets or ["single", "double"], snr,
+def _loader_7story_sparse(root, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **kw):
+    return get_7story_dataloaders(
+        subsets or ["single", "double"],
         root=root,
         num_workers=num_workers,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
         sensor_indices=SPARSE_7STORY_SENSOR_INDICES,
+        **kw,
     )
 
 
-def _7story_cal_loaders(root, snr, num_workers, eval_batch_size, seed,
+def _7story_cal_loaders(root, num_workers, eval_batch_size, seed,
                         sensor_indices=None, **_) -> list:
     """Separate single + double val loaders for 7-story calibration."""
-    _, val_s, _ = _get_split_loader("single", snr, root=root, num_workers=num_workers,
+    _, val_s, _ = _get_split_loader("single", root=root, num_workers=num_workers,
                                     eval_batch_size=eval_batch_size, seed=seed,
                                     sensor_indices=sensor_indices)
-    _, val_d, _ = _get_split_loader("double", snr, root=root, num_workers=num_workers,
+    _, val_d, _ = _get_split_loader("double", root=root, num_workers=num_workers,
                                     eval_batch_size=eval_batch_size, seed=seed,
                                     sensor_indices=sensor_indices)
     return [val_s, val_d]
 
 
-def _7story_test_loaders(root, snr, num_workers, eval_batch_size, seed,
+def _7story_test_loaders(root, num_workers, eval_batch_size, seed,
                          sensor_indices=None, **_):
     """Separate single + double test loaders for 7-story evaluation."""
-    _, _, test_s = _get_split_loader("single", snr, root=root, num_workers=num_workers,
+    _, _, test_s = _get_split_loader("single", root=root, num_workers=num_workers,
                                      eval_batch_size=eval_batch_size, seed=seed,
                                      sensor_indices=sensor_indices)
-    _, _, test_d = _get_split_loader("double", snr, root=root, num_workers=num_workers,
+    _, _, test_d = _get_split_loader("double", root=root, num_workers=num_workers,
                                      eval_batch_size=eval_batch_size, seed=seed,
                                      sensor_indices=sensor_indices)
     return test_s, test_d
 
 
-def _loader_tower(root, tower_excitation, num_workers, train_batch_size, eval_batch_size, seed, **_):
+def _loader_tower(root, tower_excitation, num_workers, train_batch_size, eval_batch_size, seed, **kw):
     return get_tower_dataloaders(
         list(tower_excitation),
         root=root,
@@ -177,13 +186,26 @@ def _loader_tower(root, tower_excitation, num_workers, train_batch_size, eval_ba
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
+        **kw,
+    )
+
+
+def _loader_lumo(root, window_size, overlap, downsample,
+                 num_workers, train_batch_size, eval_batch_size, seed, **kw):
+    return get_lumo_dataloaders(
+        root=root,
+        window_size=window_size, overlap=overlap, downsample=downsample,
+        num_workers=num_workers,
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        seed=seed,
+        **kw,
     )
 
 
 def _loader_qatar(root, window_size, overlap, downsample,
                   num_workers, train_batch_size, eval_batch_size, seed,
-                  p_mix=0.0, held_out_double=None, split_double=False,
-                  targeted_mix=False, **_):
+                  held_out_double=None, split_double=False, **kw):
     return get_qatar_dataloaders(
         root=root,
         window_size=window_size, overlap=overlap, downsample=downsample,
@@ -191,10 +213,9 @@ def _loader_qatar(root, window_size, overlap, downsample,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
-        p_mix=p_mix,
         held_out_double=held_out_double,
         split_double=split_double,
-        targeted_mix=targeted_mix,
+        **kw,
     )
 
 
@@ -245,6 +266,21 @@ DATASETS: dict[str, DatasetConfig] = {
         supports_real_benchmark=False,
         default_root=TOWER_DEFAULT_ROOT,
         _loader_fn=_loader_tower,
+    ),
+    "lumo": DatasetConfig(
+        name="lumo",
+        n_sensors=LUMO_N_SENSORS,
+        n_locations=LUMO_N_LOCATIONS,
+        time_len=LUMO_TIME_LEN,   # window_size // downsample at defaults
+        label_type="binary",
+        supports_real_benchmark=False,
+        default_root=LUMO_DEFAULT_ROOT,
+        _loader_fn=_loader_lumo,
+        # LUMO binary labels {-1,+1}: same sev-weight collapse as Qatar —
+        # severity is always 1 for damaged slots, so sev_loss is trivially
+        # learned and decouples val_loss from val_mse.  Force sev_weight=0.
+        _model_cfg_overrides={"c": {"sev_weight": 0.0}},
+        _training_overrides={},
     ),
     "qatar": DatasetConfig(
         name="qatar",

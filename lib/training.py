@@ -64,7 +64,7 @@ def train_one_epoch(
 ) -> float:
     model.train()
     accum = 0.0
-    for x, y in train_dl:
+    for x, y, *_ in train_dl:
         y_dmg, y_loc = y.max(-1, keepdim=True)
         y_loc = y_loc[:, 0]
         damaged = y_dmg[:, 0] > PRESENCE_NORM_THRESH          # (B,) bool — healthy mask
@@ -283,12 +283,16 @@ def train_one_epoch_c(
     criterion,
     ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
+    fault_criterion=None,
+    fault_loss_weight: float = 1.0,
 ) -> tuple[float, float, float]:
     """
     One training epoch for the C-head model.
 
     Args:
-        criterion: :class:`~lib.losses.SetCriterion` instance.
+        criterion:          :class:`~lib.losses.SetCriterion` instance.
+        fault_criterion:    :class:`~lib.losses.FaultBCELoss` or None.
+        fault_loss_weight:  Scale factor for fault BCE loss.
 
     Returns:
         (avg_total_loss, avg_loc_loss, avg_sev_loss) over the epoch.
@@ -296,12 +300,16 @@ def train_one_epoch_c(
     model.train()
     accum_total = accum_loc = accum_sev = 0.0
 
-    for x, y in train_dl:
+    for batch in train_dl:
+        x, y = batch[0], batch[1]
+        y_fault = batch[2] if len(batch) == 3 else None
         opt.zero_grad()
         with accel.autocast():
             x = randomise_bag_size(x, drop_rate)
-            loc_logits, severity = model(x)              # (B, K, L+1), (B, K)
+            loc_logits, severity, fault_prob = model(x)  # (B, K, L+1), (B, K), (B, S) or None
             total, loc, sev = criterion(loc_logits, severity, y)
+            if fault_criterion is not None and fault_prob is not None and y_fault is not None:
+                total = total + fault_loss_weight * fault_criterion(fault_prob, y_fault.to(x.device))
             if ema is not None:
                 ema.update_parameters(model)
         accel.backward(total)
@@ -340,9 +348,9 @@ def val_one_epoch_c(
     tkr_hits = tkr_total = 0
 
     for x, y in val_dl:
-        x, y = x.float().to(device), y.to(device)
+        x, y = x.float().to(device, non_blocking=True), y.to(device, non_blocking=True)
         B = x.size(0)
-        loc_logits, severity = model(x)
+        loc_logits, severity, _ = model(x)
 
         total, _, _ = criterion(loc_logits, severity, y)
         accum_loss += total.item() * B
@@ -366,6 +374,75 @@ def val_one_epoch_c(
     return accum_loss / n_samples, float("nan"), tkr_hits / max(tkr_total, 1)
 
 
+@torch.inference_mode()
+def val_one_epoch_c_fault(
+    model,
+    val_dl: DataLoader,
+    fault_criterion,
+    epoch: int,
+    n_faulted: int = 3,
+    fault_type: str = "hard",
+) -> tuple[float, float]:
+    """
+    Faulted validation pass for the C-head — damage top-k recall + fault F1.
+
+    Injects ``fault_type`` faults into ``n_faulted`` randomly selected sensors
+    of each clean val batch.  Sensor selection is seeded by ``epoch`` so the
+    same epoch always faults the same sensors (reproducible across runs) but
+    different epochs see different fault patterns (training signal diversity).
+
+    Damage metrics are always computed; fault F1 is NaN when the model has no
+    fault head (``fault_prob is None``).
+
+    Returns:
+        (faulted_top_k_recall, fault_f1)
+    """
+    from lib.faults import inject_faults_batch
+
+    model.eval()
+    device = next(model.parameters()).device
+    rng = torch.Generator()
+    rng.manual_seed(epoch)
+
+    tkr_hits = tkr_total = 0
+    f_tp = f_fp = f_fn = 0
+    fault_prob = None
+
+    for x, y in val_dl:
+        x, y = x.float().to(device, non_blocking=True), y.to(device, non_blocking=True)
+        x_f, y_fault = inject_faults_batch(x, fault_type, n_faulted, rng)
+        x_f     = x_f.to(device, non_blocking=True)
+        y_fault = y_fault.to(device, non_blocking=True)
+
+        loc_logits, severity, fault_prob = model(x_f)
+
+        active, pred_loc, is_obj = _c_slot_decode(loc_logits)
+        y_pres = y > PRESENCE_NORM_THRESH
+        k_true = y_pres.sum(-1)
+        B = x_f.size(0)
+        for b in range(B):
+            K = int(k_true[b].item())
+            if K == 0:
+                continue
+            K_slots   = min(K, is_obj.size(-1))
+            top_slots = is_obj[b].topk(K_slots).indices
+            pred_set  = set(pred_loc[b, top_slots].tolist())
+            true_set  = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
+            tkr_hits  += len(pred_set & true_set)
+            tkr_total += K
+
+        if fault_prob is not None:
+            pred_f = fault_prob >= 0.5
+            gt_f   = y_fault > 0.5
+            f_tp  += int((pred_f &  gt_f).sum())
+            f_fp  += int((pred_f & ~gt_f).sum())
+            f_fn  += int((~pred_f & gt_f).sum())
+
+    faulted_tkr = tkr_hits / max(tkr_total, 1)
+    fault_f1    = f1_from_counts(f_tp, f_fp, f_fn)[0] if fault_prob is not None else float("nan")
+    return faulted_tkr, fault_f1
+
+
 def do_training_c(
     model,
     opt,
@@ -376,6 +453,9 @@ def do_training_c(
     criterion,
     ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
+    fault_criterion=None,
+    fault_loss_weight: float = 1.0,
+    fault_val_every: int = 10,
 ):
     """
     Full training loop for the C-head model.
@@ -401,7 +481,8 @@ def do_training_c(
     epoch_bar = trange(epochs)
     for _epoch in epoch_bar:
         train_loss, loc, sev = train_one_epoch_c(
-            model, opt, sched, train_dl, accel, criterion, ema, drop_rate
+            model, opt, sched, train_dl, accel, criterion, ema, drop_rate,
+            fault_criterion=fault_criterion, fault_loss_weight=fault_loss_weight,
         )
         train_losses.append(train_loss)
         epoch_bar.set_description(
@@ -418,6 +499,15 @@ def do_training_c(
             f"train_loss {train_loss:.3e} (loc={loc:.2e} sev={sev:.2e})"
             f" | val_loss {val_loss:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
+
+        if fault_criterion is not None and fault_val_every > 0 and (_epoch + 1) % fault_val_every == 0:
+            f_tkr, f_f1 = val_one_epoch_c_fault(
+                model, val_dl, fault_criterion, _epoch
+            )
+            epoch_bar.write(
+                f"  [fault-val epoch {_epoch + 1}]"
+                f"  faulted_tkr={f_tkr:.3f}  fault_f1={f_f1:.3f}"
+            )
 
     return train_losses, val_losses, val_dl, val_f1s, val_mses, model
 
@@ -450,7 +540,7 @@ def train_one_epoch_dr(
     model.train()
     accum = 0.0
 
-    for x, y in train_dl:
+    for x, y, *_ in train_dl:
         opt.zero_grad()
         with accel.autocast():
             x    = randomise_bag_size(x, drop_rate)
@@ -495,7 +585,7 @@ def val_one_epoch_dr(
     tkr_hits = tkr_total = 0
 
     for x, y in val_dl:
-        x, y = x.float().to(device), y.to(device)
+        x, y = x.float().to(device, non_blocking=True), y.to(device, non_blocking=True)
         B = x.size(0)
         pred = model(x)                                        # (B, L) ∈ [0, 1]
 
