@@ -107,7 +107,7 @@ class DatasetConfig:
         """
         Return ``[(label, test_dl), ...]`` for final evaluation reporting.
 
-        7-story returns separate single and double test loaders.
+        7-story and Qatar return separate single and double test loaders.
         Other datasets return a single ``[(dataset_name, test_dl)]`` pair.
         """
         if self.name in ("7story", "7story-sparse"):
@@ -115,13 +115,10 @@ class DatasetConfig:
             test_single, test_double = _7story_test_loaders(**kwargs, sensor_indices=si)
             return [("single", test_single), ("double", test_double)]
         _, _, test_dl = self.get_dataloaders(**kwargs)
-        return [(self.name, test_dl)]
-
-    def get_extra_test_loader(self, **kwargs):
-        """Return the double-damage test loader (Qatar only), else None."""
-        if self._extra_test_fn is None:
-            return None
-        return self._extra_test_fn(**kwargs)
+        loaders = [(self.name, test_dl)]
+        if self._extra_test_fn is not None:
+            loaders.append(("double", self._extra_test_fn(**kwargs)))
+        return loaders
 
 
 # --------------------------------------------------------------------------- #
@@ -203,9 +200,11 @@ def _loader_lumo(root, window_size, overlap, downsample,
     )
 
 
+QATAR_HELD_OUT_DOUBLE = 4  # j23+j24 — always held out for test
+
+
 def _loader_qatar(root, window_size, overlap, downsample,
-                  num_workers, train_batch_size, eval_batch_size, seed,
-                  held_out_double=None, split_double=False, **kw):
+                  num_workers, train_batch_size, eval_batch_size, seed, **kw):
     return get_qatar_dataloaders(
         root=root,
         window_size=window_size, overlap=overlap, downsample=downsample,
@@ -213,22 +212,19 @@ def _loader_qatar(root, window_size, overlap, downsample,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
-        held_out_double=held_out_double,
-        split_double=split_double,
+        held_out_double=QATAR_HELD_OUT_DOUBLE,
         **kw,
     )
 
 
 def _extra_test_qatar(root, window_size, overlap, downsample,
-                      num_workers, eval_batch_size, held_out_double=None,
-                      split_double=False, **_):
+                      num_workers, eval_batch_size, **_):
     return get_qatar_double_test_dataloader(
         root=root,
         window_size=window_size, overlap=overlap, downsample=downsample,
         num_workers=num_workers,
         eval_batch_size=eval_batch_size,
-        held_out_index=held_out_double,
-        split_second_half=split_double,
+        held_out_index=QATAR_HELD_OUT_DOUBLE,
     )
 
 

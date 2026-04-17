@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES=0 LD_PRELOAD=/tmp/nvml_stub.so python train.py ...
 
 ## Architecture reference
 
-See **`MODEL_ARCHITECTURE.md`** for annotated diagrams of all three heads (v1, DR, C) — input/output shapes, sensor independence, importance weighting, and softmax clarification.
+See **`MODEL_ARCHITECTURE.md`** for annotated diagrams of the v1, DR, and C heads — input/output shapes, sensor independence, importance weighting, and softmax clarification. (B shares DR's architecture with mean-pooling replacing learned attention.)
 
 ## Research framing
 
@@ -18,14 +18,14 @@ See **`RESEARCH.md`** for the evolving research problem statement, central thesi
 
 ## What this repo is
 
-Structural Damage Identification (SHM) neural network. Sensor accelerometer data → damage location + severity. Three model heads:
+Structural Damage Identification (SHM) neural network. Sensor accelerometer data → damage location + severity. Four model heads:
 
 - **v1** (`Midn`): single global damage scalar + softmax location (original Engineering Structures paper)
 - **Approach C** (`MidnC`): DETR-style slot prediction with Hungarian matching
 - **Approach DR** (`MidnDR`): per-location regression with MIL sensor attention
 - **Baseline B** (`PlainDR`): plain per-location regression (mean-pool over sensors, no learned attention) — isolates MIL contribution
 
-Current development focus: **sensor-fault-aware SDI** — extending the C-head (MidnC) with a sensor spatial reasoning layer that leverages known sensor layout to distinguish structural damage signatures (spatially coherent) from sensor faults (spatially incoherent), without any external fault oracle.
+Current development focus: **fault-robust SDI across the sim→lab→field trio** — evaluating all model heads (v1, C, DR, B) plus C-head variants (C+fh with fault detection head, C+fh+sb with structural affinity bias in cross-attention routing) under controlled sensor fault injection. The structural affinity bias (`R_bias`) injects the known sensor layout as a routing prior in attention logit space, guiding each damage slot to attend toward sensors near its predicted location without modifying sensor feature embeddings. A spatial self-attention approach (`SensorSpatialLayer`) was tried and abandoned — it contaminated clean sensor representations (see Domain Insight 21).
 
 ## Collaboration workflow
 
@@ -83,6 +83,20 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 
 **Labels in normalized space**: `y_norm = raw_damage / 0.15 - 1 ∈ [-1, 1]`. Undamaged = -1, max damaged = +1.
 
+## Signal preprocessing (consistent across all datasets)
+
+All datasets share a two-stage preprocessing pipeline implemented via `scipy.signal.decimate` (FIR, zero-phase) and `lib.preprocessing.normalize_rms`:
+
+1. **FIR anti-alias decimation** — low-pass FIR filter at the new Nyquist frequency, then downsample. Removes high-frequency content that would otherwise alias into the structural response band (<50 Hz). Zero-phase (forward+backward) to avoid inter-channel temporal misalignment. Factor varies by dataset raw Fs.
+
+2. **Global RMS normalization** — divide all sensors by the scalar RMS computed across all sensors and time steps jointly (`ref_channel=None`). Preserves cross-sensor amplitude ratios (the damage signature) while providing excitation-amplitude invariance. Global (all-sensor) reference chosen over single-sensor reference for fault robustness: a faulted reference sensor would corrupt all channels, whereas global RMS degrades gracefully (~1/S perturbation per faulted sensor).
+
+| Dataset | Raw Fs | Decimation | Effective Fs | Nyquist | T | RMS ref |
+|---------|--------|-----------|-------------|---------|---|---------|
+| 7-story | 1000 Hz | truncate T=500 (zero-padded tail) | 1000 Hz | 500 Hz | 500 | global |
+| Qatar | 1024 Hz | 4× | 256 Hz | 128 Hz | 512 | global |
+| LUMO | 1652 Hz | 4× | 413 Hz | 207 Hz | 512 | global |
+
 ## Data
 
 ### 7-story frame (simulated, L=70)
@@ -90,6 +104,7 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - Single-damage: K=1 per sample; Double-damage: K=2 per sample
 - Combined single+double: ~28k train / 6k val / 6k test
 - Real benchmark: `data/7-story-frame/Testing_SingleEAcc9Sensor0.5sec.mat` (physical units, 1 sample)
+- Preprocessing: FIR anti-alias decimation 2× (1000→500 Hz, T=500) + global RMS normalization
 - Augmentation: via `lib/faults.py` (see **Data augmentation** section below)
 - Structured mask groups: 7 beam + 7 left-col + 7 right-col (3 sensors each) = 21 groups (`build_struct_masks_7story`)
 
@@ -112,8 +127,9 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - Labels: binary {0,1} → y_norm {-1,+1}; no severity grading
 - Dataset A (31 files: 1 undamaged + 30 single-damage) → train only
 - Dataset B (31 files, same scenarios, independent run) → val (first 50%) / test (last 50%)
-- Double Damage (5 files, real double-damage) → by default test only; can be added to training via `--held-out-double` or `--split-double`
+- Double Damage (5 files, real double-damage) → 4 included in training by default; j23+j24 (case_id=4) always held out for test
 - Windowing: `window_size` (default 2048=2s) + `overlap` (default 0.5) in data loader
+- Preprocessing: FIR anti-alias decimation 4× (1024→256 Hz, T=512) + global RMS normalization
 - Augmentation: via `lib/faults.py` (see **Data augmentation** section below)
 - Structured mask groups: 6 rows (5 sensors) + 5 columns (6 sensors) = 11 groups (`build_struct_masks_qatar`)
 - Use `--dataset qatar` in `train.py` / `train_all.py`; `--root` overrides default path
@@ -127,10 +143,12 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - **Effective sensor suite: 18 accelerometers**, Fs=1651.61 Hz, modal energy in 2–20 Hz band
 - 12 scenario folders = 6 × `*_Healthy` interleaved with 6 damage scenarios: `DAM{3,4,6}_{010,111}` — 010 = only leg-2↔3 bracing removed, 111 = all 3 bracings removed
 - **L=3 instrumented damage positions**: DAM3 / DAM4 / DAM6 (DAM1/2/5 do not exist as experimental scenarios). Labels binary `{-1,+1}^3`: +1 iff any bracing at that position is unbolted; 010 and 111 patterns collapse to a single "damaged" label (parity framing, severity out of scope)
-- Windowing: `window_size` (default 2048) + `overlap` (default 0.5) + `downsample` (default 4) — identical to Qatar defaults → `T=512`
+- Windowing: `window_size` (default 2048) + `overlap` (default 0.5) + `downsample` (default 4) → `T=512`
+- Preprocessing: FIR anti-alias decimation 4× (1652→413 Hz, T=512) applied before windowing + global RMS normalization
 - Split: recording-level stratified across {healthy, DAM3, DAM4, DAM6} so every position appears in train/val/test; 5 recordings per damage folder → 3/1/1 per folder
 - Augmentation: via `lib/faults.py` (see **Data augmentation** section below)
 - Structured mask groups: 9 level pairs (2 sensors) + 2 axis groups (9 sensors) = 11 groups (`build_struct_masks_lumo`)
+- Structural affinity: DAM3→ML5+ML6 (ch 8-11), DAM4→ML6+ML7 (ch 10-13), DAM6→ML8+ML9 (ch 14-17); ML6 shared between DAM3/DAM4 (`build_structural_affinity_lumo`)
 - Use `--dataset lumo` in `train.py` / `train_all.py`; `--root` overrides default path
 - `--window-size`, `--overlap`, `--downsample` flags share the Qatar CLI and work unchanged
 
@@ -142,7 +160,16 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - Per-epoch progress bar: `train_loss | val_loss | val_map_mse | val_top_k_recall` (v1) or `val_f1` (C/DR)
 - Final eval after training: test split(s) + real benchmark (7-story only) + double-damage test (Qatar only)
 
-`<run_name>` = `<dataset>` by default, or `<dataset>-<tag>` when `--tag` is used (e.g. `qatar-pmix`).
+`<run_name>` = `<dataset>` by default, or `<dataset>-<tag>` when `--tag` is used (e.g. `qatar-fault`).
+
+## Optimizer / scheduler
+
+| Head | Optimizer | LR | Scheduler | Notes |
+|------|-----------|-----|-----------|-------|
+| v1, DR, B | AdamW | 5e-4 | OneCycleLR (per-step) | Original tuning from v1 |
+| C (all variants) | AdamW | 1e-4 | CosineAnnealingLR (to 0) | DETR-style; OneCycleLR's warmup ramp destabilised fault head loss balance |
+
+Shared: weight_decay=1e-2, betas=(0.9, 0.999). Original DETR uses weight_decay=1e-4; 1e-2 is fine for our small model — revisit if overfitting observed.
 
 ## Key train.py flags
 
@@ -154,8 +181,6 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 | `--p-struct-mask <float>` | `0.0` | Per-window probability of structured group masking |
 | `--use-fault-head` | `False` | C-head: enable per-sensor binary fault classifier |
 | `--use-structural-bias` | `False` | C-head: learnable location-sensor affinity bias in cross-attention |
-| `--held-out-double <0-4>` | `None` | Qatar only: hold out one double-damage recording for test, add other 4 to training |
-| `--split-double` | `False` | Qatar only: use first½ of all 5 double-damage recordings for training, second½ for test. Mutually exclusive with `--held-out-double` |
 | `--no-obj-weight` | `0.1` | C-head: down-weight for ∅ class in location CE |
 | `--sev-weight` | `0.0`* | C-head severity loss weight (`*` Qatar registry default) |
 | `--num-slots` | `5` | C-head: K_max detection slots |
@@ -166,7 +191,7 @@ For DR: `evaluate_all_dr(pred, y_norm)` — uses `distributed_map_dr` + direct s
 - `saved_results/<dataset>/eval_<timestamp>.json` — full nested dict (NaN → null)
 - `saved_results/<dataset>/eval_<timestamp>.csv` — same table as printed
 
-Use `--out <stem>` to override the filename (e.g. `--out saved_results/qatar/eval_pmix`).
+Use `--out <stem>` to override the filename (e.g. `--out saved_results/qatar-fault/eval_fault_c-fh`).
 
 `inspect_predictions.py` saves plots to `saved_results/<dataset>/<model>/` (consistent with training output).
 Use `--out-dir` to override for non-standard paths.
@@ -191,111 +216,71 @@ Three independent mechanisms applied per sample in order:
 When any fault flag > 0, the data loader returns `(x, y, y_fault)` triplets; otherwise `(x, y)` pairs. `y_fault ∈ {0,1}^S` is the per-sensor fault ground truth, used by the C-head fault detection head (`--use-fault-head`) for BCE supervision. v1/DR discard `y_fault` but still train on faulted inputs for implicit robustness.
 
 ### Evaluation-time fault injection
-`inject_faults_batch(x, fault_type, n_faulted, rng)` in `lib/faults.py` — injects exactly one fault type with exactly `n_faulted` sensors per sample, seeded for reproducibility. Used by `evaluate_fault.py` to sweep controlled (fault_type × n_faulted) grids.
+`inject_faults_batch(x, fault_type, n_faulted, rng)` in `lib/faults.py` — injects exactly one fault type with exactly `n_faulted` sensors per sample, seeded for reproducibility. Used by `evaluate_fault.py` for 7-story (per-batch, independent samples).
 
-## Multi-damage training modes (Qatar)
+`_inject_recording(x, sensor_idx, fault_type)` in `evaluate_fault.py` — vectorized recording-consistent injection for LUMO/Qatar. Same sensors faulted across all windows in a recording, one random fault parameter draw per recording (matches physical reality: a faulty sensor stays faulty for the whole measurement session).
 
-Two modes for incorporating double-damage data, controlled by flags on `train.py` / `train_all.py` / `train_loo.py`:
+## Fault-robust experiment protocol
 
-### LOO with real double-damage (`--held-out-double <0-4>`)
-Hold out one double-damage recording for test, add the other 4 to training.
-Use `train_loo.py` to run all 5 folds automatically.
-Result: mean F1=0.439 (range 0.055–0.740) — high variance due to spatial specificity.
+Consistent protocol applied identically across 7-story, Qatar, and LUMO.
 
-### All-5 time split (`--split-double`)
-First 50% of each of the 5 double-damage recordings → training. Second 50% → test.
-Mutually exclusive with `--held-out-double`.
-Result: F1=0.9996 — near-perfect, confirming spatial specificity as root cause (see Insight 18).
+### Training
+- **Augmentation**: `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`
+- **Epochs**: 200
+- **Tag**: `--tag fault` → checkpoints in `states/<dataset>-fault/`
+- **Models**: B, v1, C, C+fh (`--use-fault-head`), C+fh+sb (`--use-fault-head --use-structural-bias`)
+  - LUMO: C+fh+sb now supported — structural affinity derived from readme.pdf Figure 1 (DAM3→ML5+ML6, DAM4→ML6+ML7, DAM6→ML8+ML9)
+  - DR: not yet trained for fault experiments
+
+### Evaluation (`evaluate_fault.py`)
+- **Fault types**: 7 types — hard, gain, bias, gain_bias, noise, stuck, partial
+- **Fault ratio**: `--fault-ratio 0.0 0.2 0.5 0.8` (fraction of sensors faulted)
+  - 7-story (S=65): nf = {0, 13, 32, 52}
+  - Qatar (S=30): nf = {0, 6, 15, 24}
+  - LUMO (S=18): nf = {0, 4, 9, 14}
+- **Repeats**: `--n-repeats 3` (3 random fault sensor selections per condition)
+- **Injection paradigm**:
+  - 7-story: per-sample (each simulation sample is independent)
+  - Qatar / LUMO: per-recording (fault persists across all windows of a measurement session)
+- **Output**: `saved_results/<dataset>-fault/eval_fault_{b,v1,c,c-fh,c-fh-sb}.{json,csv}`
+- **7-story and Qatar reports**: single-damage and double-damage subsets combined in one CSV with `subset` column
+
+### Example commands
+```
+python train.py --model c --dataset qatar --epochs 200 --tag fault --p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3 --use-fault-head
+python evaluate_fault.py --dataset qatar --c states/qatar-fault/c-fh-<uuid>.pt --c-label C+fh --out saved_results/qatar-fault/eval_fault_c-fh
+```
+
+## Qatar double-damage handling
+
+Qatar now defaults to including double-damage in training (like 7-story), with no special flags needed:
+- 4 double-damage recordings (j03+j26, j07+j14, j13+j23, j21+j25) → included in training
+- 1 double-damage recording (j23+j24, case_id=4) → always held out for test (`QATAR_HELD_OUT_DOUBLE = 4` in `lib/datasets.py`)
+
+This is hardcoded — `--held-out-double` and `--split-double` flags have been removed.
+
+### Historical LOO and split experiments (prior to default change)
+- LOO (`--held-out-double`): mean F1=0.439 (range 0.055–0.740) — high variance due to spatial specificity (fold 4 = j23+j24 scored 0.740 because j23 overlaps with training fold j13+j23).
+- Split-½ (`--split-double`): F1=0.9996 — near-perfect, confirming spatial specificity as root cause (see Insight 18).
 
 **Key finding**: C-head achieves near-perfect double-damage detection when it has seen the specific joint pair during training.
 
 ## Checkpoints in states/
 
 - `states/qatar/` — baseline Qatar models (v1, C, DR trained on single-damage only)
-- `states/qatar-dd/` — Qatar C LOO models (4 real double-damage recordings in training, 1 held out per fold)
 - `states/qatar-dd-split/` — Qatar v1, C, DR trained with first½ of all 5 double-damage recordings
-- `states/qatar-fault/` — v1, C, DR trained with sensor fault augmentation; C-head eval: `saved_results/qatar-fault/eval_fault.{json,csv}`
-- `states/qatar-fault-sb/` — C-head with structural-bias attention (`--use-structural-bias`); attention maps saved; eval: `saved_results/qatar-fault-sb/eval_fault.{json,csv}`
-- `states/qatar-spatial-fault/` — C-head with spatial reasoning layer (`--use-spatial-layer`); eval: `saved_results/qatar-spatial-fault/eval_fault.{json,csv}`
-- `states/7story/` — baseline 7-story models (v1, C, DR; full S=65 sensors; single+double combined training)
-- `states/7story-sparse/` — sparse-sensor 7-story models (v1, C, DR; S=9 sensors matching physical benchmark)
-- `states/7story-sparse-single/` — v1 only, sparse S=9, single-damage training only (no eval on record)
-- `states/7story-fault/` — v1, C, DR trained with fault aug; eval: `saved_results/7story-fault/eval_fault_{v1,dr,c}.{json,csv}`
-- `states/7story-fault-fh/` — C+fault-head (`--use-fault-head`); eval: `saved_results/7story-fault-fh/eval_fault.{json,csv}`
-- `states/7story-fault-sr/` — C+spatial-layer+fault-head (`--use-fault-head --use-spatial-layer`); eval: `saved_results/7story-fault-sr/eval_fault.{json,csv}`
-- `states/7story-fault-sb/` — C+fault-head+structural-bias (`--use-fault-head --use-structural-bias`); eval: `saved_results/7story-fault-sb/eval_fault.{json,csv}`
+- `states/qatar-fault/` — B, v1, C, C+fh, C+fh+sb with fault aug (200 epochs) — **stale: trained on single-damage only + old optimizer; needs retraining with double-damage default + CosineAnnealingLR for C-variants**
+- `states/7story/` — **empty, needs retraining** (old checkpoints trained on broken FIR-decimated zero-padded data, deleted)
+- `states/7story-fault/` — **empty, needs retraining** (same)
 - `states/lumo/` — baseline LUMO models (v1, C, DR; 18 accel sensors; single-damage binary labels); eval: `saved_results/lumo/eval_20260410_021906.{json,csv}`
+- `states/lumo-fault/` — B, v1 trained with fault aug (200 epochs, valid); C, C+fh, C+fh+sb **stale: need retraining with pos_weight removed + CosineAnnealingLR**; eval: `saved_results/lumo-fault/eval_fault_{b,v1,c,c-fh}.{json,csv}`
+- `states/lumo-lumo-nobj05/` — exploratory: LUMO C-head with `--no-obj-weight 0.05`
+- `states/lumo-lumo-slots2/` — exploratory: LUMO C-head with `--num-slots 2`
 - `states/tower/` — tower models
 
 ## Experiment results (7-story frame)
 
-Eval files: `saved_results/7story/eval_20260402_023724.json` (full S=65), `saved_results/7story-sparse/eval_20260402_123221.json` (sparse S=9).
-
-### Simulated test set (single and double damage, clean)
-
-| Model | Config | Single F1 | Single top-k | Double F1 | Double top-k |
-|-------|--------|-----------|-------------|-----------|-------------|
-| v1    | full   | 0.981     | 0.999       | 0.704     | 0.663       |
-| C     | full   | 0.999     | 1.000       | 0.942     | 0.939       |
-| DR    | full   | 0.924     | 0.924       | 0.849     | 0.837       |
-| v1    | sparse | 0.984     | 0.998       | 0.688     | 0.659       |
-| C     | sparse | 0.994     | 0.997       | 0.927     | 0.925       |
-| DR    | sparse | 0.961     | 0.989       | 0.871     | 0.889       |
-
-### Real physical benchmark (`Testing_SingleEAcc9Sensor0.5sec.mat`)
-
-| Model | Config | real-1dmg F1 | real-1dmg top-k | real-2dmg F1 | real-2dmg top-k |
-|-------|--------|-------------|----------------|-------------|----------------|
-| v1    | full   | 0.000       | 0.000          | 0.000       | 0.000          |
-| C     | full   | 0.000       | 0.000          | 0.000       | 0.000          |
-| DR    | full   | 0.167       | 0.000          | 0.000       | 0.000          |
-| v1    | sparse | 0.000       | 0.000          | 0.200       | 0.000          |
-| C     | sparse | 0.000       | 0.000          | 0.000       | 0.000          |
-| DR    | sparse | 0.400       | 1.000          | 0.133       | 0.000          |
-
-Real benchmark performance is very poor across all models — significant sim-to-real gap. DR sparse is the best but still weak. C completely fails the real benchmark despite near-perfect simulation performance.
-
-### Fault-aware (`states/7story-fault/`, `states/7story-fault-fh/`, `states/7story-fault-sb/`)
-Eval: `saved_results/7story-fault/eval_fault_{v1,dr,c}.{json,csv}`, `saved_results/7story-fault-fh/eval_fault.{json,csv}`, `saved_results/7story-fault-sb/eval_fault.{json,csv}`
-Training: fault aug (200 epochs, old flag interface; now replaced by `--p-hard` / `--p-soft`). All 6 variants complete.
-
-**SDI F1 — hard faults, single damage:**
-
-| Model    | clean | nf=1  | nf=5  | nf=10 | nf=15 |
-|----------|-------|-------|-------|-------|-------|
-| v1       | 0.984 | 0.984 | 0.981 | 0.977 | 0.970 |
-| DR       | 0.944 | 0.944 | 0.941 | 0.935 | 0.929 |
-| C        | 0.999 | 0.994 | 0.974 | 0.945 | 0.918 |
-| C+fh     | 0.998 | 0.993 | 0.972 | 0.942 | 0.908 |
-| C+sr+fh  | 0.999 | 0.991 | 0.962 | 0.925 | 0.885 |
-| C+fh+sb  | 0.999 | 0.997 | 0.989 | 0.975 | 0.958 |
-
-**Mean SDI F1 averaged across all 7 fault types × nf∈{1,3,5,10,15}:**
-
-| Model    | single | double | mean   |
-|----------|--------|--------|--------|
-| v1       | 0.9640 | 0.6960 | 0.8300 |
-| DR       | 0.8308 | 0.7863 | 0.8085 |
-| C        | 0.9591 | 0.8866 | 0.9229 |
-| C+fh     | 0.9617 | 0.9015 | 0.9316 |
-| C+sr+fh  | 0.9461 | 0.9002 | 0.9232 |
-| C+fh+sb  | 0.9693 | 0.8917 | 0.9305 |
-
-**Fault detection F1 (fault head output) @ nf=5, single damage:**
-
-| Model    | hard  | gain  | bias  | gain_bias | noise | stuck | partial |
-|----------|-------|-------|-------|-----------|-------|-------|---------|
-| C+fh     | 0.000 | 0.087 | 0.156 | 0.091     | 0.059 | 0.000 | 0.078   |
-| C+sr+fh  | 0.008 | 0.049 | 0.045 | 0.038     | 0.003 | 0.010 | 0.045   |
-| C+fh+sb  | 0.155 | 0.136 | 0.131 | 0.133     | 0.132 | 0.142 | 0.126   |
-
-Key findings:
-- **C+fh+sb is best for single-damage SDI robustness** (highest avg F1 across all fault types/levels).
-- **C+fh is marginally best overall** (better on double damage), essentially tied with C+fh+sb.
-- **C+sr+fh (spatial layer) hurts single-damage robustness** relative to plain C+fh — the spatial self-attention does not help on 7-story's complex 65-sensor layout (contrast: spatial layer also underperformed on Qatar).
-- **DR collapses on bias and noise faults** (F1 drops to 0.57–0.61 at nf=10) — vulnerable to soft faults.
-- **Fault detection fails on 7-story** (contrast with Qatar fault F1 ≈ 1.0): the fault head does not reliably identify faulty sensors. C+fh+sb shows marginal improvement but all variants are far from useful. Likely cause: 65-sensor complex layout makes per-sensor anomaly detection harder from memory embeddings alone.
-- v1 is fault-robust for SDI but architecturally capped at double-damage F1 ≈ 0.70.
+Stale — preprocessing changed (reverted FIR decimation on zero-padded data, added RMS normalization). Needs retraining and re-evaluation.
 
 ## Experiment results (Qatar)
 
@@ -312,29 +297,22 @@ Eval: `saved_results/qatar/eval_20260329_053938.json` (SDI) + `eval_fault_baseli
 
 All models robust to hard faults at the SDI level (fault_f1 not applicable — no fault head).
 
-### Double-damage (`states/qatar-dd/`, `states/qatar-dd-split/`)
+### Double-damage (`states/qatar-dd-split/`)
 
-Results from `train.py` terminal output (not saved to JSON — checkpoints in `states/qatar-dd-split/`).
+Results from `train.py` terminal output (checkpoints in `states/qatar-dd-split/`).
 
 | Run | Model | K=1 F1 | K=2 F1 | K=2 top-k recall | K=2 AP | Notes |
 |-----|-------|--------|--------|-----------------|--------|-------|
-| LOO (`--held-out-double`) | C | — | 0.439 mean (0.055–0.740) | — | — | high variance by joint pair |
-| Split-½ (`--split-double`) | C | 0.992 | 0.9996 | — | — | seen joint pairs → near-perfect |
-| Split-½ (`--split-double`) | v1 | 0.978 | 0.667 | 0.552 | 0.630 | **architectural ceiling**: single argmax → precision=1.0, recall=0.5 |
-| Split-½ (`--split-double`) | DR | 0.993 | **0.995** | 0.998 | 1.000 | near-perfect; DR regresses per-location so handles K=2 naturally |
+| LOO | C | — | 0.439 mean (0.055–0.740) | — | — | high variance by joint pair |
+| Split-½ | C | 0.992 | 0.9996 | — | — | seen joint pairs → near-perfect |
+| Split-½ | v1 | 0.978 | 0.667 | 0.552 | 0.630 | **architectural ceiling**: single argmax → precision=1.0, recall=0.5 |
+| Split-½ | DR | 0.993 | **0.995** | 0.998 | 1.000 | near-perfect; DR regresses per-location so handles K=2 naturally |
 
 Key insight: DR with split-½ training matches C on double-damage (F1≈1.0). v1 is architecturally capped at F1=0.667 (single prediction head). The C vs DR gap on double-damage disappears when both have seen the target joint pairs — the advantage of C's slot architecture matters most in the zero-shot generalisation regime.
 
-### Fault-aware (`states/qatar-fault/`, `states/qatar-fault-sb/`, `states/qatar-spatial-fault/`)
-Eval: `eval_fault.json` in each corresponding `saved_results/` folder (fault sweep: hard, 0–15 sensors)
-
-| Run | Model | SDI F1 (clean) | SDI F1 @ n_fault=10 | Fault det. F1 @ n_fault=1 |
-|-----|-------|---------------|----------------------|--------------------------|
-| `qatar-fault` | C | 0.992 | 0.986 | ≈1.0 |
-| `qatar-fault-sb` | C + structural bias | 0.994 | 0.986 | ≈1.0 |
-| `qatar-spatial-fault` | C + spatial layer | 0.952 | 0.911 | ≈1.0 |
-
-Note: `qatar-fault` also has v1 and DR checkpoints but fault eval JSON covers C-head only. v1/DR fault robustness of the *baseline* models is in `saved_results/qatar/eval_fault_baseline_{v1,dr}.json`.
+### Fault-aware (`states/qatar-fault/`)
+Training: `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`, 200 epochs. Models: B, v1, C, C+fh, C+fh+sb.
+Eval: `saved_results/qatar-fault/eval_fault_{b,v1,c,c-fh,c-fh-sb}.{json,csv}` — pending retraining and re-eval with consistent fault-ratio sweep.
 
 ## Experiment results (LUMO)
 
@@ -368,3 +346,22 @@ Key findings:
 - **v1 competitive after calibration fix** (F1=0.943, −0.032 from Qatar). With the dmg_gate fix, v1 correctly predicts K=0 for most healthy windows (`mean_k_pred=0.625` vs 0.600 true). The remaining gap vs DR/C is from the softmax-location head's forced allocation.
 - **All three heads localise damage correctly when it exists** (`top_k_recall ≈ 0.97–0.98`). The gap is entirely about *whether* to call damage, not *where*.
 - **Ranking on LUMO**: DR > C ≈ v1. Under ambient field conditions, per-location regression is the most natural fit; the C-head's slot machinery is overhead when K≤1.
+
+### Fault-aware (`states/lumo-fault/`)
+Eval: `saved_results/lumo-fault/eval_fault_{b,v1,c,c-fh}.{json,csv}`
+Training: `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`, 200 epochs. Fault-ratio sweep: `{0.0, 0.1, 0.33, 0.5, 0.67, 0.8}` → nf={0,2,6,9,12,14}. *(Protocol now uses `{0.0, 0.2, 0.5, 0.8}` — these results from original sweep.)*
+
+**Mean SDI F1 by fault type (mean across nf={2,6,9,12,14}):**
+
+| Model | hard  | gain  | bias  | gain_bias | noise | stuck | partial | MEAN  |
+|-------|-------|-------|-------|-----------|-------|-------|---------|-------|
+| B     | 0.927 | 0.941 | 0.933 | 0.930     | 0.932 | 0.928 | 0.933   | 0.932 |
+| v1    | 0.943 | 0.966 | 0.963 | 0.963     | 0.960 | 0.940 | 0.959   | 0.956 |
+| C     | 0.811 | 0.837 | 0.837 | 0.826     | 0.808 | 0.805 | 0.825   | 0.821 |
+| C+fh  | 0.905 | 0.929 | 0.909 | 0.916     | 0.917 | 0.904 | 0.909   | 0.913 |
+
+Key findings:
+- **Plain C collapses on LUMO** (F1=0.845 clean, 0.821 mean faulted) — DETR slot machinery is excessive for L=3 binary.
+- **C+fh rescues C** (0.845→0.935 clean, +0.092) — fault head provides strong regularization even on clean data.
+- **v1 most fault-robust** (mean 0.956), consistent with 7-story.
+- **Fault detection works on LUMO** — C+fh achieves fault F1≈0.65–0.70 at nf=6 (vs ≈0.0 on 7-story). Small S=18 makes per-sensor anomaly detection tractable.

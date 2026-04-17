@@ -12,6 +12,8 @@ from safetensors import safe_open
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from lib.preprocessing import normalize_rms
+
 
 # Sensor indices (0-indexed, out of 65) that match the 9 sensors used in the
 # real physical benchmark .mat file.  Used by the "7story-sparse" dataset config
@@ -41,11 +43,15 @@ def input_preprocess(
     sensor_dim: int = 1,
     sensor_indices: list[int] | None = None,
 ) -> npt.NDArray[np.float32]:
+    # Raw shape: (1000, S, 3) — first 500 samples are real signal,
+    # last 500 are zero-padded.  Truncate, don't decimate.
     accel = data.get_tensor("acc").reshape(1000, n_sensors, 3).transpose(2, 0, 1)
-    accel = accel[:sensor_dim, :500]          # (sensor_dim, 500, n_sensors)
+    accel = accel[:sensor_dim, :500].astype(np.float32)  # (sensor_dim, 500, n_sensors)
+    # Per-window global RMS normalization (no single ref — robust to sensor faults)
+    accel = normalize_rms(accel, ref_channel=None)
     if sensor_indices is not None:
         accel = accel[:, :, sensor_indices]   # (sensor_dim, 500, len(sensor_indices))
-    return accel.astype(np.float32)  # type: ignore
+    return accel
 
 
 def target_preprocess(data) -> npt.NDArray[np.float32]:

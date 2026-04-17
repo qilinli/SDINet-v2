@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from functools import lru_cache
 
 import torch
@@ -137,8 +136,6 @@ def val_one_epoch(
     measures clean accuracy without injected sensor failures.
     '''
     model.eval()
-    state = deepcopy(model.state_dict())
-
     _x_peek, _ = next(iter(val_dl))
     n_sensors = _x_peek.size(-1)
     if subset_size is None or n_sensors <= subset_size:
@@ -149,8 +146,9 @@ def val_one_epoch(
             DEFAULT_VAL_SUBSET_COUNT, subset_size=subset_size, total_sensors=n_sensors,
         )
 
-    total_losses = torch.zeros((sensor_subsets.size(0),))
-    total_mse    = torch.zeros((sensor_subsets.size(0),))
+    use_subsets = subset_size is not None and n_sensors > subset_size
+    total_losses = torch.zeros((sensor_subsets.size(0),)) if use_subsets else 0.0
+    total_mse    = torch.zeros((sensor_subsets.size(0),)) if use_subsets else 0.0
     tkr_hits = tkr_total = 0
 
     for x, y in val_dl:
@@ -176,46 +174,65 @@ def val_one_epoch(
             tkr_hits  += int((topk_mask & y_pres[b]).sum())
             tkr_total += K
 
-        # ---- subset-based loss and map_mse ---------------------------------
-        y_hat_dmg, y_hat_loc = y_hat_dmg[..., sensor_subsets], y_hat_loc[..., sensor_subsets]
-        i_dmg, i_loc = i_dmg[..., sensor_subsets], i_loc[..., sensor_subsets]
-        i_dmg = i_dmg / (i_dmg.sum(-1, keepdim=True) + EPS)
-        i_loc = i_loc / (i_loc.sum(-1, keepdim=True) + EPS)
+        if use_subsets:
+            # ---- subset-based loss and map_mse -----------------------------
+            y_hat_dmg_s, y_hat_loc_s = y_hat_dmg[..., sensor_subsets], y_hat_loc[..., sensor_subsets]
+            i_dmg_s, i_loc_s = i_dmg[..., sensor_subsets], i_loc[..., sensor_subsets]
+            i_dmg_s = i_dmg_s / (i_dmg_s.sum(-1, keepdim=True) + EPS)
+            i_loc_s = i_loc_s / (i_loc_s.sum(-1, keepdim=True) + EPS)
 
-        dmg_preds = torch.einsum("becs,becs->bec", y_hat_dmg, i_dmg)
-        loc_preds = torch.einsum("becs,becs->bec", y_hat_loc, i_loc)
+            dmg_preds = torch.einsum("becs,becs->bec", y_hat_dmg_s, i_dmg_s)
+            loc_preds = torch.einsum("becs,becs->bec", y_hat_loc_s, i_loc_s)
 
-        l_dmg = (
-            F.mse_loss(
-                dmg_preds,
-                y_dmg[..., None].expand(-1, -1, dmg_preds.size(-1)),
-                reduction="none",
-            )
-            .mean(1).sum(0).cpu()
-        )
-        # Localization CE is only meaningful for samples with actual damage.
-        if damaged.any():
-            l_loc = (
-                F.cross_entropy(
-                    loc_preds[damaged],
-                    y_loc[damaged, None].expand(-1, loc_preds.size(-1)),
+            l_dmg = (
+                F.mse_loss(
+                    dmg_preds,
+                    y_dmg[..., None].expand(-1, -1, dmg_preds.size(-1)),
                     reduction="none",
                 )
-                .sum(0).cpu()
+                .mean(1).sum(0).cpu()
             )
+            if damaged.any():
+                l_loc = (
+                    F.cross_entropy(
+                        loc_preds[damaged],
+                        y_loc[damaged, None].expand(-1, loc_preds.size(-1)),
+                        reduction="none",
+                    )
+                    .sum(0).cpu()
+                )
+            else:
+                l_loc = torch.zeros_like(l_dmg)
+            total_losses += l_dmg + l_loc
+
+            dist_map = distributed_map_v1(dmg_preds, loc_preds)    # (B, L, N)
+            total_mse += map_mse(dist_map, y).cpu()                # (N,)
         else:
-            l_loc = torch.zeros_like(l_dmg)
-        total_losses += l_dmg + l_loc
+            # ---- full-sensor aggregated loss (matches training loss) -------
+            dmg_loss = F.mse_loss(dmg_pred_full, y_dmg, reduction="sum").item()
+            if damaged.any():
+                loc_loss = F.cross_entropy(
+                    loc_pred_full[damaged], y_loc[damaged], reduction="sum"
+                ).item()
+            else:
+                loc_loss = 0.0
+            total_losses += dmg_loss + loc_loss
 
-        # map_mse in [0, 1] space — consistent with metrics.py
-        dist_map = distributed_map_v1(dmg_preds, loc_preds)    # (B, L, N)
-        total_mse += map_mse(dist_map, y).cpu()                # (N,)
+            dist_map = distributed_map_v1(
+                dmg_pred_full.unsqueeze(-1), loc_pred_full.unsqueeze(-1),
+            )
+            total_mse += map_mse(dist_map, y).cpu().item()
 
-    model.load_state_dict(state)
     denom = len(val_dl.dataset)
+    if use_subsets:
+        return (
+            torch.median(total_losses).item() / denom,
+            torch.median(total_mse).item() / denom,
+            tkr_hits / max(tkr_total, 1),
+        )
     return (
-        torch.median(total_losses).item() / denom,
-        torch.median(total_mse).item() / denom,
+        total_losses / denom,
+        total_mse / denom,
         tkr_hits / max(tkr_total, 1),
     )
 
@@ -266,6 +283,25 @@ def get_opt_and_sched(model, train_dl: DataLoader, epochs: int):
     )
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, base_lr, epochs=epochs, steps_per_epoch=len(train_dl)
+    )
+    return opt, sched
+
+
+# C-variant optimizer: lower LR + cosine decay (no warmup ramp).
+# DETR-style Hungarian matching is sensitive to high LR and OneCycleLR's
+# aggressive ramp destabilises the fault head loss balance.
+DEFAULT_C_LR = 1e-4
+
+
+def get_opt_and_sched_c(model, train_dl: DataLoader, epochs: int):
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=DEFAULT_C_LR,
+        weight_decay=DEFAULT_WEIGHT_DECAY,
+        betas=DEFAULT_ADAMW_BETAS,
+    )
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=epochs * len(train_dl), eta_min=0,
     )
     return opt, sched
 

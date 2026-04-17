@@ -55,13 +55,6 @@ def main() -> None:
     # model-specific (passed through to train.py which ignores irrelevant ones)
     parser.add_argument("--tag",                 default="",
                         help="Output dir suffix, e.g. 'pmix' → states/qatar-pmix/")
-    parser.add_argument("--held-out-double",    type=int,   default=None,
-                        choices=[0, 1, 2, 3, 4],
-                        help="Hold out this double-damage recording index (0-4) for test; "
-                             "add the other 4 to training (Qatar only).")
-    parser.add_argument("--split-double",       action="store_true", default=False,
-                        help="Use first½ of all 5 double-damage recordings for training, "
-                             "second½ for test (Qatar only).")
     parser.add_argument("--bce-pos-weight",     type=float, default=None)
     parser.add_argument("--num-slots",          type=int,   default=5)
     parser.add_argument("--num-decoder-layers", type=int,   default=2)
@@ -76,8 +69,9 @@ def main() -> None:
     # --- fault detection head ---
     parser.add_argument("--use-fault-head",      action="store_true", default=False)
     parser.add_argument("--fault-loss-weight",   type=float, default=1.0)
-    parser.add_argument("--fault-pos-weight",    type=float, default=5.0)
     parser.add_argument("--use-structural-bias", action="store_true", default=False)
+    # --- fault evaluation ---
+    parser.add_argument("--eval-fault",          action="store_true", default=False)
     # --- fault augmentation ---
     parser.add_argument("--p-hard",              type=float, default=0.0)
     parser.add_argument("--p-soft",              type=float, default=0.0)
@@ -112,10 +106,6 @@ def main() -> None:
     ]
     if args.tag:
         shared += ["--tag", args.tag]
-    if args.held_out_double is not None:
-        shared += ["--held-out-double", str(args.held_out_double)]
-    if args.split_double:
-        shared += ["--split-double"]
     if args.root is not None:
         shared += ["--root", args.root]
     if args.bce_pos_weight is not None:
@@ -130,8 +120,7 @@ def main() -> None:
                "--spatial-nhead",      str(args.spatial_nhead)]
     if args.use_fault_head:
         shared += ["--use-fault-head"]
-    shared += ["--fault-loss-weight", str(args.fault_loss_weight),
-               "--fault-pos-weight",  str(args.fault_pos_weight)]
+    shared += ["--fault-loss-weight", str(args.fault_loss_weight)]
     if args.use_structural_bias:
         shared += ["--use-structural-bias"]
     if args.p_hard > 0.0:
@@ -140,6 +129,8 @@ def main() -> None:
         shared += ["--p-soft", str(args.p_soft)]
     if args.p_struct_mask > 0.0:
         shared += ["--p-struct-mask", str(args.p_struct_mask)]
+    if args.eval_fault:
+        shared += ["--eval-fault"]
 
     for model in args.models:
         sep = "=" * 60

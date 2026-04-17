@@ -56,6 +56,8 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from scipy.signal import decimate as _scipy_decimate
 
+from lib.preprocessing import normalize_rms
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -148,10 +150,9 @@ def _normalize(windows: np.ndarray, mode: str | None) -> np.ndarray:
     """
     Per-window normalization applied after windowing.
 
-    "rms"    — divide all channels by the RMS of channel 0 (joint 1, front-row
-               reference sensor near the shaker). Preserves cross-channel amplitude
-               ratios, which carry damage location information. Channel 0 ends up
-               with RMS ≈ 1; other channels scale proportionally.
+    "rms"    — divide all channels by the RMS of channel 0 via shared
+               :func:`~lib.preprocessing.normalize_rms`.  Preserves cross-channel
+               amplitude ratios (transmissibility referencing).
 
     "zscore" — subtract mean and divide by std across all channels and time steps.
                Removes DC offset and normalises energy but destroys inter-channel
@@ -162,9 +163,7 @@ def _normalize(windows: np.ndarray, mode: str | None) -> np.ndarray:
     if mode is None:
         return windows
     if mode == "rms":
-        rms = np.sqrt(np.mean(windows[:, :, 0] ** 2, axis=1, keepdims=True))  # (N,1)
-        rms = rms[:, :, np.newaxis]   # (N,1,1) broadcasts over (N,T,S)
-        return windows / (rms + 1e-8)
+        return normalize_rms(windows, ref_channel=None)
     if mode == "zscore":
         mean = windows.mean(axis=(1, 2), keepdims=True)
         std  = windows.std(axis=(1, 2), keepdims=True)
@@ -294,6 +293,18 @@ def _time_split_b(
     return np.concatenate(val_list), np.concatenate(test_list)
 
 
+def _to_recordings(X, Y, case_ids) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Convert numpy arrays to list of (x, y) tensors grouped by case_id."""
+    x_t = torch.from_numpy(X).unsqueeze(1).float()  # (N, 1, T, S)
+    y_t = torch.from_numpy(Y).float()                # (N, L)
+    y_t = y_t * 2.0 - 1.0                            # {0,1} → {-1,+1} normalised
+    recordings = []
+    for c in np.unique(case_ids):
+        mask = case_ids == c
+        recordings.append((x_t[mask], y_t[mask]))
+    return recordings
+
+
 def get_qatar_test_by_recording(
     root: str = QATAR_DEFAULT_ROOT,
     window_size: int = 2048,
@@ -320,17 +331,32 @@ def get_qatar_test_by_recording(
     stride = max(1, int(window_size * (1 - overlap)))
     X, Y, case_ids = _load_group(Path(root), "dataset_b", window_size, stride, normalize, downsample)
     _, test_idx = _time_split_b(case_ids, val_frac)
+    return _to_recordings(X[test_idx], Y[test_idx], case_ids[test_idx])
 
-    x_t = torch.from_numpy(X[test_idx]).unsqueeze(1).float()  # (N, 1, T, S)
-    y_t = torch.from_numpy(Y[test_idx]).float()                # (N, L)
-    y_t = y_t * 2.0 - 1.0                                     # {0,1} → {-1,+1} normalised
 
-    ids = case_ids[test_idx]
-    recordings = []
-    for c in np.unique(ids):
-        mask = ids == c
-        recordings.append((x_t[mask], y_t[mask]))
-    return recordings
+def get_qatar_double_by_recording(
+    root: str = QATAR_DEFAULT_ROOT,
+    window_size: int = 2048,
+    overlap: float = 0.5,
+    downsample: int = 4,
+    normalize: str = "rms",
+    held_out_index: int | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Return double-damage recordings grouped by recording.
+
+    held_out_index: if set, return only that one recording (test counterpart).
+    If None, return all 5.
+
+    Same format as get_qatar_test_by_recording (list of (x, y) tuples)
+    so evaluate_fault.py's recording-consistent injection loop works unchanged.
+    """
+    stride = max(1, int(window_size * (1 - overlap)))
+    X, Y, case_ids = _load_group(Path(root), "double_damage", window_size, stride, normalize, downsample)
+    if held_out_index is not None:
+        mask = case_ids == held_out_index
+        X, Y, case_ids = X[mask], Y[mask], case_ids[mask]
+    return _to_recordings(X, Y, case_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +395,6 @@ def get_qatar_dataloaders(
     p_struct_mask: float = 0.0,
     p_soft: float = 0.0,
     held_out_double: int | None = None,
-    split_double: bool = False,
     **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -377,6 +402,7 @@ def get_qatar_dataloaders(
 
     Data sources:
         train  —  Dataset A (all 31 recordings: 1 healthy + 30 single-damage)
+                   + 4 double-damage recordings (excluding held_out_double)
         val    —  Dataset B, first val_frac of windows per recording
         test   —  Dataset B, remaining windows per recording (1-window gap at boundary)
 
@@ -384,9 +410,6 @@ def get_qatar_dataloaders(
     augmentation (amplitude scaling + per-sensor noise) and optionally fault
     augmentation when any fault flag is > 0.
     """
-    if split_double and held_out_double is not None:
-        raise ValueError("split_double and held_out_double are mutually exclusive")
-
     root   = Path(root)
     stride = max(1, int(window_size * (1.0 - overlap)))
 
@@ -403,8 +426,7 @@ def get_qatar_dataloaders(
     # Time-based split of Dataset B into val and test
     val_idx, test_idx = _time_split_b(case_ids_b, val_frac)
 
-    # Optionally append 4 of 5 real double-damage recordings to the training set.
-    # The held-out recording (held_out_double) is reserved for test evaluation.
+    # Append double-damage recordings to training (excluding held-out for test).
     dd_note = ""
     if held_out_double is not None:
         X_dd, Y_dd, case_ids_dd = _load_group(
@@ -416,19 +438,6 @@ def get_qatar_dataloaders(
         x_a = torch.cat([x_a, x_dd], dim=0)
         y_a = torch.cat([y_a, y_dd], dim=0)
         dd_note = f" + 4×K=2 real ({len(x_dd)} segs)"
-
-    # Optionally append first 50% of all 5 double-damage recordings (split_double mode).
-    # Second 50% is reserved as the test set in get_qatar_double_test_dataloader.
-    if split_double:
-        X_dd, Y_dd, case_ids_dd = _load_group(
-            root, "double_damage", window_size, stride, normalize, downsample
-        )
-        train_idx_dd, _ = _time_split_b(case_ids_dd, val_frac=0.5)
-        x_dd = torch.from_numpy(X_dd[train_idx_dd]).float().unsqueeze(1)
-        y_dd = torch.from_numpy(Y_dd[train_idx_dd] * 2.0 - 1.0).float()
-        x_a = torch.cat([x_a, x_dd], dim=0)
-        y_a = torch.cat([y_a, y_dd], dim=0)
-        dd_note = f" + 5×K=2 first½ ({len(x_dd)} segs)"
 
     eff_fs = QATAR_FS // downsample
     eff_T  = window_size // downsample

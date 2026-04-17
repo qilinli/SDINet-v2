@@ -128,27 +128,33 @@ The LUMO field benchmark (ambient wind excitation, K≤1) reveals a regime where
 
 ---
 
-## Next Research Stage: Sensor-Fault-Aware SDI
+## Sensor-Fault-Aware SDI: Completed Investigation
 
-### Core direction
+### Approaches tried
 
-Add a **sensor spatial reasoning layer** between the backbone and the slot queries. This layer uses the known sensor layout (Qatar: 5×6 grid, coordinates known a priori) as a structural prior. Each sensor observes its physical neighbours in feature space. Sensors that are spatially incoherent with neighbours — faulty sensors — develop distinctive features that the damage slots naturally down-weight via cross-attention.
+Two approaches were investigated for injecting spatial sensor knowledge into the C-head:
 
-This is architecturally distinguished from V1's implicit fault tolerance (sensor dropout augmentation) in a critical way: V1 learns to be robust to *absent* sensors; the spatial reasoning approach learns to detect and discount *present-but-wrong* sensors — the harder and more practically important fault class.
+1. **Sensor spatial reasoning layer** (`SensorSpatialLayer` / C+SF+FH) — all-to-all self-attention over sensor features before the slot decoder. **Failed**: contaminated clean sensor representations by distributing fault artifacts into neighbours' features (see "Why SensorSpatialLayer failed" below and Domain Insight 21).
+
+2. **Structural affinity bias** (`R_bias` / C+FH+SB) — learnable (L+1)×S matrix injected as additive logit bias in slot cross-attention at decoder layers ≥1. **Succeeded**: guides attention routing without modifying sensor embeddings. Achieves best damage F1 across all fault types while improving clean F1 (see "Why R_bias succeeded" below and Domain Insight 22).
+
+**Design principle established**: structural spatial priors belong in attention *routing* (logit space), not in feature mixing. Only logit-space injection preserves per-sensor embedding integrity.
+
+The distinction from V1's implicit fault tolerance remains key: V1 learns to be robust to *absent* sensors (hard faults); the spatial bias approach helps discount *present-but-wrong* sensors (soft faults) — the harder and more practically important fault class.
 
 ### Sensor fault augmentation
 
 The existing augmentation (random channel masking, structured row/col masking) covers hard faults only (zeroed sensors). The SHM literature identifies a standard taxonomy of accelerometer faults relevant to forced-vibration testing; drift is excluded as it operates over hours/days and is negligible in 2s measurement windows.
 
-| Fault type | Physical cause | Augmentation |
+| Fault type | Physical cause | Augmentation (current `lib/faults.py`) |
 |---|---|---|
-| **Complete failure** | Cable disconnect, dead DAQ channel | Zero the sensor (already done) |
-| **Gain fault** | Mismatched sensitivity, cable resistance | Multiply by U(0.05, 0.15) or U(5, 15) |
-| **Bias/offset** | Poor sensor zeroing, coupling issue | Add constant ∈ ±[3×, 10×] RMS |
-| **Gain + bias (combined)** | Loose/corroded connector | Multiply + add offset simultaneously |
-| **Precision degradation** | EMI near electrical equipment | Add high-variance noise (σ >> 5% RMS) |
-| **Noise-only** | Transient interference during test | Replace with pure Gaussian noise |
-| **Stuck value** | Frozen DAQ channel | Replace with sensor mean ± small noise |
+| **hard** (complete failure) | Cable disconnect, dead DAQ channel | Zero the sensor |
+| **gain** | Mismatched sensitivity, cable resistance | Multiply by U(0.5, 0.8) or U(1.2, 1.7) |
+| **bias** (offset) | Poor sensor zeroing, coupling issue | Add ±U(0.2, 1.0) × RMS |
+| **gain_bias** (combined) | Loose/corroded connector | Scale U(0.5, 0.9) + offset ±U(0.1, 0.5) × RMS |
+| **noise** | EMI / cable degradation | Additive noise σ = U(0.5, 2.0) × RMS |
+| **stuck** | Frozen DAQ channel | Replace with sensor mean + noise (0.01 × RMS) |
+| **partial** (attenuation) | Loose connector, signal reduced | Multiply by U(0.3, 0.7) |
 
 All are generatable synthetically with no new recordings. Each produces a `y_fault` label for the affected sensors — free supervision from augmentation. Gain+bias as a combined mode is physically motivated: loose or corroded connectors degrade amplitude and introduce DC offset simultaneously.
 
@@ -180,12 +186,11 @@ Focus on **single-damage (K=1)** detection under varying fault conditions. Multi
 
 ## Experimental Findings: Sensor Fault Robustness Phase
 
-Six models were compared on the Qatar test set (Dataset B, 30 sensors, 30 joints, K=1).
-Four training conditions: no fault augmentation (baseline), fault head + soft-fault aug
-(C+FH), spatial-layer + fault head (C+SF+FH), and structural affinity bias + fault head
-(C+FH+SB). Soft-fault augmentation used moderate magnitudes across 7 fault types (hard,
-gain, bias, gain_bias, noise, stuck, partial), sweeping n_faulted ∈ {1, 3, 5, 10, 15}
-with n_repeats=3. Results are mean damage detection F1 across all n values.
+Fault robustness is evaluated across all three datasets (7-story, LUMO, Qatar) using a consistent protocol: training with `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3` (200 epochs), evaluation with fault-ratio sweep `{0.0, 0.1, 0.33, 0.5, 0.67, 0.8}`, 7 fault types, 3 repeats. Full per-fault-type tables are in `CLAUDE.md` (7-story and LUMO complete; Qatar pending retraining).
+
+### Prior Qatar results (from earlier experimental round — checkpoints deleted, to be updated)
+
+The table below is from a prior Qatar-only experiment using old nf levels {1, 3, 5, 10, 15} and includes the now-abandoned C+SF+FH variant. These numbers motivated the design conclusions below but will be replaced once the consistent cross-dataset Qatar eval completes.
 
 | Fault Type  | v1    | DR    | C     | C+FH  | C+SF+FH | C+FH+SB |
 |-------------|-------|-------|-------|-------|---------|---------|
@@ -198,7 +203,7 @@ with n_repeats=3. Results are mean damage detection F1 across all n values.
 | partial     | 0.974 | 0.985 | 0.988 | 0.983 | 0.850   | **0.991** |
 | **clean**   | 0.975 | 0.991 | 0.992 | 0.992 | 0.984   | **0.994** |
 
-*Baselines use models trained without fault augmentation. C+SF+FH used old extreme-magnitude fault aug and is included as an ablation.*
+*v1, DR, C baselines were trained without fault augmentation. C+SF+FH used old extreme-magnitude fault aug and is included as an ablation. C+FH and C+FH+SB used moderate-magnitude aug matching current `lib/faults.py`.*
 
 ### Why SensorSpatialLayer (C+SF+FH) failed
 

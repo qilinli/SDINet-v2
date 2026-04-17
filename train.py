@@ -29,7 +29,7 @@ import torch
 
 from lib.datasets import get_dataset
 from lib.model import ModelConfig, ModelConfigC, ModelConfigDR, build_model, build_criterion_c, build_criterion_fault
-from lib.training import do_training, do_training_c, do_training_dr, get_opt_and_sched
+from lib.training import do_training, do_training_c, do_training_dr, get_opt_and_sched, get_opt_and_sched_c
 from lib.visualization import plot_training_results
 
 
@@ -107,8 +107,6 @@ def _build_dl_kwargs(args, dataset) -> dict:
         base["window_size"]     = args.window_size
         base["overlap"]         = args.overlap
         base["downsample"]      = args.downsample
-        base["held_out_double"] = args.held_out_double
-        base["split_double"]    = args.split_double
     return base
 
 
@@ -165,7 +163,6 @@ def _build_model_config(args, dataset):
             spatial_nhead=args.spatial_nhead,
             use_fault_head=args.use_fault_head,
             fault_loss_weight=args.fault_loss_weight,
-            fault_pos_weight=args.fault_pos_weight,
             use_structural_bias=args.use_structural_bias,
         )
 
@@ -237,20 +234,13 @@ def _run_post_training(args, dataset, trained_model, dl_kwargs, ckpt_path, save_
     # Calibration: use val loaders from the registry helper
     cal_loaders = dataset.get_calibration_val_loaders(**dl_kwargs)
     cal = calibrate(trained_model, cal_loaders, device)
-    if ckpt_path is not None:
+    if ckpt_path is not None and cal:
         save_calibration(cal, ckpt_path)
 
     # Test evaluation
     for label, test_dl in dataset.get_test_loaders(**dl_kwargs):
         print(f"\n[test / {label}]")
         for k, v in eval_loader(trained_model, test_dl, device, **cal).items():
-            print(f"  {k}: {v:.4f}")
-
-    # Optional extra test (Qatar double-damage)
-    extra_dl = dataset.get_extra_test_loader(**dl_kwargs)
-    if extra_dl is not None:
-        print(f"\n[test / {dataset.name} double]")
-        for k, v in eval_loader(trained_model, extra_dl, device, **cal).items():
             print(f"  {k}: {v:.4f}")
 
     # Real benchmark (7-story only)
@@ -280,6 +270,9 @@ def main(args) -> None:
         elif dataset.name == "qatar":
             from lib.data_qatar import build_structural_affinity
             structural_affinity = build_structural_affinity()
+        elif dataset.name == "lumo":
+            from lib.data_lumo import build_structural_affinity_lumo
+            structural_affinity = build_structural_affinity_lumo()
         else:
             raise ValueError(
                 f"--use-structural-bias is not supported for dataset {dataset.name!r}. "
@@ -296,25 +289,37 @@ def main(args) -> None:
         multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.999),
     )
 
-    opt, sched = get_opt_and_sched(model, train_dl, args.epochs)
+    if args.model == "c":
+        opt, sched = get_opt_and_sched_c(model, train_dl, args.epochs)
+    else:
+        opt, sched = get_opt_and_sched(model, train_dl, args.epochs)
 
     train_losses, val_losses, _, val_accs, val_mses, trained_model = _run_training(
         args, model, ema, opt, sched, train_dl, val_dl, criterion, fault_criterion=fault_criterion
     )
 
     # Save checkpoint
+    if args.label:
+        model_label = args.label
+    else:
+        model_label = args.model
+        if args.model == "c":
+            if args.use_fault_head:
+                model_label += "-fh"
+            if args.use_structural_bias:
+                model_label += "-sb"
     run_name   = f"{args.dataset}-{args.tag}" if args.tag else args.dataset
     states_dir = Path(__file__).resolve().parent / "states" / run_name
     states_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = None
     if args.save_checkpoint:
-        ckpt_path = states_dir / f"{args.model}-combined-{uuid4()}.pt"
+        ckpt_path = states_dir / f"{model_label}-{uuid4()}.pt"
         torch.save(trained_model.state_dict(), ckpt_path)
         print(f"[checkpoint] Saved: {ckpt_path}")
 
     # Plots
     val_acc_label = "Val F1" if args.model in ("c", "dr") else "Val top-k recall"
-    save_dir = f"saved_results/{run_name}/{args.model}"
+    save_dir = f"saved_results/{run_name}/{model_label}"
     plot_training_results(
         train_losses, val_losses, val_accs, val_mses,
         save_dir=save_dir,
@@ -323,6 +328,45 @@ def main(args) -> None:
     )
 
     _run_post_training(args, dataset, trained_model, dl_kwargs, ckpt_path, save_dir=save_dir)
+
+    # Optional fault evaluation
+    if getattr(args, "eval_fault", False) and ckpt_path is not None:
+        _run_eval_fault(args, ckpt_path, model_label, run_name)
+
+
+def _run_eval_fault(args, ckpt_path, model_label, run_name):
+    """Run evaluate_fault.py as a subprocess after training."""
+    import subprocess
+
+    # Map model type to the right CLI flag for evaluate_fault.py
+    model_flag = {"v1": "--v1", "c": "--c", "dr": "--dr", "b": "--b"}[args.model]
+    label_flag = {"v1": "--v1-label", "c": "--c-label", "dr": "--dr-label", "b": "--b-label"}[args.model]
+
+    # Display label: e.g. "C+fh+sb", "v1", "B"
+    _display = {"v1": "v1", "c": "C", "dr": "DR", "b": "B"}
+    display = _display[args.model]
+    if args.model == "c":
+        if args.use_fault_head:
+            display += "+fh"
+        if args.use_structural_bias:
+            display += "+sb"
+
+    out_stem = f"saved_results/{run_name}/eval_fault_{model_label}"
+
+    cmd = [
+        sys.executable, "evaluate_fault.py",
+        "--dataset", args.dataset,
+        model_flag, str(ckpt_path),
+        label_flag, display,
+        "--out", out_stem,
+    ]
+    if args.root is not None:
+        cmd += ["--root", args.root]
+
+    print(f"\n{'=' * 60}")
+    print(f"  Running fault evaluation: {display}")
+    print(f"{'=' * 60}\n")
+    subprocess.call(cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -402,13 +446,6 @@ if __name__ == "__main__":
                         help="Window overlap fraction (qatar only)")
     parser.add_argument("--downsample",       type=int,   default=4,
                         help="Decimation factor (qatar only; 4=256 Hz)")
-    parser.add_argument("--held-out-double",  type=int,   default=None,
-                        choices=[0, 1, 2, 3, 4],
-                        help="Hold out this double-damage recording index (0-4) for test; "
-                             "add the other 4 to training (qatar only). Default: all 5 for test only.")
-    parser.add_argument("--split-double",     action="store_true", default=False,
-                        help="Use first½ of all 5 double-damage recordings for training, "
-                             "second½ for test (qatar only). Mutually exclusive with --held-out-double.")
     # --- sensor spatial reasoning (C-head only) ---
     parser.add_argument("--use-spatial-layer",   action="store_true", default=False,
                         help="Enable SensorPositionalEncoding + SensorSpatialLayer before slot decoder.")
@@ -425,8 +462,6 @@ if __name__ == "__main__":
                              "Qatar only; requires --num-decoder-layers >= 2.")
     parser.add_argument("--fault-loss-weight",   type=float, default=1.0,
                         help="Scale factor for fault BCE loss (default 1.0).")
-    parser.add_argument("--fault-pos-weight",    type=float, default=5.0,
-                        help="BCE pos_weight for sparse faulty sensors (default 5.0).")
     # --- fault augmentation (all datasets) ---
     parser.add_argument("--p-hard",              type=float, default=0.0,
                         help="Per-sensor probability of hard fault (zero-out) during training.")
@@ -434,8 +469,12 @@ if __name__ == "__main__":
                         help="Per-sensor probability of soft fault during training.")
     parser.add_argument("--p-struct-mask",       type=float, default=0.0,
                         help="Per-window probability of structured group masking (default 0.0 = off).")
+    parser.add_argument("--eval-fault",       action="store_true", default=False,
+                        help="Run evaluate_fault.py automatically after training")
     parser.add_argument("--tag",              default="",
-                        help="Suffix appended to output dirs, e.g. 'pmix' → states/qatar-pmix/")
+                        help="Suffix appended to output dirs, e.g. 'fault' → states/qatar-fault/")
+    parser.add_argument("--label",            default="",
+                        help="Override model label for checkpoint/plot naming, e.g. 'c-fh-nobj02'")
 
     args = parser.parse_args()
 

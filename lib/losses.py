@@ -169,18 +169,8 @@ class FaultBCELoss(nn.Module):
     Per-sensor binary cross-entropy loss for the fault detection head.
 
     fault_prob is already sigmoid-activated (output of MidnC.fault_head),
-    so we use binary_cross_entropy rather than binary_cross_entropy_with_logits.
-
-    pos_weight upweights the faulty-sensor class to compensate for sparsity
-    (typically ~5 sensors out of 30 are faulted per augmented window).
-
-    Args:
-        pos_weight: BCE positive-class weight. Default 5.0 ≈ (S - mean_faults) / mean_faults.
+    so we use F.binary_cross_entropy (not with_logits).
     """
-
-    def __init__(self, pos_weight: float = 5.0) -> None:
-        super().__init__()
-        self.register_buffer("pos_weight", torch.tensor(pos_weight))
 
     def forward(self, fault_prob: Tensor, y_fault: Tensor) -> Tensor:
         """
@@ -189,12 +179,6 @@ class FaultBCELoss(nn.Module):
             y_fault:    (B, S) binary ground truth ∈ {0, 1}
 
         Returns:
-            Scalar weighted BCE loss.
+            Scalar BCE loss.
         """
-        y = y_fault.float()
-        # Manual pos_weight: scale positive terms
-        loss = -(
-            self.pos_weight * y * torch.log(fault_prob.clamp(min=1e-7))
-            + (1.0 - y) * torch.log((1.0 - fault_prob).clamp(min=1e-7))
-        )
-        return loss.mean()
+        return F.binary_cross_entropy(fault_prob, y_fault.float(), reduction="mean")

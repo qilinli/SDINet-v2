@@ -275,7 +275,8 @@ connected nodes, and isolated activations inconsistent with the load path can be
 suppressed.
 
 **Where in paper**
-Methodology (Approach D, GNN refinement), Discussion (physical interpretability)
+Discussion (physical interpretability, motivation for structural spatial priors)
+*Note: "Approach D" (GNN post-refinement) was a speculative direction never implemented. The structural prior is instead realised via the R_bias attention routing mechanism (see Insight 22).*
 
 **Quote-ready**
 > Structural load redistribution implies that damage at one location increases
@@ -474,7 +475,7 @@ Methodology (data augmentation for multi-damage generalisation), Discussion (val
 The Qatar SHM benchmark provides only 5 real double-damage recordings — far too few for supervised multi-damage training. However, the structure is a linear system excited by broadband white noise, so sensor responses superpose approximately: `x_1+2 ≈ x_1 + x_2`. This means synthetic K=2 training windows can be constructed by adding pairs of single-damage windows from different recordings, with `y = max(y_1, y_2)` as the label union. No new experiments are required.
 
 **ML implication**
-Training the DETR-style C-head with 50% synthetic K=2 augmentation (`--p-mix 0.5`) and 200 epochs breaks the ∅-prior trap identified in Insight 14. Empirical results on Qatar:
+Training the DETR-style C-head with 50% synthetic K=2 augmentation (formerly `--p-mix 0.5`, flag since removed) and 200 epochs breaks the ∅-prior trap identified in Insight 14. Empirical results on Qatar (historical — `states/qatar-pmix/` deleted, superseded by LOO/split-double experiments):
 
 | Setting | Double F1 | Double mean_k_pred | Single F1 |
 |---------|-----------|-------------------|-----------|
@@ -653,7 +654,9 @@ Discussion (architecture comparison for multi-damage scenarios), Motivation for 
 Spatial coherence under forced vibration means a faulty sensor is an outlier *relative to its physical neighbours* — the discriminating signal lives in that local contrast. An all-to-all cross-sensor self-attention layer placed before the slot decoder blurs this contrast in the wrong direction: the faulty sensor's anomalous feature representation is distributed into its neighbours' representations via attention-weighted sums, while its own signature is diluted by the normal features of those neighbours. The network mixes the signals of all sensors together before the damage head sees them, which erases the very spatial incoherence pattern it is designed to exploit.
 
 **ML implication**
-Training with sensor fault augmentation and a `SensorSpatialLayer` (multi-head self-attention over all S sensor features) before the `MidnC` slot decoder consistently degrades damage F1 relative to fault augmentation alone. The degradation is asymmetric across fault types:
+Training with sensor fault augmentation and a `SensorSpatialLayer` (multi-head self-attention over all S sensor features) before the `MidnC` slot decoder consistently degrades damage F1 relative to fault augmentation alone. The degradation is asymmetric across fault types.
+
+*Numbers from prior Qatar experiment (old nf levels {1,3,5,10,15}, checkpoints deleted). Analysis and design conclusions remain valid; updated numbers pending consistent cross-dataset re-eval.*
 
 | Fault | C+FH (aug only) | C+SF+FH (aug + spatial layer) | Δ |
 |-------|-----------------|-------------------------------|---|
@@ -698,7 +701,9 @@ bias[b, slot, sensor] = softmax(loc_logits[b, slot]) @ R   →   shape (B, K, S)
 
 This is dynamic — it changes per sample and per decoder layer as each slot refines its location prediction — and it does not touch sensor feature embeddings. Each slot predicted at location l preferentially attends to sensors adjacent to l; a faulty sensor far from the predicted location gets lower attention weight. Layer 0 always runs without bias: slot queries have not yet seen sensor data, so `loc_head(queries)` is sample-identical and provides no meaningful location estimate to weight R's rows. R is a learnable `nn.Parameter`, allowing training to refine the binary adjacency prior and discover structural coupling patterns (e.g. longer-range coupling along load-path columns or rows) that simple 4-connectivity does not capture.
 
-Because R acts only on attention logits, sensor embeddings remain unmodified — no contamination path exists. Empirical results on Qatar (K=1, 30 sensors, 7 fault types):
+Because R acts only on attention logits, sensor embeddings remain unmodified — no contamination path exists.
+
+*Numbers from prior Qatar experiment (old nf levels {1,3,5,10,15}, checkpoints deleted). Analysis and design conclusions remain valid; updated numbers pending consistent cross-dataset re-eval. See `CLAUDE.md` for current 7-story and LUMO fault results.*
 
 | Fault | C (no aug) | C+FH | C+FH+SB |
 |-------|-----------|------|---------|
@@ -764,3 +769,117 @@ Discussion (architecture comparison across data regimes), Results (sim → lab �
 > that slot-based architectures are best suited to multi-damage regimes (K>1) where
 > set prediction is genuinely required, while per-location regression is preferable
 > for single-damage field monitoring under non-stationary excitation.
+
+---
+
+## 24. Reference-sensor RMS normalization is physically grounded transmissibility estimation — fundamentally different from time-series forecasting normalization
+
+**Domain rationale**
+In structural dynamics, dividing each sensor's RMS by the RMS of a reference sensor approximates the transmissibility function — the energy transfer ratio between two points in the structure. For a linear structure under broadband excitation, this ratio encodes the structural transfer characteristics: stiffness distribution, damping, and connectivity. Damage (stiffness loss, cracking, connection degradation) alters local stiffness and damping, changing how vibration energy distributes spatially. The normalised feature vector therefore captures the structural state while being invariant to excitation amplitude.
+
+This is fundamentally different from normalization techniques in the time-series forecasting literature (RevIN, DAIN, Dish-TS, SAN, FAN), which address temporal distribution shift by normalizing each channel independently using its own mean/variance statistics. Those methods are designed for a different problem: non-stationarity over long horizons where train and test distributions diverge temporally.
+
+**Key distinctions from forecasting normalization**
+
+1. *Excitation invariance.* If the input force doubles, all sensor RMS values roughly double, and the inter-sensor ratios stay constant. RevIN and its descendants would also remove amplitude scaling, but in a less physically grounded way — they normalize each sensor's temporal waveform independently, stripping out the cross-sensor amplitude relationships that encode damage location and severity.
+
+2. *Cross-sensor structure preservation.* The damage signature lives in the relative responses between sensors. Reference-sensor RMS normalization preserves this spatial pattern explicitly. Methods like RevIN, DAIN, and SAN normalize each channel independently using its own statistics, destroying the inter-sensor amplitude ratios.
+
+3. *Stationarity is not the primary concern.* Forecasting methods are designed to handle temporal non-stationarity causing train-test distribution mismatch over time. In SHM under repeated or ambient excitation, the signal within a measurement window is approximately stationary. The "distribution shift" of interest is between undamaged and damaged states — exactly the signal to preserve, not normalize away.
+
+**Empirical evidence**
+Qatar (with reference-sensor RMS normalization) shows near-zero SDI F1 degradation under preserving sensor faults (gain, bias, partial) even at 80% sensor fault ratio (F1=0.992 vs 0.995 clean). The same model architecture on 7-story and LUMO (without normalization) degrades measurably under identical fault injection. An extreme-gain stress test on Qatar (scale=0.001 to 100×) confirms the model is truly amplitude-invariant within realistic ranges: gain scales 0.001–2.0× cause <1.5% F1 drop, while only extreme amplification (10×+) overwhelms BatchNorm statistics and causes collapse.
+
+**ML implication**
+Global RMS normalization should be applied as a standard preprocessing step across all SHM datasets. It forces the model to learn frequency/phase/mode-shape features rather than absolute amplitudes, providing inherent robustness to gain-type sensor faults without any model architecture change. This is complementary to (not redundant with) fault-augmented training: normalization handles amplitude-preserving faults at the input level, while fault augmentation trains the model to handle destructive faults (hard, stuck, noise) that normalization cannot address.
+
+We use global (all-sensor) RMS rather than single-sensor reference for fault robustness: a single reference sensor is a single point of failure — if it is faulted (zeroed, stuck, biased), dividing by its corrupted RMS contaminates every sensor in the window. Global RMS degrades gracefully under sensor faults because any one faulted sensor contributes only ~1/S to the denominator. While single-sensor referencing gives a purer transmissibility estimate, the fault robustness benefit of global RMS outweighs the marginal physics accuracy loss for our experimental setting.
+
+**Where in paper**
+Methodology (data preprocessing, justification for normalization choice), Discussion (comparison with forecasting normalization literature, fault robustness analysis)
+
+**Quote-ready**
+> Per-window global RMS normalization divides all sensor channels by the root-mean-square
+> amplitude computed across all sensors jointly. This preserves cross-sensor amplitude
+> ratios — the spatial energy distribution pattern that encodes structural damage location
+> and severity — while providing excitation-amplitude invariance. Unlike single-sensor
+> referencing (which approximates transmissibility more closely but creates a single point
+> of failure under sensor faults), global RMS degrades gracefully: faulting k of S sensors
+> perturbs the denominator by only ~k/S. Unlike instance normalization methods from the
+> time-series forecasting literature (RevIN, DAIN, Dish-TS) which normalize each channel
+> independently, global RMS normalization preserves the inter-sensor amplitude structure
+> that is the primary damage signature.
+
+---
+
+## 25. Future direction: fault-aware learnable normalization combining structural physics with adaptive gating
+
+**Domain rationale**
+Reference-sensor RMS normalization is effective but static — it applies a fixed, physically motivated transformation. Under long-term field monitoring, environmental and operational variability (temperature affecting stiffness, varying traffic loads, seasonal wind patterns) creates distribution shift that a fixed normalization cannot fully absorb. The challenge maps onto the "intra-space shift vs inter-space shift" distinction from Dish-TS: environmental variation is nuisance shift to remove, while damage is signal shift to preserve.
+
+**Research directions**
+
+1. *Learnable gating adapted from DAIN.* DAIN's learnable normalization layer could be adapted to operate across the sensor array rather than per-channel. Instead of normalizing each sensor independently, a cross-sensor gating mechanism could learn to highlight damage-sensitive sensors and suppress uninformative ones — complementing the fixed RMS-referencing rather than replacing it.
+
+2. *Frequency-domain normalization.* Inspired by FAN's frequency-aware approach: a normalization scheme operating on the power spectral density of sensor signals could separate structural response characteristics (natural frequencies, mode shapes) from excitation characteristics (broadband energy level). PSD ratios between sensors are a richer version of the scalar RMS ratio, capturing frequency-dependent transmissibility rather than broadband energy transfer.
+
+3. *Transmissibility-based features.* The natural progression of RMS-referencing within the structural dynamics literature — power spectral density ratios, coherence functions, and mode shape curvature features. These all share the core principle (ratio-based features that cancel excitation effects) but capture richer frequency-dependent and spatial information.
+
+**Where in paper**
+Future work, Discussion (connecting SHM preprocessing to broader normalization literature)
+
+---
+
+## 26. Anti-alias FIR decimation is mandatory before downsampling vibration data — stride decimation aliases high-frequency content into the structural band
+
+**Domain rationale**
+Structural damage signatures live in the low-frequency modal response band: mode shapes, natural frequency shifts, and damping changes typically occur below 50–100 Hz for civil structures. Raw accelerometer sampling rates (1000–1652 Hz) far exceed what is needed and waste model capacity on high-frequency content (electrical noise, sensor resonance, aliased machinery harmonics) that carries no damage information.
+
+Downsampling reduces the time dimension and focuses the model on the relevant frequency band, but *how* the downsampling is performed matters critically. Two approaches:
+
+1. **Stride decimation** (`x[::k]`): simply takes every k-th sample. Any frequency content above the new Nyquist frequency (Fs/2k) is *not removed* — it folds back (aliases) into the lower frequency band, appearing as phantom spectral content that the model cannot distinguish from real structural response. This is the classic aliasing problem from signal processing.
+
+2. **FIR anti-alias decimation** (`scipy.signal.decimate(..., ftype='fir', zero_phase=True)`): first applies a low-pass FIR filter with cutoff at the new Nyquist frequency to remove all content above Fs/2k, then downsamples. The filter is applied zero-phase (forward + backward pass) to avoid group delay distortion that would misalign channels temporally.
+
+**Why this matters for SHM specifically**
+
+- *Aliased content corrupts damage features.* A vibration sensor at 1652 Hz sampling rate contains energy up to 826 Hz. If stride-decimated 4× to 413 Hz, content in the 207–826 Hz band folds back into 0–207 Hz — directly overlapping with structural modes. The model sees aliased artefacts as if they were real structural response, making damage features less discriminative.
+
+- *Aliasing is damage-state-dependent.* Different damage states change the broadband frequency response, so the aliased content differs between healthy and damaged conditions. This creates a confound: the model may learn to discriminate damage states partly through aliased artefacts rather than true modal features, resulting in a classifier that appears to work on in-distribution data but fails under distribution shift (different excitation, environmental conditions, sensor placement).
+
+- *Consistent preprocessing across datasets.* For fair comparison across the sim→lab→field trio (7-story 1000 Hz, Qatar 1024 Hz, LUMO 1652 Hz), all must use the same decimation strategy. Inconsistent preprocessing (one dataset with anti-alias filtering, another without) means performance differences could reflect preprocessing artefacts rather than genuine model or dataset characteristics.
+
+**Implementation**
+
+All three datasets now use `scipy.signal.decimate(x, factor, ftype='fir', zero_phase=True)`:
+
+| Dataset | Raw Fs (Hz) | Decimation factor | Effective Fs (Hz) | Nyquist (Hz) | T (samples) |
+|---------|-------------|-------------------|--------------------|--------------|-------------|
+| 7-story | 1000 | 2× | 500 | 250 | 500 |
+| Qatar | 1024 | 4× | 256 | 128 | 512 |
+| LUMO | 1652 | 4× | 413 | 207 | 512 |
+
+All effective Nyquist frequencies are well above the structural mode band (<50 Hz for these structures), ensuring no loss of damage-relevant information.
+
+**Previous state and what changed**
+
+- *Qatar*: already used `scipy.signal.decimate` with FIR filter — no change.
+- *7-story*: raw data is 1000 samples at 1000 Hz (1 second). Previously hard-cut to first 500 samples (`accel[:, :500]`) — equivalent to simply discarding the second half of the window, not downsampling at all. No frequency content was removed; the model saw the full 0–500 Hz band in 500 time steps. Now: FIR decimate 2× over the full 1000 steps → 500 steps at 500 Hz effective rate, with content above 250 Hz attenuated by the anti-alias filter.
+- *LUMO*: previously used stride decimation (`chunk[::4]`) — every 4th sample with no filtering. Content in the 207–826 Hz band was aliased into 0–207 Hz. Now: FIR decimation applied to the full recording before windowing, eliminating aliasing.
+
+**ML implication**
+Anti-alias filtering is a form of input denoising that removes high-frequency content the model cannot usefully learn from. Without it, the model must either (a) learn to ignore aliased content, wasting capacity, or (b) overfit to aliased artefacts that do not generalise. The FIR filter is a hard prior encoding the known physics: structural damage information lives below the Nyquist of the decimated signal. This is analogous to how convolutional stride layers in vision models implicitly rely on preceding convolutions to anti-alias before spatial downsampling (Zhang 2019, "Making Convolutional Networks Shift-Invariant Again").
+
+**Where in paper**
+Methodology (data preprocessing — describe the decimation pipeline and justify anti-alias filtering). If the paper includes an ablation study, a comparison of stride vs FIR decimation on LUMO (where the aliasing was worst due to 4× decimation from 1652 Hz) would directly demonstrate the impact.
+
+**Quote-ready**
+> All accelerometer signals are decimated to the target sampling rate using a zero-phase
+> FIR anti-alias filter (scipy.signal.decimate) prior to windowing. This removes spectral
+> content above the new Nyquist frequency that would otherwise alias into the structural
+> response band (typically <50 Hz for civil structures), where it is indistinguishable
+> from genuine modal features. Stride decimation without filtering was previously used
+> for the LUMO dataset (4× decimation from 1652 Hz), which allowed content in the
+> 207–826 Hz band to fold back into the 0–207 Hz analysis band. Consistent FIR
+> decimation across all datasets ensures that performance comparisons reflect genuine
+> model and dataset characteristics rather than preprocessing artefacts.

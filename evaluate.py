@@ -108,8 +108,6 @@ def run_evaluation(
     overlap: float = 0.5,
     downsample: int = 4,
     tower_excitation: tuple[str, ...] = ("EQ", "WN", "sine"),
-    split_double: bool = False,
-    held_out_double: int | None = None,
 ) -> dict[str, dict[str, float]]:
     """
     Evaluate any combination of checkpoints and return a nested metric dict.
@@ -131,8 +129,6 @@ def run_evaluation(
         window_size=window_size,
         overlap=overlap,
         downsample=downsample,
-        split_double=split_double,
-        held_out_double=held_out_double,
         train_batch_size=32,   # unused for test loaders
     )
 
@@ -260,10 +256,6 @@ def main() -> None:
     parser.add_argument("--overlap",     type=float, default=0.5)
     parser.add_argument("--downsample",  type=int,   default=4)
     parser.add_argument("--tower-excitation", nargs="+", default=["EQ", "WN", "sine"])
-    parser.add_argument("--split-double", action="store_true", default=False,
-                        help="Qatar only: use second½ of double-damage recordings as extra test set")
-    parser.add_argument("--held-out-double", type=int, default=None, metavar="{0-4}",
-                        help="Qatar only: use this LOO fold's held-out recording as extra test set")
     parser.add_argument("--out", default=None, metavar="STEM",
                         help="Output path stem for .json/.csv (default: saved_results/{dataset}/eval_{timestamp})")
     args = parser.parse_args()
@@ -280,8 +272,6 @@ def main() -> None:
         overlap=args.overlap,
         downsample=args.downsample,
         tower_excitation=tuple(args.tower_excitation),
-        split_double=args.split_double,
-        held_out_double=args.held_out_double,
     )
     print_table(results)
     save_results(results, args.dataset, out=args.out)

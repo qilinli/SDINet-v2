@@ -54,6 +54,23 @@ approved plan, severity 010 vs 111 is collapsed):
     *_DAM4_*  :   [-1, +1, -1]  (K = 1)
     *_DAM6_*  :   [-1, -1, +1]  (K = 1)
 
+Sensor layout and damage positions (from readme.pdf Figure 1)::
+
+    ML1  (accel01, ch 0-1)    8.95 m
+    ML2  (accel02, ch 2-3)    8.00 m
+    ML3  (accel03, ch 4-5)    7.00 m
+    ML4  (accel04, ch 6-7)    5.95 m
+    ML5  (accel05, ch 8-9)    5.00 m  ── DAM3 (between ML5–ML6)
+    ML6  (accel06, ch 10-11)  4.00 m  ── DAM4 (between ML6–ML7)
+    ML7  (accel07, ch 12-13)  2.95 m
+    ML8  (accel08, ch 14-15)  2.00 m
+    ML9  (accel09, ch 16-17)  1.00 m  ── DAM6 (between ML9–ML10)
+    ML10 (strain only)        0.10 m     (no accelerometer)
+
+Structural affinity (``build_structural_affinity_lumo``): each DAM position
+is associated with the two flanking measurement levels (4 sensors each).
+ML6 is shared between DAM3 and DAM4.
+
 Dataset constants (passed to model configs)::
 
     LUMO_FS           = 1651.6129
@@ -75,7 +92,10 @@ from pathlib import Path
 import numpy as np
 import scipy.io as sio
 import torch
+from scipy.signal import decimate as _scipy_decimate
 from torch.utils.data import DataLoader, TensorDataset
+
+from lib.preprocessing import normalize_rms
 
 LUMO_DEFAULT_ROOT: str = "data/LUMO"
 
@@ -145,52 +165,53 @@ def _parse_scenario(folder_name: str) -> tuple[str, np.ndarray]:
 # .mat loading + windowing                                                     #
 # --------------------------------------------------------------------------- #
 
-def _load_accel(mat_path: Path) -> np.ndarray:
+def _load_accel(mat_path: Path, downsample: int = 1) -> np.ndarray:
     """
     Load the 18 accelerometer channels from one LUMO .mat file.
 
+    If downsample > 1, applies a FIR anti-alias filter and decimates the
+    raw signal *before* windowing (matching the Qatar pipeline).
+
     Returns
     -------
-    accel : (T_total, 18) float32
+    accel : (T_effective, 18) float32
     """
     m = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
     data = m["Dat"].Data                  # (T_total, 22) float32
-    return np.ascontiguousarray(data[:, :LUMO_N_SENSORS])
+    accel = np.ascontiguousarray(data[:, :LUMO_N_SENSORS])
+    if downsample > 1:
+        accel = _scipy_decimate(
+            accel, downsample, ftype="fir", axis=0, zero_phase=True,
+        ).astype(np.float32)
+    return accel
 
 
 def _window(
     signal: np.ndarray,
     window_size: int,
     overlap: float,
-    downsample: int,
 ) -> np.ndarray:
     """
-    Slice a raw (T_total, 18) signal into fixed-length, overlapped windows.
+    Slice an already-decimated (T_effective, 18) signal into overlapped windows.
 
-    Decimation is applied *after* windowing so window_size refers to raw
-    sample indices (matches the Qatar convention).
+    Decimation is applied in _load_accel *before* windowing (FIR anti-alias
+    filter, matching the Qatar pipeline).  window_size here refers to the
+    effective (post-decimation) sample count.
 
     Returns
     -------
-    windows : (N, T, 18)  float32  where T = window_size // downsample
+    windows : (N, window_size, 18)  float32
     """
-    assert window_size % downsample == 0, (
-        f"window_size ({window_size}) must be divisible by downsample ({downsample})"
-    )
     stride = max(1, int(round(window_size * (1.0 - overlap))))
     t_total = signal.shape[0]
     if t_total < window_size:
-        return np.empty((0, window_size // downsample, LUMO_N_SENSORS), dtype=np.float32)
+        return np.empty((0, window_size, LUMO_N_SENSORS), dtype=np.float32)
 
     n_windows = 1 + (t_total - window_size) // stride
-    t_win = window_size // downsample
-    out = np.empty((n_windows, t_win, LUMO_N_SENSORS), dtype=np.float32)
+    out = np.empty((n_windows, window_size, LUMO_N_SENSORS), dtype=np.float32)
     for i in range(n_windows):
         start = i * stride
-        chunk = signal[start : start + window_size]
-        if downsample > 1:
-            chunk = chunk[::downsample]
-        out[i] = chunk[:t_win]
+        out[i] = signal[start : start + window_size]
     return out
 
 
@@ -235,10 +256,13 @@ def _scan_recordings(
             continue
 
         for mat_path in sorted(folder.glob("SHMTS_*.mat")):
-            accel = _load_accel(mat_path)
-            windows = _window(accel, window_size, overlap, downsample)
+            accel = _load_accel(mat_path, downsample=downsample)
+            eff_window = window_size // downsample
+            windows = _window(accel, eff_window, overlap)
             if windows.shape[0] == 0:
                 continue
+            # Global RMS normalization (no natural reference sensor under ambient excitation)
+            windows = normalize_rms(windows, ref_channel=None)
             Xs.append(windows)
             Ys.append(np.broadcast_to(y_vec, (windows.shape[0], LUMO_N_LOCATIONS)).copy())
             case_ids.extend([case_idx] * windows.shape[0])
@@ -307,6 +331,29 @@ def _stratified_case_split(
 # --------------------------------------------------------------------------- #
 # Structured fault masks                                                       #
 # --------------------------------------------------------------------------- #
+
+def build_structural_affinity_lumo() -> torch.Tensor:
+    """(L+1, S) = (4, 18) binary structural affinity for LUMO's lattice tower.
+
+    Each DAM position is a bracing section between two measurement levels
+    (see readme.pdf Figure 1).  Affinity = 1 for the accelerometers on the
+    two flanking levels (x + y axes).
+
+    Row 0 (DAM3): ML5 (ch 8-9) + ML6 (ch 10-11)    — bracing at 4.0–5.0 m
+    Row 1 (DAM4): ML6 (ch 10-11) + ML7 (ch 12-13)   — bracing at 2.95–4.0 m
+    Row 2 (DAM6): ML9 (ch 16-17) + ML8 (ch 14-15)   — bracing at 0.1–1.0 m
+                  (ML10 is base with strain gauges only, no accel → use ML8)
+    Row 3 (∅):    all zeros (no spatial preference for no-object class)
+
+    ML6 (ch 10-11) is shared between DAM3 and DAM4 — physically correct
+    since it sits at the junction between those two bracing sections.
+    """
+    R = torch.zeros(LUMO_N_LOCATIONS + 1, LUMO_N_SENSORS)  # (4, 18)
+    R[0, 8:12] = 1.0    # DAM3: accel05 (ch 8-9) + accel06 (ch 10-11)
+    R[1, 10:14] = 1.0   # DAM4: accel06 (ch 10-11) + accel07 (ch 12-13)
+    R[2, 14:18] = 1.0   # DAM6: accel08 (ch 14-15) + accel09 (ch 16-17)
+    return R
+
 
 def build_struct_masks_lumo() -> list[list[int]]:
     """11 structured mask groups for LUMO's 18 sensors (0-indexed).
@@ -418,3 +465,45 @@ def get_lumo_dataloaders(
         _dl(val_idx,   eval_batch_size,  shuffle=False),
         _dl(test_idx,  eval_batch_size,  shuffle=False),
     )
+
+
+def get_lumo_test_by_recording(
+    root: str | Path = LUMO_DEFAULT_ROOT,
+    window_size: int = LUMO_DEFAULT_WINDOW_SIZE,
+    overlap: float = LUMO_DEFAULT_OVERLAP,
+    downsample: int = LUMO_DEFAULT_DOWNSAMPLE,
+    seed: int = 42,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Return test windows grouped by recording for fault evaluation.
+
+    Uses the same split logic as :func:`get_lumo_dataloaders` so results are
+    consistent.  Recording boundaries are preserved so evaluate_fault.py
+    can inject faults consistently across all windows of each recording
+    (matching the physical scenario where a sensor fault persists for the
+    full measurement session).
+
+    Returns:
+        List of (x, y) per recording.
+        x: (n_windows, 1, T, 18)  pre-windowed, decimated
+        y: (n_windows, 3)         label repeated for every window (constant
+                                  within a recording — same damage scenario)
+    """
+    root = Path(root)
+    X, Y, case_ids, _ = _scan_recordings(root, window_size, overlap, downsample)
+
+    x_t = torch.from_numpy(X).float().unsqueeze(1)
+    y_t = torch.from_numpy(Y).float()
+
+    unique_cases = np.unique(case_ids)
+    case_to_y = {int(c): Y[case_ids == c][0] for c in unique_cases}
+    _, _, test_cases = _stratified_case_split(unique_cases, case_to_y, seed)
+
+    test_idx = np.where(np.isin(case_ids, test_cases))[0]
+    ids = case_ids[test_idx]
+
+    recordings = []
+    for c in np.unique(ids):
+        mask = ids == c
+        recordings.append((x_t[test_idx[mask]], y_t[test_idx[mask]]))
+    return recordings

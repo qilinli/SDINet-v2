@@ -119,7 +119,6 @@ class ModelConfigC:
     # --- fault detection head (default off — backward compatible) ---
     use_fault_head:    bool  = False
     fault_loss_weight: float = 1.0
-    fault_pos_weight:  float = 5.0   # BCE pos_weight ≈ (S − mean_faults) / mean_faults
 
     # --- structural location-sensor affinity bias (default off — backward compatible) ---
     # Qatar only: learnable (L+1, S) bias matrix initialised from 6×5 grid 4-connectivity.
@@ -243,7 +242,7 @@ def build_criterion_fault(cfg: ModelConfigC):
     if not cfg.use_fault_head:
         return None
     from lib.losses import FaultBCELoss
-    return FaultBCELoss(pos_weight=cfg.fault_pos_weight)
+    return FaultBCELoss()
 
 
 # ---------------------------------------------------------------------------
