@@ -291,6 +291,8 @@ Discussion (physical interpretability, motivation for structural spatial priors)
 
 ## 10. v1 scalar head fails on real data — physical interpretability of the failure mode
 
+> **[Historical — status: not reproducible from current checkpoints.]** The F1=0.00 / top_k_recall=0.00 figures below predate (a) the 7-story preprocessing fix (truncation-restore after FIR ringing on zero-padded simulation tails, see Insight #26), and (b) the `dmg_gate` calibration fix rolled out for v1 on small-L datasets (Qatar, LUMO). Both changes are expected to materially improve v1 on the real benchmark. The *mechanism* argued here — a single tanh-scalar encoding both presence and severity is brittle to domain shift — is still a valid design argument, but the headline numbers are not current evidence for it.
+
 **Domain rationale**
 Real accelerometer recordings differ from simulated training data in noise
 characteristics, physical units, and excitation spectral content. The v1 global
@@ -471,6 +473,8 @@ Methodology (data augmentation for multi-damage generalisation), Discussion (val
 
 ## 17. Synthetic double-damage augmentation via signal superposition breaks the DETR ∅ trap with minimal single-damage degradation
 
+> **[Historical — status: not reproducible from current checkpoints.]** The `--p-mix` CLI flag has been removed and the `states/qatar-pmix/` checkpoint cohort is deleted. The table below is preserved as an evidentiary trace of the mechanism (synthetic K=2 superposition breaks the ∅ trap) but cannot be re-run against the current training script. Current Qatar double-damage results are in `states/qatar-dd-split/` and are governed by Insight #18's spatial-specificity conclusion, which superseded the p_mix programme.
+
 **Domain rationale**
 The Qatar SHM benchmark provides only 5 real double-damage recordings — far too few for supervised multi-damage training. However, the structure is a linear system excited by broadband white noise, so sensor responses superpose approximately: `x_1+2 ≈ x_1 + x_2`. This means synthetic K=2 training windows can be constructed by adding pairs of single-damage windows from different recordings, with `y = max(y_1, y_2)` as the label union. No new experiments are required.
 
@@ -650,13 +654,13 @@ Discussion (architecture comparison for multi-damage scenarios), Motivation for 
 
 ## 21. Sensor self-attention before the slot decoder propagates fault artifacts into clean sensor representations
 
+> **[Historical — status: not reproducible from current checkpoints.]** The numbers in the Δ table below are from a prior Qatar experiment using the old nf levels `{1, 3, 5, 10, 15}` (incompatible with the current `{0, 0.2·S, 0.5·S, 0.8·S}` protocol) and the `SensorSpatialLayer` code path has since been removed — checkpoints deleted. The *mechanism* argued here (all-to-all self-attention over sensor features contaminates fault-isolation cues, motivating the logit-space structural-bias alternative, Insight #22) is design-load-bearing and still current; the per-fault-type numbers should be treated as historical evidence rather than reproducible benchmarks.
+
 **Domain rationale**
 Spatial coherence under forced vibration means a faulty sensor is an outlier *relative to its physical neighbours* — the discriminating signal lives in that local contrast. An all-to-all cross-sensor self-attention layer placed before the slot decoder blurs this contrast in the wrong direction: the faulty sensor's anomalous feature representation is distributed into its neighbours' representations via attention-weighted sums, while its own signature is diluted by the normal features of those neighbours. The network mixes the signals of all sensors together before the damage head sees them, which erases the very spatial incoherence pattern it is designed to exploit.
 
 **ML implication**
 Training with sensor fault augmentation and a `SensorSpatialLayer` (multi-head self-attention over all S sensor features) before the `MidnC` slot decoder consistently degrades damage F1 relative to fault augmentation alone. The degradation is asymmetric across fault types.
-
-*Numbers from prior Qatar experiment (old nf levels {1,3,5,10,15}, checkpoints deleted). Analysis and design conclusions remain valid; updated numbers pending consistent cross-dataset re-eval.*
 
 | Fault | C+FH (aug only) | C+SF+FH (aug + spatial layer) | Δ |
 |-------|-----------------|-------------------------------|---|
@@ -772,10 +776,12 @@ Discussion (architecture comparison across data regimes), Results (sim → lab �
 
 ---
 
-## 24. Reference-sensor RMS normalization is physically grounded transmissibility estimation — fundamentally different from time-series forecasting normalization
+## 24. Global RMS normalization is physically grounded transmissibility-like preprocessing — fundamentally different from time-series forecasting normalization
 
 **Domain rationale**
-In structural dynamics, dividing each sensor's RMS by the RMS of a reference sensor approximates the transmissibility function — the energy transfer ratio between two points in the structure. For a linear structure under broadband excitation, this ratio encodes the structural transfer characteristics: stiffness distribution, damping, and connectivity. Damage (stiffness loss, cracking, connection degradation) alters local stiffness and damping, changing how vibration energy distributes spatially. The normalised feature vector therefore captures the structural state while being invariant to excitation amplitude.
+In structural dynamics, dividing each sensor's RMS by a shared reference RMS approximates the transmissibility function — the energy transfer ratio between two points in the structure. For a linear structure under broadband excitation, this ratio encodes the structural transfer characteristics: stiffness distribution, damping, and connectivity. Damage (stiffness loss, cracking, connection degradation) alters local stiffness and damping, changing how vibration energy distributes spatially. The normalised feature vector therefore captures the structural state while being invariant to excitation amplitude.
+
+We use the *global-RMS* variant (denominator = RMS across all sensors and time steps jointly, `ref_channel=None` in `lib/preprocessing.normalize_rms`) rather than a single fixed reference sensor. The rationale is below under "Global vs single-sensor reference." See also Insight #30 for the empirically-confirmed fault-robustness advantage of mean-RMS over robust (median) alternatives.
 
 This is fundamentally different from normalization techniques in the time-series forecasting literature (RevIN, DAIN, Dish-TS, SAN, FAN), which address temporal distribution shift by normalizing each channel independently using its own mean/variance statistics. Those methods are designed for a different problem: non-stationarity over long horizons where train and test distributions diverge temporally.
 
@@ -851,21 +857,21 @@ Downsampling reduces the time dimension and focuses the model on the relevant fr
 
 **Implementation**
 
-All three datasets now use `scipy.signal.decimate(x, factor, ftype='fir', zero_phase=True)`:
+Qatar and LUMO use `scipy.signal.decimate(x, factor, ftype='fir', zero_phase=True)` prior to windowing. 7-story is a special case: its raw window is 1000 samples at 1000 Hz, but the final 500 samples are zero-padded (the simulated impact response fully decays by t=0.5 s), so the correct operation is to *truncate* to the first 500 non-padded samples — no decimation is needed because no information is discarded and Nyquist stays at 500 Hz.
 
-| Dataset | Raw Fs (Hz) | Decimation factor | Effective Fs (Hz) | Nyquist (Hz) | T (samples) |
-|---------|-------------|-------------------|--------------------|--------------|-------------|
-| 7-story | 1000 | 2× | 500 | 250 | 500 |
-| Qatar | 1024 | 4× | 256 | 128 | 512 |
-| LUMO | 1652 | 4× | 413 | 207 | 512 |
+| Dataset | Raw Fs (Hz) | Preprocessing | Effective Fs (Hz) | Nyquist (Hz) | T (samples) |
+|---------|-------------|---------------|--------------------|--------------|-------------|
+| 7-story | 1000 | truncate first 500 samples (tail is zero-padded) | 1000 | 500 | 500 |
+| Qatar | 1024 | FIR decimate 4× | 256 | 128 | 512 |
+| LUMO | 1652 | FIR decimate 4× | 413 | 207 | 512 |
 
 All effective Nyquist frequencies are well above the structural mode band (<50 Hz for these structures), ensuring no loss of damage-relevant information.
 
 **Previous state and what changed**
 
 - *Qatar*: already used `scipy.signal.decimate` with FIR filter — no change.
-- *7-story*: raw data is 1000 samples at 1000 Hz (1 second). Previously hard-cut to first 500 samples (`accel[:, :500]`) — equivalent to simply discarding the second half of the window, not downsampling at all. No frequency content was removed; the model saw the full 0–500 Hz band in 500 time steps. Now: FIR decimate 2× over the full 1000 steps → 500 steps at 500 Hz effective rate, with content above 250 Hz attenuated by the anti-alias filter.
 - *LUMO*: previously used stride decimation (`chunk[::4]`) — every 4th sample with no filtering. Content in the 207–826 Hz band was aliased into 0–207 Hz. Now: FIR decimation applied to the full recording before windowing, eliminating aliasing.
+- *7-story*: a short-lived intermediate state applied FIR 2× decimation over the full 1000 samples (500→250 Hz Nyquist). This was reverted in the `fix 7-story preprocessing` commit on discovering that the second half of each raw window is zero-padded by the simulation — decimating *padded* data introduces FIR ringing and transient filter startup/endup artefacts at window boundaries, contaminating the useful signal in the first 500 samples. The current pipeline truncates instead, which is information-preserving: raw data is bandlimited to 500 Hz by the simulator, so operating at 1000 Hz sampling over 500 real samples is the correct representation.
 
 **ML implication**
 Anti-alias filtering is a form of input denoising that removes high-frequency content the model cannot usefully learn from. Without it, the model must either (a) learn to ignore aliased content, wasting capacity, or (b) overfit to aliased artefacts that do not generalise. The FIR filter is a hard prior encoding the known physics: structural damage information lives below the Nyquist of the decimated signal. This is analogous to how convolutional stride layers in vision models implicitly rely on preceding convolutions to anti-alias before spatial downsampling (Zhang 2019, "Making Convolutional Networks Shift-Invariant Again").
@@ -883,3 +889,368 @@ Methodology (data preprocessing — describe the decimation pipeline and justify
 > 207–826 Hz band to fold back into the 0–207 Hz analysis band. Consistent FIR
 > decimation across all datasets ensures that performance comparisons reflect genuine
 > model and dataset characteristics rather than preprocessing artefacts.
+
+---
+
+## 27. Stacking "obvious-looking" fault-robustness priors onto C+fh+sb regresses — each intervention alone is already neutral-to-negative, confirmed at both 50 and 200 epochs
+
+**Domain rationale**
+The C+fh+sb architecture already composes three ideas: DETR slot prediction, fault-head auxiliary BCE, and structural affinity bias R in cross-attention logits. The natural next question is: can we strengthen each piece to close the remaining gap vs v1 at K=1-under-fault? Three interventions looked individually sensible — (A) use the fault head's own `p_fault` as a cross-attention logit penalty `−λ·p_fault` (detached); (B) freeze R to its physics initialisation and apply it at decoder layer 0 as well; (C) DETR-style aux loss applied at every decoder layer output. A 5-run 50-epoch ablation on 7-story-fault (R0 base + R1-A, R2-B, R3-C, R4-ABC) returned unanimous negative results:
+
+| Run    | K=1 clean | K=1 nf=32 | K=1 nf=52 | K=2 clean | K=2 nf=52 | fault_F1@32 |
+|--------|-----------|-----------|-----------|-----------|-----------|-------------|
+| base50 | 0.830     | 0.804     | 0.696     | 0.753     | 0.636     | 0.975       |
+| A50    | 0.838     | 0.743     | 0.575     | 0.738     | 0.561     | 0.975       |
+| B50    | 0.809     | 0.767     | 0.628     | 0.710     | 0.571     | 0.975       |
+| C50    | 0.840     | 0.799     | 0.676     | 0.740     | 0.611     | 0.974       |
+| ABC50  | 0.763     | 0.695     | 0.546     | 0.705     | 0.528     | 0.974       |
+
+None of A/B/C individually beats R0 at nf=32 or nf=52. Their combination (ABC) does not cancel to neutral — it stacks negatively, regressing K=1-nf=52 from 0.696 → 0.546 (−0.150).
+
+**200-epoch confirmation.** The same 5-run protocol at 200 epochs (`states/7story-fault-ablate200/`, `saved_results/7story-fault-ablate200/ablation_summary.csv`) produces the same ranking: base200 wins all K=1 conditions; ABC200 is worst; A200 is the single worst ablation at nf=52; C200 (aux-loss) is closest to base but still below. K=1 F1 across fault types (mean):
+
+| Run     | K=1 clean | K=1 nf=13 | K=1 nf=32 | K=1 nf=52 | K=2 nf=52 | fault_F1@32 |
+|---------|-----------|-----------|-----------|-----------|-----------|-------------|
+| base200 | 0.921     | 0.917     | 0.907     | 0.835     | 0.784     | 0.978       |
+| A200    | 0.901     | 0.885     | 0.858     | 0.752     | 0.723     | 0.978       |
+| B200    | 0.906     | 0.904     | 0.895     | 0.828     | 0.783     | 0.978       |
+| C200    | 0.919     | 0.914     | 0.901     | 0.816     | 0.780     | 0.977       |
+| ABC200  | 0.893     | 0.873     | 0.838     | 0.717     | 0.724     | 0.977       |
+
+The gap magnitudes shrink (more epochs mask some of the regression), but the ordering is identical and the combined variant (ABC) remains the worst, confirming this is not an under-training artifact. Fault-head F1 stays ≥0.977 in all runs — consistent with the 50-epoch finding that the detach protects fault-head supervision.
+
+**ML implication**
+Each intervention's failure mechanism is a different failure of the same assumption — that "the model can only benefit from more signal about sensors":
+
+- **(A) fault-gate**: at λ=3 a confidently-faulted sensor gets its attention logit driven down by ~3, reducing its post-softmax weight to ~5% of baseline. This is exactly what a hand-engineered fault-robustness scheme would do. But under training-time fault augmentation (p_hard/p_soft/p_struct_mask=0.3) the decoder already learns to down-weight faulted sensors implicitly — the hard gate double-penalises them and also suppresses clean sensors the slot should attend to (because p_fault is detached and cannot be recalibrated by decoder gradients). Net effect: lower K=1 F1 across all fault ratios.
+- **(B) freeze R + layer-0**: treating R as a hard physical prior (freeze) and applying it from layer 0 matches the "honest physics-informed" framing of Insight 22. But R as implemented is 4-connected grid adjacency — an approximation of coupling, not ground truth. The learnable variant (Insight 22) converges to a bias pattern different from binary adjacency. Freezing locks in the approximation; applying at layer 0 propagates its errors through every subsequent layer. The layer-0 bias computes `softmax(loc_head(slot_queries)) @ R`, but slot queries at layer 0 have not yet seen sensor data — the location prior is sample-identical and biased toward the class-frequency distribution of damage locations in the training set, which is not a useful routing prior.
+- **(C) aux loss**: shared heads applied at every decoder layer's output. DETR's original aux loss works because DETR has 6 decoder layers and the aux signal provides a learning curriculum from coarse (early layers) to fine (late layers) predictions. At decoder depth = 2 (our MidnC configuration), there is essentially one intermediate layer and one final layer — the aux loss is applied to a slot representation that has received only half the refinement, effectively asking shared heads to commit to predictions before they are ready. At 50 epochs and this depth the effect is ~neutral (−0.001 mean K=1 F1), but adds training-time cost with no observable benefit.
+
+The combined regression (ABC50 K=1 F1 across nf=0,13,32,52 averaged = 0.687 vs base50 0.789; Δ=−0.102) is an amplification, not a sum: (A) distorts attention, (B) distorts the routing prior, (C) over-commits intermediate representations to those distorted signals. All three share a common pattern: **they replace learning signal with hand-engineered regularisation.** When training-time augmentation already provides the supervision the regularisation was meant to substitute for, the regularisation becomes a constraint rather than a scaffold.
+
+Fault-head supervision itself is unaffected — all 5 runs keep fault_F1@nf=32 ≥ 0.974. The detach of `p_fault` into the A-gate successfully isolates fault-head gradients from decoder supervision, but preserving the fault head does not rescue the downstream decoder.
+
+**Where in paper**
+Ablation / negative results section. The table above belongs in the supplementary. The framing in the main text is: "We evaluated three extensions that compose the existing three innovations more tightly (fault-gate cross-attention, frozen physics-initialised R with layer-0 application, deep decoder supervision). All three regressed on K=1 fault-robustness at 50 epochs. We interpret this as evidence that under strong fault augmentation (p=0.3 each of hard/soft/struct-mask), the decoder implicitly learns the sensor-down-weighting behaviour that explicit regularisation was meant to provide, and that hand-engineered priors compete with rather than complement the learned regularisation."
+
+**Quote-ready**
+> To close the remaining gap between the slot-based C+fh+sb model and the v1 head at K=1
+> under sensor faults, we evaluated three extensions, each reinforcing one of the model's
+> three existing priors: (A) a fault-probability penalty on sensor cross-attention logits;
+> (B) a frozen, physics-initialised structural affinity bias applied from the first decoder
+> layer; (C) DETR-style deep decoder supervision via per-layer Hungarian-matched auxiliary
+> losses. In a 5-run, 50-epoch ablation on 7-story-fault under matched augmentation
+> (p_hard=p_soft=p_struct_mask=0.3), all three extensions regressed single-damage F1 at
+> non-zero fault ratios, and their composition regressed K=1 F1 at 52 faulted sensors
+> from 0.696 to 0.546. Fault-head F1 at 32 faulted sensors was preserved (≥0.974 in all
+> runs), confirming that the gradient detach in (A) did not contaminate fault-head
+> supervision. We interpret the negative result as evidence that, under strong fault
+> augmentation, the decoder implicitly learns the sensor-down-weighting and spatial-
+> routing behaviour the explicit regularisation was meant to scaffold — and that
+> hand-engineered priors compete with the learned regularisation rather than complementing
+> it.
+
+---
+
+## 28. Fault-head and structural-bias are synergistic, not additive — physics priors in different spaces (feature state × attention routing) compose; in the same space they compete
+
+**Domain rationale**
+The C-head architecture exposes two independent physics priors: a per-sensor fault-detection head (fh) supervised by per-sensor BCE against injected fault ground truth, and a structural-affinity bias (sb = R_bias) that biases slot cross-attention logits toward sensors near each slot's currently-predicted location. Each prior is individually well-motivated and each could plausibly help fault-robust damage localisation. A clean isolation — training C, C+fh, C+sb, and C+fh+sb on 7-story-fault with identical fault augmentation (p_hard=p_soft=p_struct_mask=0.3) at 200 epochs — shows a striking interaction effect:
+
+| Model    | K=1 clean | K=1 nf=32 | K=1 nf=52 | K=2 clean | K=2 nf=52 | Δ vs C (K=1 nf=52) |
+|----------|-----------|-----------|-----------|-----------|-----------|--------------------|
+| C        | 0.927     | 0.911     | 0.849     | 0.864     | 0.806     | —                  |
+| C+fh     | 0.920     | 0.909     | 0.855     | 0.859     | 0.801     | +0.006             |
+| C+sb     | 0.916     | 0.898     | 0.828     | 0.854     | 0.782     | −0.021             |
+| C+fh+sb  | **0.939** | **0.926** | **0.872** | **0.873** | **0.817** | **+0.023**         |
+
+Neither component alone is helpful — fh is essentially neutral (+0.006), sb is slightly harmful (−0.021). Their combination gains +0.023 at the hardest operating point — an effect roughly three times the sum of the individual effects, and positive where neither alone is. This is not an additive composition; it is a synergistic interaction.
+
+**ML implication**
+The two priors are expressed in fundamentally different spaces of the decoder, and each one supplies what the other is missing:
+
+- **sb** is a geometric prior in **attention-logit space**: it answers *where should slot k look?* by biasing cross-attention toward sensors spatially adjacent to the predicted location. But sb is state-blind — a faulted sensor adjacent to the true damage is routed to identically to a healthy one.
+- **fh** is a state prior in **feature space**: its BCE auxiliary loss pushes the encoder to produce sensor embeddings that separably encode fault state. But on its own, the decoder has no structured mechanism to exploit that separability for localisation — the extra fault-aware direction in embedding space does not translate into better slot routing.
+
+When composed, sb routes the slot into the correct spatial neighbourhood and fh ensures the sensors *in* that neighbourhood carry discriminable health information. Soft cross-attention then implicitly computes `attention_weight ∝ spatial_proximity × health` — not a hard gate on either, but a multiplicative weighting in which both factors must be non-zero for the sensor to contribute meaningfully. Neither factor alone suffices: sb without fh routes to the right place but accepts broken signal; fh without sb produces the right features but has no routing structure to amplify healthy ones over faulted ones in the local neighbourhood.
+
+**The failure modes are concrete and complementary:**
+
+- **C+sb alone fails at high fault rates** (−0.021 K=1 nf=52). The spatial prior commits with high confidence to faulted sensors adjacent to the true damage; the Hungarian matcher pays the full mistake cost. On clean data the commitment is harmless; as fault rate grows the cost grows with it.
+- **C+fh alone is flat-to-slightly-negative on clean data** (−0.007 K=1 clean). The extra BCE loss reallocates encoder capacity toward fault detection, but the decoder cannot structurally exploit the resulting fault-aware features without a spatial routing mechanism to focus attention locally. The auxiliary task is "free" signal with no downstream architectural hook.
+
+**Composition principle established.** This result generalises beyond the specific fh/sb pair: **for physics-informed priors in learned models, where the prior is injected (which space, which layer, additive vs multiplicative) matters as much as what the prior encodes.** Priors injected in orthogonal spaces (logit routing × feature state × input weighting) can be complementary because each supplies a distinct ingredient the model composes through its existing computation. Priors injected in the same space compete for the same routing capacity.
+
+This frames and explains three earlier observations in this codebase:
+
+- **Insight 21** (SensorSpatialLayer abandoned): putting a geometric prior in *feature* space contaminated the very features fh would later need to keep clean. Feature space is where sensor state lives; overwriting it with geometric mixing destroys the signal fh extracts.
+- **Insight 22** (sb as logit-space routing prior): the correct space for a geometric prior is attention logits, not features — leaving the feature space untouched so the state prior (fh) has an unobstructed signal to learn.
+- **Insight 27** (50-epoch stacking ablation was negative): the fault-gate variant (−λ·p_fault on cross-attention logits) put fh's signal back into logit space where sb already lives — competing for the same routing capacity, exactly the over-composition failure the synergy principle warns against.
+
+The synergy of fh+sb is thus not an accidental empirical fact but the predictable outcome of a deeper design rule: **compose priors across spaces, not within them.**
+
+**Where in paper**
+Methodology (justification for keeping fh in feature-supervision space and sb in logit-routing space — explicitly frame as orthogonal injection). Ablation / Results (the 4-row table above). Discussion (the orthogonal-space composition principle as a design heuristic that generalises to other SHM tasks: e.g. temperature-compensation priors in feature space + sensor-layout priors in logit space; input-amplitude priors via preprocessing × modal priors via output-head weighting).
+
+**Quote-ready**
+> The C+fh+sb configuration achieves the best K=1 and K=2 F1 across all fault ratios on
+> 7-story-fault, improving on the plain-C baseline by +0.012 at K=1 clean and +0.023 at
+> K=1 with 52 of 65 sensors faulted. Individually, neither extension is beneficial: C+fh
+> is approximately neutral (−0.007 K=1 clean) and C+sb slightly regresses under heavy
+> faults (−0.021 K=1 nf=52). The synergy reflects the orthogonality of the two priors'
+> injection sites in the decoder: the fault head operates in feature space, supervising
+> the encoder to produce sensor embeddings that separably encode fault state; the
+> structural-affinity bias operates in attention-logit space, routing each damage slot
+> toward sensors spatially adjacent to its predicted location. When composed, the
+> slot attends to a spatially-correct neighbourhood in which faulted sensors are
+> simultaneously discriminable via their embeddings, so soft cross-attention implicitly
+> computes a multiplicative weighting of spatial proximity and sensor health. Neither
+> factor alone suffices for fault-robust localisation; their composition succeeds
+> because they occupy orthogonal spaces of the decoder and do not compete for the
+> same routing capacity. This identifies a reusable design principle for physics-
+> informed architectures: compose priors across spaces, not within them.
+
+---
+
+## 29. HP sweeps at short epoch budgets select for convergence speed, not terminal optimum — re-rank at full budget before declaring a winner
+
+**Domain rationale**
+When validating c-fh-sb HP choices on 7-story-fault, a 10-run, 50-epoch sweep over num-slots, no-obj-weight, augmentation strength, and neck dropout showed a clear winner: no-obj-weight = 0.2 ("n20") beat the default 0.1 baseline by +0.122 K=1 clean F1 (0.889 vs 0.767). Every K=1 and K=2 fault condition ranked n20 first, often by ≥0.10. Retraining n20 at the standard 200-epoch budget **reverses the result**: n20 underperforms the default on every SDI metric (K=1 clean −0.005, K=2 nf=52 −0.027), with the only positive delta being a negligible +0.002 in fault-head F1.
+
+**ML implication**
+A stronger ∅-class weight (n20) biases the DETR slot head toward fewer activations from epoch 0, accelerating convergence into the K=1-dominant regime where most samples have one damage and most slots should emit ∅. At 50 epochs the default (n=0.1) has not yet learned to suppress spurious slots, so n20's head start dominates. Given full training time, the default catches up and slightly surpasses n20 because weaker ∅ pressure leaves more representational capacity in the active slots — which matters more at K=2, where suppressing second-slot activations is costly. The 50-epoch ranking tracks *learning rate along the loss surface*, not *position of the final minimum*.
+
+**Methodological lesson**
+Short-budget sweeps are legitimate for pruning — they cheaply reject configurations that cannot even reach convergence. But they must not be used to *select among* candidates near the frontier. A winner at a shortened budget is a hypothesis; terminal ranking requires training each candidate (or at minimum the top 2-3) at the full budget. This is a general pattern for HP selection on non-convex losses — the HP that reaches any given loss value fastest is not the same as the HP that reaches the *lowest* loss value, because regularisation-like HPs that accelerate early-phase optimisation often over-constrain the final-phase fit.
+
+**Where in paper**
+Supplementary / ablation appendix. Useful if reviewers ask "did you sweep HPs?" — the short answer is "yes, the defaults were confirmed at full training budget to be near-optimal for this head."
+
+**Quote-ready**
+> A ten-configuration, 50-epoch hyperparameter sweep over the DETR no-object weight,
+> slot count, augmentation intensity, and neck dropout identified a clear 50-epoch
+> winner — no-object weight doubled from 0.1 to 0.2 — that dominated every
+> single- and double-damage fault condition. Re-training this configuration at the
+> 200-epoch reference budget reversed the ranking: the default recovered and
+> slightly surpassed the sweep-winner on every SDI metric. The 50-epoch advantage
+> reflects faster convergence toward the K=1-dominant regime, not a lower terminal
+> loss. Short-budget sweeps can prune pathological settings, but terminal selection
+> requires full-budget confirmation; the published defaults are therefore retained.
+
+**Confirmation at n=2 (Round 2, April 2026)**
+A second-round, 100-epoch sweep picked a different winner on a different HP axis: `num_slots=3` ("s3") beat the 5-slot default by +0.037 K=1 clean F1 (0.906 vs 0.869) at 100 epochs. Retraining s3 at 200 epochs reproduces the same reversal pattern as n20, *more strongly*: K=1 clean Δ=−0.013, K=1 nf=52 Δ=**−0.029** (17× the n20 gap at nf=52), K=2 nf=52 Δ=−0.032. Mechanism is analogous but operates through architectural capacity rather than loss weighting — fewer slots converge faster to the K≤2-dominant regime but hit a lower ceiling once the 5-slot default catches up on suppression. s3 loses harder than n20 because reducing `num_slots` removes decoder parameters (a hard capacity cap), whereas stronger ∅-weighting only biases an existing loss term. Two independent short-budget winners — one loss-weighting, one architectural — now both confirmed null at full budget, sufficient to treat the "confirm at ≥200 epochs" step as an operating protocol on this task.
+
+## 30. Fault-contrast from mean-RMS normalization is load-bearing only when the backbone erases amplitude internally — amplitude-preserving tokenisers make the preprocessing redundant
+
+**Domain rationale**
+Under fault-aware training with gain / bias / partial faults, the trained model learns to exploit *per-sensor amplitude contrast* as a damage-vs-fault detection cue: a gain- or bias-faulted sensor has anomalously high RMS, and the model uses this to flag the sensor and re-weight attention. Where this cue enters the model depends on the backbone's treatment of amplitude:
+
+- **Amplitude-erasing backbones** (DenseNet with BatchNorm in early convs) actively discard per-channel scale inside their feature extractor. The only place they can access amplitude-contrast information is the pre-processing — specifically the global-mean RMS denominator, which couples all sensors' scales together. A biased sensor inflates the denominator, which suppresses clean channels, producing a high-contrast input pattern the downstream attention learns to use.
+- **Amplitude-preserving tokenisers** (iTransformer's per-sensor `Linear(T, D)`) carry absolute per-sensor amplitude directly into the token magnitude. The same fault-contrast cue is available intrinsically; external pre-normalization becomes redundant.
+
+**Empirical evidence** — two ablations, same augmentation (`--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`, 200 epochs, C+fh+sb head):
+
+1. **DenseNet backbone**, 4-way norm ablation (`states/7story-fault-norm-{median,none,median-mil}` + baseline mean). **Mean strictly dominates every alternative at every cell**. K=1 mean F1 by nf={0,13,32,52}: mean 0.939 / 0.935 / 0.926 / 0.872; median 0.915 / 0.911 / 0.903 / 0.837; no-norm 0.910 / 0.907 / 0.895 / 0.826. K=2 mirrors. At K=1 nf=52 median loses to mean on all 7 fault types, largest gaps on the bias family (bias −0.049, gain_bias −0.043, gain −0.023). Robust-statistic intuition fails here because the model has learned to use the non-robust coupling.
+
+2. **iTransformer backbone**, 2-way ablation (`states/7story-fault-itransformer` mean vs `states/7story-fault-it-no-norm` none). **The gap collapses to within ±0.005 at every cell**. K=1: 0.944/0.939/0.929/0.860 (mean) vs 0.940/0.938/0.929/0.862 (no-norm), Δ ∈ {−0.004, −0.001, 0.000, +0.002}. K=2: 0.878/0.876/0.867/0.812 (mean) vs 0.878/0.875/0.867/0.817 (no-norm), Δ ∈ {0.000, −0.001, +0.001, +0.005}. The strongest pro-no-norm cell is the K=2 extreme-fault corner (nf=52, +0.005), consistent with the Linear tokeniser dominating the fault signal under severe amplitude distortion.
+
+**ML implication**
+A pre-processing step's role in the end-to-end pipeline is a function of *what the downstream architecture already provides*. Mean-RMS pre-normalization is not universally "the right preprocessing for SHM" — it is load-bearing under backbones whose first layer erases absolute amplitude (BN/GN-based convs) and redundant under tokenisers that preserve it (per-sensor Linear / MLP in iTransformer-family models). With an amplitude-preserving tokeniser the choice of aggregator matters only for excitation-amplitude invariance and numerical conditioning, not for fault-contrast — so a switch to `none` or `median` is approximately neutral rather than strongly harmful.
+
+This generalises: whenever a pre-processing step and a model component both expose the same signal, only one of them carries it end-to-end. Removing or changing the pre-processing is neutral *for that specific signal*, and the net effect becomes whatever other jobs the pre-processing was doing (excitation invariance, SNR, conditioning). Pre-processing ablations should therefore be run per backbone, not interpreted as architecture-independent.
+
+**Methodological lesson**
+The correct phrasing of the original DenseNet finding is: "under a backbone that erases amplitude, the pre-normalization statistic matters and the non-robust choice is strictly best." The iTransformer counter-ablation narrows the scope precisely: "under a backbone that preserves amplitude, the pre-normalization statistic is approximately neutral." A reviewer-style challenge of the form "have you tried robust normalization?" therefore has two valid answers depending on backbone, not one.
+
+**Where in paper**
+Appendix / ablation — present as two sub-tables (DenseNet and iTransformer) supporting the joint conclusion: under fault-aware training, the model exploits amplitude contrast; *where* it picks this up — external pre-norm vs internal tokeniser — depends on the backbone's amplitude handling.
+
+**Quote-ready**
+> Fault-aware training teaches the model to exploit per-sensor amplitude
+> contrast as a detection cue. Where this cue enters the model depends on
+> the backbone: an amplitude-erasing DenseNet backbone discards absolute
+> scale internally and can only access the cue through the external global-
+> mean RMS denominator, which couples all sensors' scales. An iTransformer
+> with a per-sensor Linear tokeniser preserves absolute amplitude into the
+> token magnitude directly and does not need the external coupling. A four-
+> way normalisation ablation on DenseNet C+fh+sb (mean, median, none,
+> median+MIL) shows mean strictly dominating every alternative across fault
+> ratios — a ≈3–5 F1-point gap at K=1, n_faulted=52 on the bias-family
+> faults that most strongly perturb the mean. The same ablation on
+> iTransformer C+fh+sb (mean vs none) shows the gap vanishing: Δ ∈ [−0.005,
+> +0.005] across the entire fault-ratio × K sweep, with no-norm actually
+> winning at the K=2 extreme-fault corner. The lesson generalises: a pre-
+> processing step is only load-bearing end-to-end if it carries information
+> the downstream model cannot otherwise recover from its inputs.
+
+## 31. The ASCE 4-story impact-hammer benchmark has a fundamental 4-fold damage-identifiability ceiling from symmetric mass × symmetric sensor layout × symmetric excitation
+
+**Domain rationale**
+The ASCE benchmark (Case 1, 12-DOF rigid-floor, symmetric mass) instruments each floor with 4 accelerometers at the mid-edges of a 2-bay × 2-bay plan (nodes 2, 4, 6, 8 — two x-axis sensors, two y-axis sensors per floor), and excites the roof with a diagonal half-sine impulse of equal x and y components applied at the roof centre. Under rigid-floor + symmetric mass, each story contributes 8 diagonal braces arranged around the floor perimeter, split 4-axis-x × 4-axis-y. The floor-level observable from the sensors is rigid-body translation (x, y) plus rotation — but with the dominant excitation mode being translation of a symmetric mass, the rotational component is weakly excited. The four corner braces on a given (story, axis) all enter the story-stiffness matrix identically, so any single-sample damage at any of those four corners produces an essentially identical free-decay response at the four mid-edge sensors.
+
+**Empirical evidence** (B plain-regression head, K=1 scenarios on ASCE test set):
+- For every true damaged brace `l`, the three braces that co-activate at rate 0.25 each are exactly the three other corners in the same (story, axis) 4-group: brace 0 → {1, 4, 5}; brace 2 → {3, 6, 7}; brace 8 → {9, 12, 13}; … (two 4-groups per story × 4 stories = 8 equivalence classes, each of size 4).
+- Per-sample `max(pred)` at true-positive locations is *lower* than `max(pred)` at true-negative locations (0.147 vs 0.176) — the model ranks a peer brace above the true one on average, because the label is arbitrary within the 4-group.
+- v1 softmax entropy on K=1 ≈ 1.56, very close to log(4) = 1.386 — the mass is split roughly evenly across exactly 4 locations. Raising the `ratio_alpha` threshold from 0.1 to 0.5 does not change `mean_k_pred` (≈ 4.0) or recall (1.0) — the four softmax values inside a 4-group are almost equal, so no fractional threshold can break them apart.
+
+**Refinement — the equivalence is strict 2-fold, approximate 4-fold.**
+Pairwise L2 distance between mean K=1 free-decay responses (30 samples/brace) within story 1:
+
+```
+       b0     b1     b2     b3     b4     b5     b6     b7
+b0   0.000  0.396  6.214  6.427  2.242  2.178  6.951  6.412
+b1   0.396  0.000  6.204  6.420  2.212  2.082  6.951  6.406
+b4   2.242  2.212  6.267  6.472  0.000  0.677  7.200  6.657
+b5   2.178  2.082  5.947  6.163  0.677  0.000  6.905  6.340
+```
+Within-class per-sample spread ≈ 2.0–3.2; ‖K=0 mean − K=1(b0) mean‖ = 4.44.
+
+Two nested equivalence scales coexist:
+- **Strict 2-fold (pair equivalence):** d(b0,b1)=0.40, d(b2,b3)=0.40, d(b4,b5)=0.68, d(b6,b7)=0.86 — all far below within-class noise. Each pair is one class from the sensor data. Four pairs/story × 4 stories = 16 strictly-resolvable classes out of 32 brace labels.
+- **Approximate 4-fold (group equivalence):** d(b0,b4)=2.24 ≈ within-class spread 2.8 — borderline resolvable. {0,1}∪{4,5} and {2,3}∪{6,7} cluster at the edge of noise; statistically distinguishable in principle but swamped for any single sample.
+- **Cross-4-group distances** (b0↔b6, b2↔b4, etc.) ≈ 6–7 — comfortably separable.
+
+**Identifiability ceiling (closed form)**
+For any head whose output at the 4-group is approximately uniform, K=1 scoring gives:
+- recall ≈ K / |group| = 1/4 ≈ 0.25 if only one brace is called; or 4/4 = 1.0 if all four are called, at precision 1/4 = 0.25
+- max achievable single-damage F1 ≈ 0.4 from either corner of this trade-off (weaker 4-fold reading) or ≈ 0.67 (P=1/2, R=1 under strict pair ceiling)
+- observed ASCE K=1 F1 across B/v1/C/C+fh/C+fh+sb is 0.38–0.42 — models saturate at the weaker 4-fold ceiling, not the tighter 2-fold ceiling. Training curves confirm the plateau is geometric, not optimisation: val top-K recall hits 0.308 at epoch 20 of 200 for C+fh+sb and stays flat to epoch 200; B's best checkpoint is epoch 10 of 200.
+
+This is not a training, calibration, or architecture defect — it is a modal observability limit imposed by the dataset geometry. There is some headroom between the achieved 4-fold ceiling and the tighter 2-fold ceiling (F1 0.4 → 0.67) that richer heads or pair-aware losses could in principle claim, but the 2-fold floor is hard: the pair-equivalent braces are indistinguishable from the 16-channel free-decay data.
+
+**ML implication**
+- Damage identification benchmarks that pair symmetric structure × symmetric sensors × symmetric excitation will under-measure the capability of any model, because the labels they use to score predictions are not recoverable from the inputs they supply. The comparison between heads on such a benchmark measures "which head handles the identifiability ceiling most gracefully", not "which head localises best".
+- A sharper ASCE protocol for SDI comparisons would either (a) break symmetry — asymmetric excitation (single-corner hammer) or asymmetric sensor placement, (b) relabel to the 4-group level (reducing the 32-brace task to an 8-class story-axis problem where the ceiling lifts), or (c) accept the ceiling and treat top-K recall with K=true_damaged × 4 as the principal metric. Concrete recipe for option (a) in `data/asce_hammer/README.md` "Regenerating a symmetry-broken variant" section — apply the impulse at a roof corner (node 7) instead of the roof centre, generating a DOF-12 torque component that distinguishes the four corners per (story, axis).
+- For the current fault-robust experiment, ASCE's role shifts from "another lab-style SDI benchmark" to "a symmetric-observability stress test": how does each head's fault-robustness generalise when the clean-data ceiling is geometry-limited rather than architecture-limited? The answer is meaningful even with a low absolute F1 — a head that loses little under faults on ASCE is robust in a structurally different regime than Qatar (high-L lab) or LUMO (low-L field).
+
+**Where in paper**
+Appendix / dataset-characterisation subsection for ASCE. Critical to include, since otherwise a reader would read ASCE F1 ≈ 0.40 as a model failure rather than a dataset ceiling. The 4-way softmax entropy check + the 4-group co-activation table from the B model are the two readable pieces of evidence.
+
+**Quote-ready**
+> The ASCE 4-story benchmark's symmetric mass distribution, 4-sensor-per-floor
+> mid-edge layout, and diagonal roof-centre impulse jointly produce an
+> eight-class story-axis equivalence partition of its 32 brace labels.
+> Under Case 1's rigid-floor + symmetric-mass assumption, the four corner
+> braces on a given (story, axis) contribute identically to the story
+> stiffness matrix, and the mid-edge sensors resolve only floor translation —
+> not the rotational component that would distinguish corners. A plain
+> per-location regression head trained on this dataset co-activates each
+> true-damaged brace with its three same-group peers at a uniform ~0.25
+> rate, and a softmax head at K=1 places its entire probability mass on
+> those four locations with entropy ≈ log 4. Single-damage F1 is therefore
+> geometry-capped near 0.4 regardless of architecture — a dataset-level
+> modal-observability ceiling, not a model-capacity limit. We report this
+> ceiling as a first-class property of the benchmark and treat within-ceiling
+> relative performance as the meaningful comparison axis.
+
+---
+
+## 32. DETR's `no_obj_weight=0.1` default is miscalibrated for SHM — the ∅ class is the majority outcome, not a rare one
+
+**Domain rationale**
+DETR's set-loss default down-weights the ∅ (no-object) class by 0.1 because in image detection there are typically ~100 slot queries and ~5 actual objects per image — ∅ slots outnumber foreground ~20:1, so without down-weighting the ∅ gradient would drown out the foreground signal. In structural damage identification the query budget is small (K_max=5 slots) and the foreground count is low (K_true ∈ {0, 1, 2}), so ∅ is still the *majority* slot outcome but only by a factor of 2–3×. Furthermore, K=0 samples (structure is healthy — the *deployment* default condition) contribute an all-∅ assignment whose total gradient under `no_obj_weight=0.1` is 5 × 0.1 = 0.5 per sample vs 1.4 for a K=1 sample and 2.3 for a K=2 sample — the model sees K=0 samples as 3× *weaker* training signal than damaged samples.
+
+On 7story-fault-k0 with 200 undamaged samples in a 40k-sample training set (~0.5%), this under-supervision makes the ∅ class practically invisible. The trained slot head fires spuriously on ~50% of held-out healthy monitoring windows (`sample_far = 0.500` at clean). Raising `no_obj_weight` to 0.5 roughly rebalances the effective gradient contribution, and K=0 sample_far drops to 0.022 grand (0.000 clean, 0.062 at 80% sensor faults). The damaged-task F1 *also* improves (grand +0.044) because sharper ∅ confidence reduces spurious extra-slot firings on K=1 and K=2 samples — precision on damaged samples goes from 0.85 to 0.93 with no recall regression.
+
+**ML implication**
+The DETR set-loss hyperparameter set was calibrated to an image-detection regime (K_max ≫ K_true, large datasets with balanced K distributions). In specialised domains with different query/target ratios and *heavily skewed* K distributions (including common K=0 cases that the original DETR never encountered for image classification), the `no_obj_weight` default must be re-tuned. For SHM with K_max=5 and K ∈ {0, 1, 2}, `no_obj_weight=0.5` — five times DETR's default — is the correct scale. Under this adjustment, a slot-based head matches the single-argmax (softmax) head's precision on K=1 (0.93 vs 0.94), resolves the K=0 FAR problem that slot-based models were previously presumed unable to handle without architectural additions, and retains the K=2 advantage (+0.24 F1 grand vs softmax). No architectural change required.
+
+**Where in paper**
+Loss-design section / ablation study. This is the biggest single-hyperparameter lever across our tuning experiments and deserves its own subsection.
+
+**Quote-ready**
+> The default `no_obj_weight=0.1` in DETR-style set criteria is calibrated for
+> image object detection, where ∅ slots outnumber foreground slots ~20:1. In
+> structural damage identification with K_max=5 slots and K ∈ {0, 1, 2}, ∅
+> remains the majority outcome but only by a factor of 2–3×, and K=0 healthy
+> samples — the deployment-default condition — under-weight the ∅ gradient
+> by 3× relative to damaged samples. We raise `no_obj_weight` to 0.5 and find
+> that it simultaneously reduces the healthy-sample false-alarm rate from
+> 50% to 2% and improves damaged-task F1 by 0.044, with no recall regression.
+> The slot-based head then matches the single-argmax baseline's K=1 precision
+> while retaining a +0.24 F1 advantage on K=2 multi-damage detection.
+
+---
+
+## 33. Auxiliary per-sensor heads competing with main-task supervision through a shared encoder hurts main-task performance — place the aux head before the encoder
+
+**Domain rationale**
+The sensor fault head (per-sensor binary "is this sensor broken?") and the damage slot head (cross-sensor pattern "which structural location is damaged?") operate at different physical scales. Fault detection is a per-sensor question — it benefits from isolated per-sensor features. Damage localisation is a cross-sensor pattern-matching question — it benefits from features that aggregate across sensors. Placing both heads downstream of a shared encoder (the iT self-attention stack) forces the encoder to serve both objectives simultaneously: gradients from the fault BCE loss push the encoder toward features that distinguish faulted from clean sensors, competing with damage-localisation gradients that push it toward features that express cross-sensor damage patterns. This competition uses encoder capacity that would otherwise be dedicated to the main task.
+
+Moving the fault head *before* the encoder (reading raw per-sensor tokenizer output, with gradients flowing back only through the tokenizer) eliminates the competition. The encoder now has a single objective. On 7story-fault-k0 this is worth +0.04 damaged-task F1 grand and +0.03 K=1 F1 grand. The price is reduced fault-detection sensitivity (fault_f1 0.92 → 0.74) because pre-encoder features cannot exploit cross-sensor consistency cues that the post-encoder representation provides. For SHM deployment this is the right trade: fault detection is auxiliary (its role is to *not hurt* damage detection, not to succeed on its own), and a 0.74 fault F1 is still actionable for sensor-health reporting.
+
+**ML implication**
+Multi-head architectures with differing-scale objectives should not share feature pathways further than necessary. When one head operates at a fine granularity (per-element / per-sensor / per-pixel) and another at a coarse granularity (whole-sample / cross-element / set-level), the coarse head is best served by a dedicated deep path while the fine-grained head should tap the earliest stable representation. The standard pattern — "stack many heads on the encoder output and let them all compete for capacity" — is an assumption that fails when the heads have meaningfully different feature-scale requirements.
+
+**Where in paper**
+Architecture-ablation subsection. The pre-encoder-fault-head change is the second-largest tuning lever after `no_obj_weight=0.5` and together they define the proposed configuration.
+
+**Quote-ready**
+> Placing the per-sensor fault-detection head downstream of the cross-sensor
+> encoder forces the encoder to allocate capacity to both objectives
+> simultaneously, producing a gradient-path competition between per-sensor
+> fault supervision and cross-sensor damage supervision. Moving the fault
+> head *before* the encoder — reading raw per-sensor tokenizer output —
+> releases the encoder to serve damage localisation exclusively and
+> improves damaged-task F1 by 0.04 grand. Fault-detection sensitivity falls
+> from 0.92 to 0.74 because the pre-encoder representation cannot exploit
+> cross-sensor consistency cues, but this is the correct trade-off in a
+> structural monitoring deployment where damage identification is the
+> primary objective.
+
+---
+
+## 34. The "softmax-is-architecturally-best-at-K=1" intuition is a half-truth — slot heads with properly supervised ∅ class match softmax precision without inheriting softmax's K=1 cap
+
+**Domain rationale**
+Before this work, the standard framing of set-prediction vs softmax heads on SHM was: softmax heads (v1) win single-damage identification (K=1) because their normalised output naturally produces a single argmax prediction with bounded false-positive rate; set-prediction heads (C) win multi-damage (K≥2) because they can emit multiple slot predictions; but C cannot match softmax's K=1 precision because its slots may fire spuriously. This framed softmax as structurally optimal for K=1, making iT+C a "multi-damage specialist" rather than a universal winner.
+
+The finding: this framing held *only* because slot heads had been trained with under-supervised ∅ class (`no_obj_weight=0.1`). Under that regime, slot predictions at K=1 had ~0.85 precision vs softmax's ~0.94 — a 0.09 gap that looked like an architectural ceiling. Once ∅ is properly supervised (nw=0.5), slot head precision reaches 0.93 — essentially tied with softmax (0.94) — and K=1 F1 grand hits 0.967 vs softmax's 0.962 (within noise). The slot head now *absorbs* softmax's K=1 strength without inheriting softmax's K=2 architectural cap (K=2 F1 0.886 vs softmax's 0.646). The "softmax is structurally better at K=1" claim was really "softmax trains its implicit ∅ behaviour automatically (via normalisation), slot heads need explicit ∅ supervision to match it."
+
+**ML implication**
+Apparent "architectural" advantages of one head over another should be tested under matched loss-calibration conditions before being attributed to architecture. A proper ablation of set-prediction vs single-argmax heads must include a sweep of the ∅-class weight — otherwise the comparison is between "a slot head starved for ∅ gradient" and "a softmax head whose ∅ behaviour is built into its output normalisation." The slot head is not inherently worse at K=1; it was under-supervised at K=1 under the default loss configuration.
+
+**Where in paper**
+Discussion / architectural comparison. This finding reframes the headline — the proposal is no longer "accept the K=1 cost to gain K=2" but "the slot head wins uniformly, we just had to tune the ∅ weight."
+
+**Quote-ready**
+> Under the standard DETR loss calibration (`no_obj_weight=0.1`), slot-based
+> heads underperform single-argmax heads on single-damage identification by
+> approximately 0.08 F1. This gap has previously been attributed to an
+> architectural disadvantage of set prediction at K=1. We show it is instead
+> a loss-calibration artefact: the slot head receives insufficient ∅-class
+> gradient to sharpen its foreground-vs-background decision boundary. Under
+> task-appropriate `no_obj_weight=0.5`, the slot head's K=1 precision
+> matches the softmax head's (0.93 vs 0.94) and K=1 F1 is statistically
+> indistinguishable (0.967 vs 0.962). The slot head retains its structural
+> advantage on multi-damage (+0.24 K=2 F1 grand) with no K=1 cost.
+
+---
+
+## 35. Drop-in tokenizer replacements that aggressively compress the time dimension require more training capacity than the rest of the pipeline was tuned for
+
+**Domain rationale**
+The legacy iT+C encoder tokenizes each sensor's T=500 time series with a single `Linear(T, D)` layer — a learned linear combination that preserves any feature expressible as a weighted sum of time samples. A multi-scale dilated-conv tokenizer (stride=4, AAP(1), 4 dilation branches) was tested as a "richer" alternative: more principled multi-scale receptive fields, fewer parameters in the tokenizer proper. But it compresses T=500 → 125 → 1 before entering the iT encoder, leaving the encoder with only 4 scalar features per sensor per branch (i.e. 4 scalars per sensor total, up to a learned projection). On 7story-fault-k0, this tokenizer combined with the downstream 4-layer iT encoder and 2-layer decoder fails to converge at the 200-epoch budget used for linear-tokenizer runs: both msc+post-fh and msc+pre-fh at decoder-depth 2 plateau near val_top_k_recall=0.55–0.76 while linear variants reach 0.95+. Extending the decoder to 4 layers (msc+pre-fh, dec=4) partially recovers — val 0.85, test K=1 F1 0.85, K=2 F1 0.80 — but still strictly below the linear-tokenizer baseline's 0.95 / 0.89.
+
+This is not an indictment of multi-scale convolution as a tokenizer — it is a training-budget mismatch. The msc tokenizer with AAP-to-1 discards the T' sequence that would give the downstream iT something to attend over; under that constraint the model has to learn damage patterns from 4 per-sensor scalars and needs much more optimisation to do so.
+
+**ML implication**
+Drop-in tokenizer replacements in a pipeline tuned for one tokenizer (hyperparameters, epoch budget, learning rate, decoder depth) are not actually drop-in. A tokenizer that changes the *shape* of what enters the encoder (scalar-per-sensor vs vector-per-sensor-time, full resolution vs compressed) changes the optimisation landscape enough to require its own tuning pass. Our msc variant should either (a) preserve the time sequence (stride=1, no AAP collapse, feed `(B, S, T', D)` into the encoder so the encoder has something to attend over in time), or (b) inherit a different training budget (more epochs, deeper decoder, LR warm-up) — both are non-trivial changes. We defer the redesign to future work and use the linear tokenizer as the proposal's backbone.
+
+**Where in paper**
+Ablation-study subsection on tokenizer choice. Report as a negative result — "we tried multi-scale convolution, it did not pay off under the shared training budget, here's why we believe this is a training-budget mismatch rather than an architectural inferiority."
+
+**Quote-ready**
+> Replacing the Linear(T, D) tokenizer with a multi-scale dilated convolution
+> (stride=4, global pooling, 4 dilation branches) failed to converge under
+> the 200-epoch training budget used for the linear-tokenizer baselines.
+> The compressed representation (4 scalars per sensor after pooling) leaves
+> the downstream iT encoder with no time-resolution information to attend
+> over, and recovering damage patterns from this compressed representation
+> requires either deeper decoder capacity (partially verified: decoder
+> depth 4 recovers val top-K recall from 0.55 to 0.85 but still trails the
+> linear baseline's 0.95) or a substantially longer training budget. We
+> treat this as a training-budget mismatch, not an architectural inferiority,
+> and retain the linear tokenizer as the proposal backbone. A redesign that
+> preserves the time sequence rather than pooling to a scalar is deferred
+> to future work.

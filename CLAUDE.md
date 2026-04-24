@@ -10,11 +10,15 @@ CUDA_VISIBLE_DEVICES=0 LD_PRELOAD=/tmp/nvml_stub.so python train.py ...
 
 ## Architecture reference
 
-See **`MODEL_ARCHITECTURE.md`** for annotated diagrams of the v1, DR, and C heads — input/output shapes, sensor independence, importance weighting, and softmax clarification. (B shares DR's architecture with mean-pooling replacing learned attention.)
+See **`docs/MODEL_ARCHITECTURE.md`** for annotated diagrams of the v1, DR, and C heads — input/output shapes, sensor independence, importance weighting, and softmax clarification. (B shares DR's architecture with mean-pooling replacing learned attention.)
 
 ## Research framing
 
-See **`RESEARCH.md`** for the evolving research problem statement, central thesis, dataset roles, and open questions. Update it as the research discussion develops.
+See **`docs/RESEARCH.md`** for the evolving research problem statement, central thesis, dataset roles, and open questions. Update it as the research discussion develops.
+
+Domain-ML insights accumulated across the project are in **`docs/DOMAIN_INSIGHTS.md`** — append new ones as the research develops.
+
+Deferred architectural work items for the iT+C proposal are in **`docs/future_plans.md`** (F1 sample-level gate — superseded by `no_obj_weight=0.5`, kept as fallback; F2 deep supervision; F3 R_bias freeze+drift logging; F4 anchor queries; F5 multi-scale conv tokenizer redesign preserving time sequence). Consult before proposing new architectural work.
 
 ## What this repo is
 
@@ -25,7 +29,7 @@ Structural Damage Identification (SHM) neural network. Sensor accelerometer data
 - **Approach DR** (`MidnDR`): per-location regression with MIL sensor attention
 - **Baseline B** (`PlainDR`): plain per-location regression (mean-pool over sensors, no learned attention) — isolates MIL contribution
 
-Current development focus: **fault-robust SDI across the sim→lab→field trio** — evaluating all model heads (v1, C, DR, B) plus C-head variants (C+fh with fault detection head, C+fh+sb with structural affinity bias in cross-attention routing) under controlled sensor fault injection. The structural affinity bias (`R_bias`) injects the known sensor layout as a routing prior in attention logit space, guiding each damage slot to attend toward sensors near its predicted location without modifying sensor feature embeddings. A spatial self-attention approach (`SensorSpatialLayer`) was tried and abandoned — it contaminated clean sensor representations (see Domain Insight 21).
+Current development focus: **fault-robust SDI on 7story-fault-k0 (single + double + undamaged on `unc=0` and `unc=1`)**, with the proposed configuration being iT+C+fh+sb with **pre-encoder fault head** (`--fault-head-location encoder`) and **`no_obj_weight=0.5`** (up from DETR default 0.1). Auto-label: `c-nm-it4-pfh-sb-nw5`. This config wins K=0 sample-FAR (0.022 grand vs B's 0.167, v1's 0.507), wins K=2 F1 (0.886 grand, +0.24 over v1's 0.646), and ties v1 on K=1 F1 (0.967 vs 0.962). The two tuning changes compose cleanly: nw=0.5 fixes the K=0 false-alarm problem by giving the ∅ class adequate gradient (Insight 32); pre-encoder fault head releases encoder capacity from gradient-path competition with damage supervision (Insight 33). Abandoned / deferred: structural affinity bias (`R_bias`) is retained from the legacy baseline but not the star; spatial self-attention (`SensorSpatialLayer`, Insight 21) remained off; multi-scale conv tokenizer failed to converge at 200 epochs under our training budget and is deferred (Insight 35, `docs/future_plans.md` F5).
 
 ## Collaboration workflow
 
@@ -89,7 +93,7 @@ All datasets share a two-stage preprocessing pipeline implemented via `scipy.sig
 
 1. **FIR anti-alias decimation** — low-pass FIR filter at the new Nyquist frequency, then downsample. Removes high-frequency content that would otherwise alias into the structural response band (<50 Hz). Zero-phase (forward+backward) to avoid inter-channel temporal misalignment. Factor varies by dataset raw Fs.
 
-2. **Global RMS normalization** — divide all sensors by the scalar RMS computed across all sensors and time steps jointly (`ref_channel=None`). Preserves cross-sensor amplitude ratios (the damage signature) while providing excitation-amplitude invariance. Global (all-sensor) reference chosen over single-sensor reference for fault robustness: a faulted reference sensor would corrupt all channels, whereas global RMS degrades gracefully (~1/S perturbation per faulted sensor).
+2. **Global RMS normalization** — divide all sensors by the scalar RMS computed across all sensors and time steps jointly (`ref_channel=None`). Preserves cross-sensor amplitude ratios (the damage signature) while providing excitation-amplitude invariance. Global (all-sensor) reference chosen over single-sensor reference for fault robustness: a faulted reference sensor would corrupt all channels, whereas global RMS degrades gracefully (~1/S perturbation per faulted sensor). **CLI default is `none`** for both `train.py` and `evaluate_fault.py`. v1 and B match their original-paper preprocessing under the default (softmax and mean-pool heads absorb amplitude variation internally; removing the shared RMS denominator also eliminates a small fault-contamination path for B at extreme fault ratios). **C-variants (DenseNet backbone) must pass `--norm-method mean` explicitly** — the fault-aware head (`fh`+`sb`) exploits mean-RMS as an end-to-end fault-contrast cue and any alternative (none, final-LN) strictly regresses. For the iTransformer backbone (`--encoder-type itransformer`), norm choice is approximately neutral (Δ within ±0.005 at every fault cell) because the per-sensor Linear tokeniser preserves amplitude and learns the same fault contrast end-to-end. See Insight 30 for the backbone-dependent scope. The `median` option was removed from the codebase after the DenseNet norm-ablation showed it regressed at every cell.
 
 | Dataset | Raw Fs | Decimation | Effective Fs | Nyquist | T | RMS ref |
 |---------|--------|-----------|-------------|---------|---|---------|
@@ -161,6 +165,37 @@ All datasets share a two-stage preprocessing pipeline implemented via `scipy.sig
 - Final eval after training: test split(s) + real benchmark (7-story only) + double-damage test (Qatar only)
 
 `<run_name>` = `<dataset>` by default, or `<dataset>-<tag>` when `--tag` is used (e.g. `qatar-fault`).
+
+### C-head checkpoint naming (head-to-toe)
+
+Auto-label for any C-head (`--model c`) run without an explicit `--label`, walking the data path in order:
+
+```
+c-<norm>[-<tokenizer>]-<encoder><depth>[-<posemb>][-<faulthead>][-<bias>][-s<K>d<D>][-<readout>]
+```
+
+| stage | always shown | non-default markers |
+|-------|---|---|
+| `<norm>` | yes | `nm` (mean) / `nn` (none) |
+| `<tokenizer>` | no — omit for linear | `msc` (multi-scale conv, Phase B1) |
+| `<encoder><depth>` | yes | `it<D>` (iTransformer + depth) or `dn` (DenseNet) |
+| `<posemb>` | no — omit for `learned` | `pen` (none), `per` (rope) |
+| `<faulthead>` | no — omit if disabled | `fh` (decoder-located, legacy) / `pfh` (pre-encoder, Phase B2) |
+| `<bias>` | no — omit if off | `sb` (structural affinity) |
+| `s<K>` | no — omit if default (5) | e.g. `s3` |
+| `d<D>` | no — omit if default (2) | e.g. `d4` (decoder depth, not to be confused with `it<D>` encoder depth) |
+| `nw<X>` | no — omit if default (0.1) | e.g. `nw5` (no_obj_weight=0.5), `nw3` (=0.3). `X = int(value × 10)` |
+| `<readout>` | no — omit if direct | `mil` |
+
+Examples:
+- `c-nm-it2-fh-sb` = iT+C d=2 baseline (mean norm, linear tokenizer, learned PE, decoder fault head, structural bias).
+- `c-nm-it4-fh-sb` = iT+C d=4.
+- `c-nn-it2-fh-sb` = iT+C d=2 with no-norm (no-norm ablation).
+- `c-nm-it2-per-fh-sb` = iT+C d=2 with rope PE.
+- `c-nm-msc-it4-pfh-sb` = **Phase B full**: multi-scale conv tokenizer + pre-encoder fault head at d=4.
+- `c-nm-dn-fh-sb` = DenseNet C+fh+sb.
+
+Existing checkpoints keep their legacy names (`c-fh-sb-it-d4`, `c-fh-sb`, etc.) — renaming would break references in saved eval CSVs. The new scheme applies only to runs going forward.
 
 ## Optimizer / scheduler
 
@@ -271,16 +306,165 @@ This is hardcoded — `--held-out-double` and `--split-double` flags have been r
 - `states/qatar-dd-split/` — Qatar v1, C, DR trained with first½ of all 5 double-damage recordings
 - `states/qatar-fault/` — B, v1, C, C+fh, C+fh+sb with fault aug (200 epochs) — **stale: trained on single-damage only + old optimizer; needs retraining with double-damage default + CosineAnnealingLR for C-variants**
 - `states/7story/` — **empty, needs retraining** (old checkpoints trained on broken FIR-decimated zero-padded data, deleted)
-- `states/7story-fault/` — **empty, needs retraining** (same)
+- `states/tmp/7story-fault/` — B, v1, C, C+fh, C+sb, C+fh+sb with fault aug (200 epochs, K=0-naive); eval: `saved_results/tmp/7story-fault/eval_fault_{b,v1,c,c-fh,c-sb,c-fh-sb}.{json,csv}`. C+fh+sb wins on K=2 across all fault levels; v1 still wins K=1 under faults. fh+sb shows synergistic interaction (Insight 28). Superseded by the K=0-aware `states/7story-fault-k0/` cohort for the current proposal; retained under `tmp/` for historical comparison.
+- **Deleted checkpoint cohorts** (numerical evidence preserved in `saved_results/` CSVs/JSONs; all were dead-end configurations):
+  - `7story-fault-ablate{50,200}` — ABC ablation (fault-gate, freeze-rbias+layer0, aux-loss); all three regressed vs base at both budgets. Insight 27.
+  - `7story-fault-sweep50` — Round-1 10-variant 50-epoch HP sweep. Winner: n20 (no-obj-weight 0.2).
+  - `7story-fault-sweep100` — Round-2 5-variant 100-epoch HP sweep + cross-ckpt comparison that motivated removing EMA (see `saved_results/tmp/7story-fault-sweep100/cross_checkpoint_comparison.md`). Winner: s3 (num_slots=3).
+  - `7story-fault-n20-200ep`, `7story-fault-s3-200ep` — 200-ep confirmations of both sweep winners. Both null (s3 stronger: K1_nf52 −0.029, K2_nf52 −0.032). n=2 confirmation for Insight 29.
+  - `7story-fault-norm-{median,none,median-mil}` — norm ablation on c-fh-sb (200 epochs each). Mean RMS strictly dominates median and no-norm at every cell; median+MIL collapses at high nf. Insight 30. Eval CSVs under `saved_results/tmp/7story-fault-norm-{median,none,median-mil}/`.
 - `states/lumo/` — baseline LUMO models (v1, C, DR; 18 accel sensors; single-damage binary labels); eval: `saved_results/lumo/eval_20260410_021906.{json,csv}`
 - `states/lumo-fault/` — B, v1 trained with fault aug (200 epochs, valid); C, C+fh, C+fh+sb **stale: need retraining with pos_weight removed + CosineAnnealingLR**; eval: `saved_results/lumo-fault/eval_fault_{b,v1,c,c-fh}.{json,csv}`
 - `states/lumo-lumo-nobj05/` — exploratory: LUMO C-head with `--no-obj-weight 0.05`
 - `states/lumo-lumo-slots2/` — exploratory: LUMO C-head with `--num-slots 2`
 - `states/tower/` — tower models
+- `states/asce-fault/` — impact-hammer B, v1, C, C+fh, C+fh+sb trained with fault aug (200 epochs each). **Geometry-capped**: ASCE's 4-sensor-per-floor mid-edge layout × symmetric-mass rigid-floor × diagonal-centre impulse produces a 4-fold identifiability equivalence on brace labels (8 4-groups across story × axis). All heads observe this ceiling — B/v1 K=1 F1 ≈ 0.35, recall = 1.0, precision ≈ 0.25, mean_k_pred ≈ 4. See Insight 31. Relative-comparison metric only; absolute F1 is not comparable to 7-story/Qatar/LUMO.
+- `states/tmp/7story-fault-itransformer/` — C+fh+sb with iTransformer encoder replacing DenseNet (200 epochs fp32; fp16 diverges at ep 88). Matches DenseNet within 0.005 at every fault cell for nf ≤ 32; fault-detection F1 slightly higher. Eval: `saved_results/tmp/7story-fault-itransformer/eval_fault_c-fh-sb-it.{json,csv}`. Real-benchmark test is skipped (9-sensor .mat vs 65-sensor iT tokeniser — architectural mismatch). Superseded by the K=0-aware cohort; retained under `tmp/` for history.
 
 ## Experiment results (7-story frame)
 
-Stale — preprocessing changed (reverted FIR decimation on zero-padded data, added RMS normalization). Needs retraining and re-evaluation.
+Baseline retraining after preprocessing fix pending. Fault-robust results below are current.
+
+### Fault-aware K=0-naive (HISTORICAL — `states/tmp/7story-fault/`, 200 epochs, `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`)
+
+Eval: `saved_results/tmp/7story-fault/eval_fault_{v1,b,c,c-fh,c-sb,c-fh-sb}.{json,csv}`. Fault-ratio sweep `{0.0, 0.2, 0.5, 0.8}` → nf={0, 13, 32, 52} on a 65-sensor layout, 3 repeats per condition, mean F1 across 7 fault types. Training used `--subsets single double` (no undamaged). Superseded by the K=0-aware cohort in `states/7story-fault-k0/`.
+
+**Single-damage (K=1):**
+
+| Model     | clean | nf=13 | nf=32 | nf=52 | fault_F1@32 |
+|-----------|-------|-------|-------|-------|-------------|
+| v1        | **0.974** | **0.972** | **0.966** | **0.941** | —       |
+| B         | 0.923 | 0.920 | 0.879 | 0.463 | —       |
+| C         | 0.927 | 0.922 | 0.911 | 0.849 | —       |
+| C+fh      | 0.920 | 0.918 | 0.909 | 0.855 | 0.978   |
+| C+sb      | 0.916 | 0.910 | 0.898 | 0.828 | —       |
+| C+fh+sb   | 0.939 | 0.935 | 0.926 | 0.872 | 0.977   |
+
+**Double-damage (K=2):**
+
+| Model     | clean | nf=13 | nf=32 | nf=52 |
+|-----------|-------|-------|-------|-------|
+| v1        | 0.648 | 0.650 | 0.649 | 0.646 |
+| B         | 0.846 | 0.849 | 0.834 | 0.531 |
+| C         | 0.864 | 0.861 | 0.852 | 0.806 |
+| C+fh      | 0.859 | 0.856 | 0.848 | 0.801 |
+| C+sb      | 0.854 | 0.849 | 0.838 | 0.782 |
+| C+fh+sb   | **0.873** | **0.869** | **0.862** | **0.817** |
+
+Key findings:
+- **v1 is the K=1 king under faults** (F1=0.941 at nf=52) — softmax-importance implicitly down-weights faulted sensors and there's no wrong-slot penalty at K=1. But v1 is architecturally capped at K=2 (single argmax → recall ≤ 0.5, F1 ≈ 0.65).
+- **C+fh+sb is the K=2 king across all fault ratios** (F1=0.817 at nf=52 vs v1's 0.646). This is the headline result for the C architecture on 7-story-fault — it retains multi-damage capability and is fault-robust.
+- **fh and sb are synergistic, not additive** (see Insight 28). Individually each is neutral-to-negative (fh alone +0.006, sb alone −0.021 at K=1 nf=52). Combined they gain +0.023 — ~3× the sum of individual effects, positive where neither is. Mechanism: fh encodes fault state in feature space; sb routes attention in logit space. Orthogonal injection spaces compose multiplicatively via soft cross-attention (≈ spatial_proximity × health). Putting both priors in the same space (as in the ABC ablation's fault-gate variant) breaks the synergy.
+- **B collapses at nf=52** (F1=0.463) — mean-pool has no mechanism to down-weight faulted sensors implicitly.
+
+### Normalization ablation on C+fh+sb (argmax decoder, 200 epochs each)
+
+Compares global-mean RMS (baseline), per-window-median RMS, no normalization, and median+MIL. Mean F1 across 7 fault types by nf.
+
+**K=1:**
+
+| method      | clean | nf=13 | nf=32 | nf=52 |
+|-------------|-------|-------|-------|-------|
+| mean (base) | **0.939** | **0.935** | **0.926** | **0.872** |
+| median      | 0.915 | 0.911 | 0.903 | 0.837 |
+| no norm     | 0.910 | 0.907 | 0.895 | 0.826 |
+| median+MIL  | 0.848 | 0.846 | 0.826 | 0.667 |
+
+**K=2:**
+
+| method      | clean | nf=13 | nf=32 | nf=52 |
+|-------------|-------|-------|-------|-------|
+| mean (base) | **0.873** | **0.869** | **0.862** | **0.817** |
+| median      | 0.857 | 0.854 | 0.843 | 0.787 |
+| no norm     | 0.854 | 0.850 | 0.839 | 0.783 |
+| median+MIL  | 0.812 | 0.806 | 0.784 | 0.666 |
+
+Mean RMS wins every cell. At K=1 nf=52, median loses to mean on all 7 fault types (largest gaps on bias-family: bias −0.049, gain_bias −0.043). Under fault-aware training the mean normalizer itself carries fault-contrast signal — a gain/bias-faulted sensor inflates the global RMS and suppresses clean channels, producing a pattern the fault head and slot cross-attention learn to exploit. Robust (median) and no-norm alternatives erase this cue. See Insight 30.
+
+### Encoder ablation — iTransformer replacing DenseNet backbone on C+fh+sb (200 epochs, fp32)
+
+`states/tmp/7story-fault-itransformer/c-fh-sb-it-<uuid>-best200.pt`. Eval: `saved_results/tmp/7story-fault-itransformer/eval_fault_c-fh-sb-it.{json,csv}`. Hungarian-matched DETR slot head + fault head + structural bias, identical to base C+fh+sb except the encoder is replaced by an iTransformer (per-sensor Linear(T, D) tokenisation + depth-2 Transformer self-attention across the sensor dimension).
+
+| Subset | Model              | clean | nf=13 | nf=32 | nf=52 | top_k_recall (clean) | fault_detect @ nf=32 |
+|--------|--------------------|-------|-------|-------|-------|---------------------|----------------------|
+| K=1    | C+fh+sb (DenseNet) | 0.939 | 0.935 | 0.926 | **0.872** | 0.98+               | 0.977                |
+| K=1    | C+fh+sb-iT         | **0.944** | **0.939** | **0.929** | 0.860 | **0.984**           | **0.984**            |
+| K=2    | C+fh+sb (DenseNet) | 0.873 | 0.869 | 0.862 | **0.817** | 0.88+               | 0.977                |
+| K=2    | C+fh+sb-iT         | **0.878** | **0.876** | **0.867** | 0.812 | 0.877               | **0.983**            |
+
+iTransformer matches DenseNet within 0.005 at every cell for nf ≤ 32 (slightly wins clean + moderate-fault on both K=1 and K=2), and trails by ~0.005–0.012 at the extreme nf=52 tail. Fault-detection F1 is strictly higher (+0.006–0.007) — per-sensor tokenisation directly exposes the per-sensor health classifier to sensor-level features. iTransformer **required fp32 training** — its self-attention across 65 sensors saturates fp16 exp() past ep 88 under fault-aware training and diverges catastrophically (val_top_k_recall 0.910 → 0.031 in one epoch). `train.py` auto-gates `--encoder-type itransformer` to fp32; DenseNet C remains on fp16 (no softmax over 65 elements, so no overflow path). The post-training real-benchmark step is skipped for iT because the 9-sensor real `.mat` cannot be fed to a model whose tokeniser is fixed at n_sensors=65.
+
+#### iTransformer sub-ablations (C+fh+sb-iT base, 200 epochs fp32 each)
+
+Mean F1 across 7 fault types at each nf cell. Baseline (d=2) = learned absolute pos-emb + global-mean RMS norm.
+
+| Variant                | K=1 clean | K=1 nf=13 | K=1 nf=32 | K=1 nf=52 | K=2 clean | K=2 nf=13 | K=2 nf=32 | K=2 nf=52 | fault_F1@32 |
+|------------------------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-------------|
+| baseline (d=2)         | 0.944     | 0.939     | 0.929     | 0.860     | 0.878     | 0.876     | 0.867     | 0.812     | **0.984**   |
+| **no-pe** (drop pos-emb) | **0.947** | **0.944** | **0.933** | **0.868** | 0.873     | 0.870     | 0.863     | 0.809     | 0.983       |
+| **no-norm** (drop RMS) | 0.940     | 0.938     | 0.929     | 0.862     | 0.878     | 0.875     | 0.867     | 0.817     | 0.983       |
+| **rope** (RoPE pos-emb) | **0.947** | **0.944** | 0.932     | 0.863     | 0.881     | 0.878     | 0.869     | 0.812     | 0.963       |
+| **d=4 deeper** (4 layers) | 0.941  | 0.937     | 0.926     | 0.855     | **0.884** | **0.882** | **0.873** | **0.818** | **0.984**   |
+
+Checkpoints: `states/tmp/7story-fault-it-{no-pe,no-norm,rope,d4}/`. Evals: `saved_results/tmp/7story-fault-it-{no-pe,no-norm,rope,d4}/eval_fault_*.{json,csv}`.
+
+Findings:
+- **All 4 variants within ±0.006 F1 of baseline at every cell** — the iT architecture is remarkably insensitive to PE choice, norm choice, and depth in the 2–4 range. Consistent with Insight 30 revised: amplitude-preserving tokenisers absorb the preprocessing choice, and sensor-dim attention over 65 tokens does not depend heavily on explicit position cues.
+- **d=4 wins K=2 across the board** (+0.006 clean/nf=13, +0.006 nf=52). Deeper sensor-attention helps multi-damage slot routing specifically; K=1 cost is −0.003 to −0.005. Best K=2 variant overall.
+- **no-pe wins K=1 marginally** (+0.003–0.008 across cells). Absolute learned position embeddings over an unordered 65-sensor set add small routing noise; removing them slightly tightens K=1 argmax without hurting K=2 much.
+- **no-norm ≈ baseline** (within 0.005 every cell, K=2 nf=52 actually +0.005). Directly contradicts DenseNet norm-ablation expectation (Insight 30): iT's Linear(T, D) tokeniser preserves per-sensor amplitude and learns the fault-contrast end-to-end, making preprocessing choice redundant.
+- **rope is neutral on F1 but costs fault_detect** (0.963 vs baseline 0.984). Relative-position bias applied to 65 physically-unordered sensor tokens doesn't match the 1D-sequence assumption RoPE was designed for; fault-head degrades the most because per-sensor health prediction loses the stable absolute-position signal.
+
+### Phase B + K=0 training + no_obj_weight=0.5 — current proposal headline (`states/7story-fault-k0/`)
+
+Adds three independent changes to the `C+fh+sb-iT d=4` baseline, evaluated on the **K=0-aware test set** (single + double + undamaged test splits; 30 held-out healthy samples from both `unc=0` and `unc=1`):
+
+1. **K=0 data inclusion in training**: undamaged subsets from `unc=0` and `unc=1` added to the default `--subsets single double undamaged` flow.
+2. **Phase B2**: fault head moved from MidnC (post-encoder) to iTransformerEncoder (pre-encoder, reading raw tokeniser output before cross-sensor self-attention). CLI: `--fault-head-location encoder`.
+3. **`no_obj_weight=0.5`**: up from DETR default 0.1. CLI: `--no-obj-weight 0.5`.
+
+Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3 --use-fault-head --use-structural-bias --encoder-type itransformer --encoder-num-layers 4 --norm-method mean --fault-head-location encoder --no-obj-weight 0.5` → auto-label `c-nm-it4-pfh-sb-nw5`.
+
+**K=0 healthy-sample FAR** (fraction of 30 held-out undamaged samples flagging ≥1 location; ↓ better):
+
+| model | nf=0 | nf=13 | nf=32 | nf=52 | grand |
+|---|---|---|---|---|---|
+| v1-k0 | 0.500 | 0.513 | 0.500 | 0.508 | 0.507 |
+| B-k0 | **0.000** | **0.000** | **0.000** | 0.524 | 0.167 |
+| iT+C K=0-aware (legacy, nw=0.1) | 0.500 | 0.500 | 0.494 | 0.483 | 0.492 |
+| B2 only (linear+pfh, nw=0.1) | 0.500 | 0.394 | 0.379 | 0.410 | 0.399 |
+| **B2 + nw=0.5 (PROPOSAL)** | **0.000** | **0.000** | **0.006** | **0.062** | **0.022** |
+
+**K=1 F1**:
+
+| model | nf=0 | nf=13 | nf=32 | nf=52 | grand |
+|---|---|---|---|---|---|
+| v1-k0 | 0.973 | 0.972 | 0.968 | **0.944** | 0.962 |
+| iT+C K=0-aware (legacy) | 0.920 | 0.915 | 0.901 | 0.830 | 0.884 |
+| B2 only (nw=0.1) | 0.953 | 0.950 | 0.942 | 0.865 | 0.921 |
+| **B2 + nw=0.5 (PROPOSAL)** | **0.983** | **0.982** | **0.979** | 0.938 | **0.967** |
+
+**K=2 F1**:
+
+| model | nf=0 | nf=13 | nf=32 | nf=52 | grand |
+|---|---|---|---|---|---|
+| v1-k0 | 0.647 | 0.648 | 0.649 | 0.643 | 0.646 |
+| B-k0 | 0.844 | 0.845 | 0.823 | 0.512 | 0.732 |
+| iT+C K=0-aware (legacy) | 0.858 | 0.855 | 0.844 | 0.786 | 0.829 |
+| B2 only (nw=0.1) | 0.890 | 0.887 | 0.878 | 0.823 | 0.864 |
+| **B2 + nw=0.5 (PROPOSAL)** | **0.906** | **0.905** | **0.899** | **0.852** | **0.886** |
+
+Key findings:
+- **B2+nw=0.5 wins on K=0 FAR, K=2 F1, and precision simultaneously; ties v1 on K=1** — the slot head no longer underperforms softmax on single-damage once the ∅ class is properly supervised. Reframes the "softmax is K=1 king by architecture" intuition (see Insight 34).
+- **K=0 FAR drops from 50% to ~0%** across fault levels. nw=0.5 provides the ∅-class gradient that K=0 inclusion alone (at nw=0.1) cannot deliver — 200 undamaged samples × 5 slots × 0.1 weight is too weak. See Insight 32.
+- **Moving the fault head pre-encoder improves damaged-task F1** (+0.04 grand) by ending gradient-path competition between damage and fault objectives on the shared encoder. Costs fault_detect F1 (0.92 → 0.74) — acceptable trade since damage detection is primary. See Insight 33.
+- **msc (multi-scale conv) tokenizer deferred**: all msc variants at dec=2 failed to converge in 200 epochs; dec=4 partially recovered (0.85 val top-K) but remained below the linear-tokenizer baseline. Training-budget mismatch rather than architectural inferiority — see Insight 35 and `docs/future_plans.md` F5. Linear tokenizer retained as the proposal backbone.
+- **Fault_detect F1 regression to ~0.77 (from ~0.92)** is the only trade-off. Caused by pre-encoder placement (no cross-sensor contamination cues for fault identification). In deployment, the fault head's role is to avoid corrupting damage detection — 0.77 is still actionable.
+
+Checkpoints in `states/7story-fault-k0/`:
+- Proposal: `c-nm-it4-pfh-sb-nw5-<uuid>-best180.pt`
+- Baselines also in this folder: `v1-<uuid>-best190.pt`, `b-<uuid>-best170.pt`, `c-fh-sb-it-<uuid>-best120.pt` (legacy K=0-aware iT+C), plus 4 Phase B ablations (B1, B2, B full, B full+dec=4) for the 2×2 tokenizer × fault-head-location grid.
+Evals: `saved_results/7story-fault-k0/eval_fault_*.{json,csv}`. The master `eval_fault_c-nm-it4-pfh-sb-nw5.{csv,json}` is the proposal reference.
 
 ## Experiment results (Qatar)
 
@@ -313,6 +497,26 @@ Key insight: DR with split-½ training matches C on double-damage (F1≈1.0). v1
 ### Fault-aware (`states/qatar-fault/`)
 Training: `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3`, 200 epochs. Models: B, v1, C, C+fh, C+fh+sb.
 Eval: `saved_results/qatar-fault/eval_fault_{b,v1,c,c-fh,c-fh-sb}.{json,csv}` — pending retraining and re-eval with consistent fault-ratio sweep.
+
+## Experiment results (ASCE — impact hammer, fault-aware)
+
+Geometry-capped absolute F1 (see Insight 31). All heads observe the same 4-fold identifiability ceiling from symmetric-mass × 4-mid-edge-sensors-per-floor × diagonal roof-centre impulse. Absolute F1 ≈ 0.40 at nf=0 is a dataset property, not a model property — use relative degradation as the metric. Fault-ratio sweep `{0.0, 0.2, 0.5, 0.8}` → nf={0,3,8,13} on 16-sensor layout, 3 repeats, mean F1 across 7 fault types (hard/gain/bias/gain_bias/noise/stuck/partial). `states/asce-fault/`. Eval: `saved_results/asce-fault/eval_fault_{b,v1,c,c-fh}.{json,csv}`.
+
+| Model    | clean  | nf=3   | nf=8   | nf=13  | top_k_recall (clean) | fault_detect F1 @ nf=8 |
+|----------|--------|--------|--------|--------|---------------------|------------------------|
+| B        | 0.423  | 0.421  | 0.392  | 0.326  | 0.337               | —                      |
+| v1       | 0.413  | 0.411  | 0.406  | 0.386  | 0.324               | —                      |
+| C        | 0.381  | 0.380  | 0.378  | 0.362  | 0.312               | —                      |
+| C+fh     | 0.381  | 0.381  | 0.379  | 0.367  | 0.309               | 0.990                  |
+| C+fh+sb  | 0.378  | 0.376  | 0.376  | 0.366  | 0.307               | **0.992**              |
+
+Key findings:
+- **4-group ceiling confirmed across all five heads** — clean top_k_recall ≈ 0.31–0.34 (≈ 1/4 expected from geometry), F1 ≈ 0.38–0.42. Architecture-independent.
+- **v1 is again K=1 king under faults**: degrades only 0.027 from clean to nf=13 vs B's 0.097. Consistent with 7-story / Qatar / LUMO pattern.
+- **B collapses under faults** (Δ=−0.097 at nf=13), just like on 7-story — mean-pool lacks fault-rejection machinery.
+- **Both C+fh and C+fh+sb achieve near-perfect fault detection on ASCE** (fault F1 = 0.990 and 0.992) — with only 16 sensors, per-sensor fault-presence classification is easy, beating even the 65-sensor 7-story case (~0.98).
+- **C-variants plateau around 0.37–0.38 with smallest fault-induced drop** (Δ ≈ −0.015 to −0.019 across C/C+fh/C+fh+sb at nf=13). The slot/matching machinery trades absolute F1 for robustness; within the observability ceiling they are essentially indistinguishable (Δ between C-variants < 0.01).
+- **Structural affinity bias (sb) does not help on ASCE** — the 4-corner ambiguity is about *which of 4 equally-coupled braces* is damaged, not *which of L locations is closest to a sensor*, so the affinity prior has no discriminative signal to inject. Consistent with Insight 28: sb requires a well-posed observability problem to add value.
 
 ## Experiment results (LUMO)
 
@@ -365,3 +569,11 @@ Key findings:
 - **C+fh rescues C** (0.845→0.935 clean, +0.092) — fault head provides strong regularization even on clean data.
 - **v1 most fault-robust** (mean 0.956), consistent with 7-story.
 - **Fault detection works on LUMO** — C+fh achieves fault F1≈0.65–0.70 at nf=6 (vs ≈0.0 on 7-story). Small S=18 makes per-sensor anomaly detection tractable.
+
+## Excitation paradigm: impact testing vs shaker-based monitoring
+
+The three benchmarks in the sim→lab→field trio (7-story, Qatar, LUMO) all use **deterministic or effectively repeated excitation** — forced shaker bursts, fixed-profile hammer impacts, or common ambient wind loading across scenarios. The time-domain response of a single window is itself a damage-discriminative signature: the impulse response rings out, modal content is in the envelope and decay, and a time-domain CNN can learn damage→response directly because the excitation pattern is shared across scenarios.
+
+The original ASCE benchmark pipeline used **per-scenario independent white-noise forcing** (one unique seed per .mat in `cal_resp.m`, so every scenario had a statistically identical but realization-unique force). Under that protocol, a single time-domain window from a monitoring session contains no scenario-specific modal content — only a stationary random sample from a process whose second-order statistics encode the damage. Modal information lives in PSDs / FRFs / transmissibilities, not in the raw time series. Feeding per-scenario-unique time series to a CNN then creates a memorization channel (time-pattern fingerprint → scenario index → label) that evaporates at val/test time.
+
+**Decision.** ASCE is being regenerated with impact-style forcing (single shared excitation profile across scenarios; damage state is the only inter-scenario variable) so it slots into the same time-domain CNN pipeline as 7-story. Results and checkpoints from the shaker-era run are discarded.

@@ -175,35 +175,39 @@ This gives engineers a two-panel output: (1) which joint is damaged, (2) which s
 
 For clean visualisation, the final cross-attention layer of the slot decoder should use a small number of heads (or single-head) so attention maps are directly readable without averaging artefacts.
 
-### Evaluation scope at this stage
+### Evaluation scope
 
-Focus on **single-damage (K=1)** detection under varying fault conditions. Multi-damage generalisation is a separate problem (addressed by the `--held-out-double` / `--split-double` LOO work). The fault-robustness evaluation should vary:
-- Fault type (hard vs. soft, random vs. structured)
-- Fault fraction (fraction of sensors affected)
-- Fault location (sensors near damage vs. far from damage — near-damage faults are the hardest case)
+Fault-robustness evaluation is **stratified by K=1 and K=2** subsets — both are reported in every CSV (see `subset` column in `saved_results/<dataset>-fault/eval_fault_*.csv`). 7-story and Qatar provide real double-damage test sets (split-½ on Qatar, native K=2 partition on 7-story); LUMO is K≤1 only.
+
+The sweep varies:
+- Fault type (7 types: hard, gain, bias, gain_bias, noise, stuck, partial)
+- Fault fraction (`{0, 0.2, 0.5, 0.8}` sensors affected, 3 random-sensor-selection repeats per cell)
+- Injection paradigm (per-sample on 7-story; per-recording on Qatar/LUMO to match physical deployment)
+
+Not currently varied: *fault location relative to damage* (near-damage vs far-damage sensors). This is a natural next ablation — near-damage faults should be the hardest case because the faulted sensor would otherwise carry the strongest evidence.
 
 ---
 
 ## Experimental Findings: Sensor Fault Robustness Phase
 
-Fault robustness is evaluated across all three datasets (7-story, LUMO, Qatar) using a consistent protocol: training with `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3` (200 epochs), evaluation with fault-ratio sweep `{0.0, 0.1, 0.33, 0.5, 0.67, 0.8}`, 7 fault types, 3 repeats. Full per-fault-type tables are in `CLAUDE.md` (7-story and LUMO complete; Qatar pending retraining).
+Fault robustness is evaluated across all three datasets (7-story, LUMO, Qatar) using a consistent protocol: training with `--p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3` (200 epochs), evaluation with fault-ratio sweep `{0.0, 0.2, 0.5, 0.8}`, 7 fault types, 3 repeats. Full per-fault-type tables are in `CLAUDE.md` (7-story and LUMO complete; Qatar pending retraining). *(An earlier 6-point sweep `{0.0, 0.1, 0.33, 0.5, 0.67, 0.8}` was used for the initial LUMO fault run; results in `saved_results/lumo-fault/` reflect that older protocol.)*
 
-### Prior Qatar results (from earlier experimental round — checkpoints deleted, to be updated)
+### [Historical] Prior Qatar results — checkpoints deleted, not reproducible
 
-The table below is from a prior Qatar-only experiment using old nf levels {1, 3, 5, 10, 15} and includes the now-abandoned C+SF+FH variant. These numbers motivated the design conclusions below but will be replaced once the consistent cross-dataset Qatar eval completes.
-
-| Fault Type  | v1    | DR    | C     | C+FH  | C+SF+FH | C+FH+SB |
-|-------------|-------|-------|-------|-------|---------|---------|
-| hard        | 0.974 | 0.989 | 0.988 | 0.987 | 0.960   | **0.988** |
-| gain        | 0.789 | 0.885 | 0.920 | 0.990 | 0.797   | **0.993** |
-| bias        | 0.278 | 0.806 | 0.737 | 0.861 | 0.902   | **0.981** |
-| gain_bias   | 0.352 | 0.956 | 0.774 | 0.929 | 0.849   | **0.990** |
-| noise       | 0.255 | 0.050 | 0.360 | 0.928 | 0.498   | **0.936** |
-| stuck       | 0.974 | 0.989 | 0.987 | 0.985 | 0.957   | **0.988** |
-| partial     | 0.974 | 0.985 | 0.988 | 0.983 | 0.850   | **0.991** |
-| **clean**   | 0.975 | 0.991 | 0.992 | 0.992 | 0.984   | **0.994** |
-
-*v1, DR, C baselines were trained without fault augmentation. C+SF+FH used old extreme-magnitude fault aug and is included as an ablation. C+FH and C+FH+SB used moderate-magnitude aug matching current `lib/faults.py`.*
+> **Status: Not reproducible from current checkpoints.** The numbers below come from a Qatar-only experimental round using nf levels `{1, 3, 5, 10, 15}` (incompatible with the current `{0, 0.2·S, 0.5·S, 0.8·S}` protocol) and include the abandoned C+SF+FH variant (Insight #21). Underlying checkpoints are deleted; no current run produces these values. Kept as a record of the design conclusions that motivated the current C+FH+SB architecture. Replace once `states/qatar-fault/` is retrained and `eval_fault_*.csv` lands.
+>
+> | Fault Type  | v1    | DR    | C     | C+FH  | C+SF+FH | C+FH+SB |
+> |-------------|-------|-------|-------|-------|---------|---------|
+> | hard        | 0.974 | 0.989 | 0.988 | 0.987 | 0.960   | **0.988** |
+> | gain        | 0.789 | 0.885 | 0.920 | 0.990 | 0.797   | **0.993** |
+> | bias        | 0.278 | 0.806 | 0.737 | 0.861 | 0.902   | **0.981** |
+> | gain_bias   | 0.352 | 0.956 | 0.774 | 0.929 | 0.849   | **0.990** |
+> | noise       | 0.255 | 0.050 | 0.360 | 0.928 | 0.498   | **0.936** |
+> | stuck       | 0.974 | 0.989 | 0.987 | 0.985 | 0.957   | **0.988** |
+> | partial     | 0.974 | 0.985 | 0.988 | 0.983 | 0.850   | **0.991** |
+> | **clean**   | 0.975 | 0.991 | 0.992 | 0.992 | 0.984   | **0.994** |
+>
+> *v1, DR, C baselines were trained without fault augmentation. C+SF+FH used old extreme-magnitude fault aug and is included as an ablation. C+FH and C+FH+SB used moderate-magnitude aug matching current `lib/faults.py`.*
 
 ### Why SensorSpatialLayer (C+SF+FH) failed
 
