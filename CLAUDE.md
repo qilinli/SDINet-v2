@@ -29,7 +29,7 @@ Structural Damage Identification (SHM) neural network. Sensor accelerometer data
 - **Approach DR** (`MidnDR`): per-location regression with MIL sensor attention
 - **Baseline B** (`PlainDR`): plain per-location regression (mean-pool over sensors, no learned attention) — isolates MIL contribution
 
-Current development focus: **fault-robust SDI on 7story-fault-k0 (single + double + undamaged on `unc=0` and `unc=1`)**, with the proposed configuration being iT+C+fh+sb with **pre-encoder fault head** (`--fault-head-location encoder`) and **`no_obj_weight=0.5`** (up from DETR default 0.1). Auto-label: `c-nm-it4-pfh-sb-nw5`. This config wins K=0 sample-FAR (0.022 grand vs B's 0.167, v1's 0.507), wins K=2 F1 (0.886 grand, +0.24 over v1's 0.646), and ties v1 on K=1 F1 (0.967 vs 0.962). The two tuning changes compose cleanly: nw=0.5 fixes the K=0 false-alarm problem by giving the ∅ class adequate gradient (Insight 32); pre-encoder fault head releases encoder capacity from gradient-path competition with damage supervision (Insight 33). Abandoned / deferred: structural affinity bias (`R_bias`) is retained from the legacy baseline but not the star; spatial self-attention (`SensorSpatialLayer`, Insight 21) remained off; multi-scale conv tokenizer failed to converge at 200 epochs under our training budget and is deferred (Insight 35, `docs/future_plans.md` F5).
+Current development focus: **fault-robust SDI on 7story-fault-k0 (single + double + undamaged on `unc=0` and `unc=1`)**, with the proposed configuration being iT+C+fh+sb with **pre-encoder fault head** (`--fault-head-location encoder`), **`no_obj_weight=0.5`** (up from DETR default 0.1), and **`--norm-method none`** (consistency across v1, B, and C on this protocol — `none` is within noise of `mean` for the iT backbone per Insight 30 revised). Canonical auto-label: `c-nn-it4-pfh-sb-nw5`. This config **ties v1 on K=1 F1** (0.962 vs 0.962), **wins K=2 F1** (0.883 grand, +0.24 over v1's 0.646), and **wins K=0 sample-FAR** (0.010 grand vs B's 0.167 vs v1's 0.507). The two tuning changes compose cleanly: nw=0.5 fixes the K=0 false-alarm problem by giving the ∅ class adequate gradient (Insight 32); pre-encoder fault head releases encoder capacity from gradient-path competition with damage supervision (Insight 33). Abandoned / deferred: structural affinity bias (`R_bias`) is retained from the legacy baseline but not the star; spatial self-attention (`SensorSpatialLayer`, Insight 21) remained off; multi-scale conv tokenizer failed to converge at 200 epochs under our training budget and is deferred (Insight 35, `docs/future_plans.md` F5). ASCE-hammer replication with the same config (`c-nn-it4-pfh-sb-nw5-s6`) confirms the architectural claims on a second dataset, though absolute F1 there sits in a 2-fold geometric symmetry ceiling (≈0.65 K=1) caused by same-wall-span equivalence in the 16-sensor ASCE layout.
 
 ## Collaboration workflow
 
@@ -423,7 +423,9 @@ Adds three independent changes to the `C+fh+sb-iT d=4` baseline, evaluated on th
 2. **Phase B2**: fault head moved from MidnC (post-encoder) to iTransformerEncoder (pre-encoder, reading raw tokeniser output before cross-sensor self-attention). CLI: `--fault-head-location encoder`.
 3. **`no_obj_weight=0.5`**: up from DETR default 0.1. CLI: `--no-obj-weight 0.5`.
 
-Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3 --use-fault-head --use-structural-bias --encoder-type itransformer --encoder-num-layers 4 --norm-method mean --fault-head-location encoder --no-obj-weight 0.5` → auto-label `c-nm-it4-pfh-sb-nw5`.
+Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p-hard 0.3 --p-soft 0.3 --p-struct-mask 0.3 --use-fault-head --use-structural-bias --encoder-type itransformer --encoder-num-layers 4 --fault-head-location encoder --no-obj-weight 0.5` → auto-label `c-nn-it4-pfh-sb-nw5` (norm=none is the CLI default). A `norm-method=mean` variant was trained first (`c-nm-it4-pfh-sb-nw5`) and matches within ±0.005 at every fault cell — Insight #30 revised. The `nn` variant is the canonical proposal because it keeps all three models (v1, B, C) on the same preprocessing without measurable cost.
+
+Baselines v1 and B are also on `--norm-method none` (the default) so all three models in the 7story-fault-k0 comparison share identical preprocessing.
 
 **K=0 healthy-sample FAR** (fraction of 30 held-out undamaged samples flagging ≥1 location; ↓ better):
 
@@ -432,8 +434,9 @@ Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p
 | v1-k0 | 0.500 | 0.513 | 0.500 | 0.508 | 0.507 |
 | B-k0 | **0.000** | **0.000** | **0.000** | 0.524 | 0.167 |
 | iT+C K=0-aware (legacy, nw=0.1) | 0.500 | 0.500 | 0.494 | 0.483 | 0.492 |
-| B2 only (linear+pfh, nw=0.1) | 0.500 | 0.394 | 0.379 | 0.410 | 0.399 |
-| **B2 + nw=0.5 (PROPOSAL)** | **0.000** | **0.000** | **0.006** | **0.062** | **0.022** |
+| B2 only (linear+pfh, nw=0.1, nm) | 0.500 | 0.394 | 0.379 | 0.410 | 0.399 |
+| Proposal (nm, nw=0.5) | **0.000** | **0.000** | 0.006 | 0.062 | 0.022 |
+| **Proposal (nn, nw=0.5, canonical)** | **0.000** | **0.000** | **0.000** | **0.030** | **0.010** |
 
 **K=1 F1**:
 
@@ -441,8 +444,9 @@ Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p
 |---|---|---|---|---|---|
 | v1-k0 | 0.973 | 0.972 | 0.968 | **0.944** | 0.962 |
 | iT+C K=0-aware (legacy) | 0.920 | 0.915 | 0.901 | 0.830 | 0.884 |
-| B2 only (nw=0.1) | 0.953 | 0.950 | 0.942 | 0.865 | 0.921 |
-| **B2 + nw=0.5 (PROPOSAL)** | **0.983** | **0.982** | **0.979** | 0.938 | **0.967** |
+| B2 only (nw=0.1, nm) | 0.953 | 0.950 | 0.942 | 0.865 | 0.921 |
+| Proposal (nm, nw=0.5) | **0.983** | **0.982** | **0.979** | 0.938 | **0.967** |
+| **Proposal (nn, nw=0.5, canonical)** | 0.979 | 0.977 | 0.974 | 0.933 | 0.962 |
 
 **K=2 F1**:
 
@@ -451,20 +455,22 @@ Trained as: `train.py --model c --dataset 7story --epochs 200 --tag fault-k0 --p
 | v1-k0 | 0.647 | 0.648 | 0.649 | 0.643 | 0.646 |
 | B-k0 | 0.844 | 0.845 | 0.823 | 0.512 | 0.732 |
 | iT+C K=0-aware (legacy) | 0.858 | 0.855 | 0.844 | 0.786 | 0.829 |
-| B2 only (nw=0.1) | 0.890 | 0.887 | 0.878 | 0.823 | 0.864 |
-| **B2 + nw=0.5 (PROPOSAL)** | **0.906** | **0.905** | **0.899** | **0.852** | **0.886** |
+| B2 only (nw=0.1, nm) | 0.890 | 0.887 | 0.878 | 0.823 | 0.864 |
+| Proposal (nm, nw=0.5) | **0.906** | **0.905** | **0.899** | **0.852** | **0.886** |
+| **Proposal (nn, nw=0.5, canonical)** | 0.902 | 0.900 | 0.895 | 0.847 | 0.883 |
 
 Key findings:
-- **B2+nw=0.5 wins on K=0 FAR, K=2 F1, and precision simultaneously; ties v1 on K=1** — the slot head no longer underperforms softmax on single-damage once the ∅ class is properly supervised. Reframes the "softmax is K=1 king by architecture" intuition (see Insight 34).
-- **K=0 FAR drops from 50% to ~0%** across fault levels. nw=0.5 provides the ∅-class gradient that K=0 inclusion alone (at nw=0.1) cannot deliver — 200 undamaged samples × 5 slots × 0.1 weight is too weak. See Insight 32.
-- **Moving the fault head pre-encoder improves damaged-task F1** (+0.04 grand) by ending gradient-path competition between damage and fault objectives on the shared encoder. Costs fault_detect F1 (0.92 → 0.74) — acceptable trade since damage detection is primary. See Insight 33.
-- **msc (multi-scale conv) tokenizer deferred**: all msc variants at dec=2 failed to converge in 200 epochs; dec=4 partially recovered (0.85 val top-K) but remained below the linear-tokenizer baseline. Training-budget mismatch rather than architectural inferiority — see Insight 35 and `docs/future_plans.md` F5. Linear tokenizer retained as the proposal backbone.
-- **Fault_detect F1 regression to ~0.77 (from ~0.92)** is the only trade-off. Caused by pre-encoder placement (no cross-sensor contamination cues for fault identification). In deployment, the fault head's role is to avoid corrupting damage detection — 0.77 is still actionable.
+- **Proposal ties v1 on K=1 (0.962 vs 0.962)** and **wins K=2 by +0.24 grand** (0.883 vs 0.646). The slot head no longer underperforms softmax on single-damage once the ∅ class is properly supervised — Insight #34.
+- **K=0 FAR drops from 50% to ~1%** across fault levels on the canonical `nn` config. nw=0.5 provides the ∅-class gradient that K=0 inclusion alone (at nw=0.1) cannot deliver — see Insight 32.
+- **Moving the fault head pre-encoder improves damaged-task F1** (+0.04 grand, B2 vs legacy) by ending gradient-path competition between damage and fault objectives on the shared encoder. Costs fault_detect F1 (0.92 → 0.77) — acceptable since damage detection is primary. See Insight 33.
+- **norm=none vs norm=mean**: within ±0.005 on all 7story cells (Insight #30 revised). `nn` is the canonical proposal because v1/B run on `--norm-method none` (the CLI default) and using `mean` for C-only creates an inconsistency with no measurable benefit on the iT backbone.
+- **msc (multi-scale conv) tokenizer deferred**: all msc variants at dec=2 failed to converge in 200 epochs; dec=4 partially recovered but remained below the linear-tokenizer baseline. Training-budget mismatch (Insight 35, `docs/future_plans.md` F5). Linear tokenizer retained as the proposal backbone.
 
 Checkpoints in `states/7story-fault-k0/`:
-- Proposal: `c-nm-it4-pfh-sb-nw5-<uuid>-best180.pt`
-- Baselines also in this folder: `v1-<uuid>-best190.pt`, `b-<uuid>-best170.pt`, `c-fh-sb-it-<uuid>-best120.pt` (legacy K=0-aware iT+C), plus 4 Phase B ablations (B1, B2, B full, B full+dec=4) for the 2×2 tokenizer × fault-head-location grid.
-Evals: `saved_results/7story-fault-k0/eval_fault_*.{json,csv}`. The master `eval_fault_c-nm-it4-pfh-sb-nw5.{csv,json}` is the proposal reference.
+- **Canonical proposal**: `c-nn-it4-pfh-sb-nw5-<uuid>-best200.pt`
+- Alt proposal (`norm=mean`): `c-nm-it4-pfh-sb-nw5-<uuid>-best180.pt` (within-noise equivalent; kept as consistency evidence).
+- Baselines in this folder: `v1-<uuid>-best190.pt`, `b-<uuid>-best170.pt`, `c-fh-sb-it-<uuid>-best120.pt` (legacy K=0-aware iT+C), plus 4 Phase B ablations (B1, B2, B full, B full+dec=4) for the 2×2 tokenizer × fault-head-location grid.
+Evals: `saved_results/7story-fault-k0/eval_fault_*.{json,csv}`. The master `eval_fault_c-nn-it4-pfh-sb-nw5.{csv,json}` is the proposal reference.
 
 ## Experiment results (Qatar)
 
