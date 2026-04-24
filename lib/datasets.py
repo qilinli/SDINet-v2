@@ -14,9 +14,11 @@ To add a new dataset:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal
 
 from lib.data_7story import (
+    build_structural_affinity_7story,
     get_7story_dataloaders,
     get_7story_single_dataloaders as _get_split_loader,
     SPARSE_7STORY_SENSOR_INDICES,
@@ -32,6 +34,7 @@ from lib.data_qatar import (
     QATAR_DEFAULT_ROOT,
     QATAR_N_LOCATIONS,
     QATAR_N_SENSORS,
+    build_structural_affinity as build_structural_affinity_qatar,
     get_qatar_dataloaders,
     get_qatar_double_test_dataloader,
 )
@@ -40,7 +43,16 @@ from lib.data_lumo import (
     LUMO_N_LOCATIONS,
     LUMO_N_SENSORS,
     LUMO_TIME_LEN,
+    build_structural_affinity_lumo,
     get_lumo_dataloaders,
+)
+from lib.data_asce import (
+    ASCE_DEFAULT_ROOT,
+    ASCE_N_LOCATIONS,
+    ASCE_N_SENSORS,
+    ASCE_TIME_LEN,
+    build_structural_affinity_asce,
+    get_asce_dataloaders,
 )
 
 
@@ -69,6 +81,9 @@ class DatasetConfig:
     _loader_fn: Callable
     _extra_test_fn: Callable | None = None   # Qatar double-damage only
 
+    # Structural affinity builder — None when the dataset has no defined layout.
+    _structural_affinity_fn: Callable | None = None
+
     # Dataset × model integration overrides.
     # Keys are model names ("v1", "c", "dr").  CLI flags override these.
     _model_cfg_overrides: dict[str, dict] = field(default_factory=dict)
@@ -85,6 +100,15 @@ class DatasetConfig:
     def training_overrides(self, model: str) -> dict:
         """Extra kwargs for do_training_* (e.g. pos_weight for DR on binary data)."""
         return self._training_overrides.get(model, {})
+
+    def build_structural_affinity(self):
+        """Return the (L+1, S) affinity tensor, or None if undefined for this dataset."""
+        if self._structural_affinity_fn is None:
+            raise ValueError(
+                f"--use-structural-bias is not supported for dataset {self.name!r}. "
+                "Define a structural affinity for this dataset first."
+            )
+        return self._structural_affinity_fn()
 
     def get_dataloaders(self, **kwargs):
         """Return ``(train_dl, val_dl, test_dl)``."""
@@ -126,27 +150,43 @@ class DatasetConfig:
 # Translate the uniform dl_kwargs dict into each data module's call signature. #
 # --------------------------------------------------------------------------- #
 
+def _7story_undamaged_sources(root: str | Path) -> list[Path]:
+    """Healthy pool for 7story: undamaged/ from both unc=0 and unc=1 (100 + 100 = 200)."""
+    root = Path(root)
+    return [root.parent / "unc=1" / "undamaged"]
+
+
 def _loader_7story(root, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **kw):
+    subsets = subsets or ["single", "double", "undamaged"]
+    extra = kw.pop("extra_subset_roots", None)
+    if "undamaged" in subsets and extra is None:
+        extra = _7story_undamaged_sources(root)
     return get_7story_dataloaders(
-        subsets or ["single", "double"],
+        subsets,
         root=root,
         num_workers=num_workers,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
+        extra_subset_roots=extra,
         **kw,
     )
 
 
 def _loader_7story_sparse(root, num_workers, train_batch_size, eval_batch_size, seed, subsets=None, **kw):
+    subsets = subsets or ["single", "double", "undamaged"]
+    extra = kw.pop("extra_subset_roots", None)
+    if "undamaged" in subsets and extra is None:
+        extra = _7story_undamaged_sources(root)
     return get_7story_dataloaders(
-        subsets or ["single", "double"],
+        subsets,
         root=root,
         num_workers=num_workers,
         train_batch_size=train_batch_size,
         eval_batch_size=eval_batch_size,
         seed=seed,
         sensor_indices=SPARSE_7STORY_SENSOR_INDICES,
+        extra_subset_roots=extra,
         **kw,
     )
 
@@ -203,6 +243,17 @@ def _loader_lumo(root, window_size, overlap, downsample,
 QATAR_HELD_OUT_DOUBLE = 4  # j23+j24 — always held out for test
 
 
+def _loader_asce(root, num_workers, train_batch_size, eval_batch_size, seed, **kw):
+    return get_asce_dataloaders(
+        root=root,
+        num_workers=num_workers,
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        seed=seed,
+        **kw,
+    )
+
+
 def _loader_qatar(root, window_size, overlap, downsample,
                   num_workers, train_batch_size, eval_batch_size, seed, **kw):
     return get_qatar_dataloaders(
@@ -242,6 +293,7 @@ DATASETS: dict[str, DatasetConfig] = {
         supports_real_benchmark=True,
         default_root="data/7-story-frame/safetensors/unc=0",
         _loader_fn=_loader_7story,
+        _structural_affinity_fn=build_structural_affinity_7story,
     ),
     "7story-sparse": DatasetConfig(
         name="7story-sparse",
@@ -252,6 +304,7 @@ DATASETS: dict[str, DatasetConfig] = {
         supports_real_benchmark=True,
         default_root="data/7-story-frame/safetensors/unc=0",
         _loader_fn=_loader_7story_sparse,
+        _structural_affinity_fn=build_structural_affinity_7story,
     ),
     "tower": DatasetConfig(
         name="tower",
@@ -272,11 +325,25 @@ DATASETS: dict[str, DatasetConfig] = {
         supports_real_benchmark=False,
         default_root=LUMO_DEFAULT_ROOT,
         _loader_fn=_loader_lumo,
+        _structural_affinity_fn=build_structural_affinity_lumo,
         # LUMO binary labels {-1,+1}: same sev-weight collapse as Qatar —
         # severity is always 1 for damaged slots, so sev_loss is trivially
         # learned and decouples val_loss from val_mse.  Force sev_weight=0.
         _model_cfg_overrides={"c": {"sev_weight": 0.0}},
         _training_overrides={},
+    ),
+    "asce": DatasetConfig(
+        name="asce",
+        n_sensors=ASCE_N_SENSORS,
+        n_locations=ASCE_N_LOCATIONS,
+        time_len=ASCE_TIME_LEN,
+        label_type="continuous",
+        supports_real_benchmark=False,
+        default_root=ASCE_DEFAULT_ROOT,
+        _loader_fn=_loader_asce,
+        _structural_affinity_fn=build_structural_affinity_asce,
+        # K_max=5 → give the C-head 6 slots (+1 for room; ∅ class is a separate logit).
+        _model_cfg_overrides={"c": {"num_slots": 6}},
     ),
     "qatar": DatasetConfig(
         name="qatar",
@@ -288,6 +355,7 @@ DATASETS: dict[str, DatasetConfig] = {
         default_root=QATAR_DEFAULT_ROOT,
         _loader_fn=_loader_qatar,
         _extra_test_fn=_extra_test_qatar,
+        _structural_affinity_fn=build_structural_affinity_qatar,
         # Qatar binary labels {-1,+1}: severity is always 1 for damaged slots,
         # so sev_loss is trivially learned and decouples val_loss from val_mse.
         # Force sev_weight=0 for the C-head (location CE only).

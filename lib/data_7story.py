@@ -42,13 +42,14 @@ def input_preprocess(
     n_sensors: int = 65,
     sensor_dim: int = 1,
     sensor_indices: list[int] | None = None,
+    norm_method: str = "mean",
 ) -> npt.NDArray[np.float32]:
     # Raw shape: (1000, S, 3) — first 500 samples are real signal,
     # last 500 are zero-padded.  Truncate, don't decimate.
     accel = data.get_tensor("acc").reshape(1000, n_sensors, 3).transpose(2, 0, 1)
     accel = accel[:sensor_dim, :500].astype(np.float32)  # (sensor_dim, 500, n_sensors)
-    # Per-window global RMS normalization (no single ref — robust to sensor faults)
-    accel = normalize_rms(accel, ref_channel=None)
+    # Per-window RMS normalization (method-dependent; see lib.preprocessing.normalize_rms)
+    accel = normalize_rms(accel, ref_channel=None, method=norm_method)
     if sensor_indices is not None:
         accel = accel[:, :, sensor_indices]   # (sensor_dim, 500, len(sensor_indices))
     return accel
@@ -70,14 +71,18 @@ def get_7story_dataloaders(
     p_hard: float = 0.0,
     p_struct_mask: float = 0.0,
     p_soft: float = 0.0,
+    norm_method: str = "mean",
+    extra_subset_roots: list[str | Path] | None = None,
     **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders from multiple subsets combined.
 
-    Each subset is split independently (70 / 15 / 15) with the same seed
-    before concatenation, so the splits are reproducible and there is no
-    leakage between train and eval across subsets.
+    ``subset_names`` are resolved as ``root / name``. ``extra_subset_roots`` are
+    full paths to additional subset directories (used for pulling undamaged data
+    from a second unc level). Every subset — named or extra — is split 70/15/15
+    independently with the same seed, so splits are reproducible and there is no
+    leakage across subsets.
 
     Training set is always wrapped in ``_AugDataset`` which applies:
       - Signal augmentation (amplitude scaling + per-sensor noise) — always on.
@@ -92,10 +97,14 @@ def get_7story_dataloaders(
     train_parts, val_parts, test_parts = [], [], []
     n_sensors = len(sensor_indices) if sensor_indices is not None else 65
 
-    for name in subset_names:
-        ds_root = root / name
+    subset_specs: list[tuple[str, Path]] = [(name, root / name) for name in subset_names]
+    if extra_subset_roots:
+        subset_specs.extend((Path(p).name, Path(p)) for p in extra_subset_roots)
+
+    for name, ds_root in subset_specs:
         ds = SevenStoryDataset(
-            ds_root, [lambda x, _si=sensor_indices: input_preprocess(x, sensor_indices=_si),
+            ds_root, [lambda x, _si=sensor_indices, _nm=norm_method: input_preprocess(
+                          x, sensor_indices=_si, norm_method=_nm),
                       target_preprocess]
         )
 
@@ -140,13 +149,15 @@ def get_7story_single_dataloaders(
     eval_batch_size: int = 32,
     seed: int = 42,
     sensor_indices: list[int] | None = None,
+    norm_method: str = "mean",
     **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     root = Path(root)
     ds_root = root / subset_name
     ds = SevenStoryDataset(
         ds_root,
-        [lambda x, _si=sensor_indices: input_preprocess(x, sensor_indices=_si),
+        [lambda x, _si=sensor_indices, _nm=norm_method: input_preprocess(
+             x, sensor_indices=_si, norm_method=_nm),
          target_preprocess],
     )
 
@@ -190,11 +201,13 @@ def build_structural_affinity_7story() -> torch.Tensor:
     """
     (L+1, S) = (71, 65) binary structural affinity for the 7-story frame.
 
-    Row 0  = null / no-object slot — all-ones (unbiased, same as Qatar).
-    Row l+1 has exactly 2 non-zero entries: the two sensors directly adjacent
-    to damage location l in the structural graph.
+    Rows 0–69 = locations 0–69 (0-indexed, matching model class indices).
+    Row 70    = null / no-object class (all zeros).
 
-    Structure (1-indexed sensors and locations):
+    Each location row has exactly 2 non-zero entries: the two sensors directly
+    adjacent to that damage location in the structural graph.
+
+    Structure (1-indexed sensors; 0-indexed locations = 1-indexed minus 1):
       Left column  : sensors 1–22 (bottom→top).
                      Floor-k node = sensor 1+3k  (k=1..7 → 4,7,10,13,16,19,22)
       Right column : sensors 44–65 (top→bottom).
@@ -202,41 +215,41 @@ def build_structural_affinity_7story() -> torch.Tensor:
       Beam k       : sensors {20+3k, 21+3k, 22+3k} (k=1..7)
                      beam 1 → {23,24,25},  beam 7 → {41,42,43}
 
-      Left col  locations  1–21 : loc l between sensors l and l+1
-      Beam locations       22–49: 4 per beam, beam k base = 22+4(k-1)
+      Left col  locations  0–20 : loc l between sensors l+1 and l+2 (1-indexed)
+      Beam locations       21–48: 4 per beam, beam k base = 21+4(k-1)
         base+0: left-col node (1+3k)   ↔ beam sensor (20+3k)
         base+1: beam sensor   (20+3k)  ↔ beam sensor (21+3k)
         base+2: beam sensor   (21+3k)  ↔ beam sensor (22+3k)
         base+3: beam sensor   (22+3k)  ↔ right-col node (65−3k)
-      Right col locations 50–70 : loc 50+j between sensors 44+j and 45+j  (j=0..20)
+      Right col locations 49–69 : loc 49+j between sensors 44+j and 45+j  (j=0..20)
     """
     A = torch.zeros(71, 65)
-    A[0] = 1.0  # null slot: attend to all sensors equally
 
-    def _adj(loc_1: int, s1_1: int, s2_1: int) -> None:
-        A[loc_1, s1_1 - 1] = 1.0
-        A[loc_1, s2_1 - 1] = 1.0
+    def _adj(loc_0: int, s1_1: int, s2_1: int) -> None:
+        """Set affinity for location loc_0 (0-indexed) to sensors s1, s2 (1-indexed)."""
+        A[loc_0, s1_1 - 1] = 1.0
+        A[loc_0, s2_1 - 1] = 1.0
 
-    # Left column (locations 1–21)
-    for l in range(1, 22):
-        _adj(l, l, l + 1)
+    # Left column (locations 0–20, 0-indexed)
+    for l in range(21):
+        _adj(l, l + 1, l + 2)
 
-    # Beams (locations 22–49, 4 per beam)
+    # Beams (locations 21–48, 4 per beam)
     for k in range(1, 8):
         s_lc  = 1 + 3 * k
         s_b1  = 20 + 3 * k
         s_b2  = 21 + 3 * k
         s_b3  = 22 + 3 * k
         s_rc  = 65 - 3 * k
-        base  = 22 + 4 * (k - 1)
+        base  = 21 + 4 * (k - 1)
         _adj(base,     s_lc, s_b1)
         _adj(base + 1, s_b1, s_b2)
         _adj(base + 2, s_b2, s_b3)
         _adj(base + 3, s_b3, s_rc)
 
-    # Right column (locations 50–70)
+    # Right column (locations 49–69, 0-indexed)
     for j in range(21):
-        _adj(50 + j, 44 + j, 45 + j)
+        _adj(49 + j, 44 + j, 45 + j)
 
     return A
 
