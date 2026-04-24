@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from lib.densenet import SDIDenseNet
+from lib.itransformer import POS_EMB_TYPES, iTransformerEncoder
 from lib.midn import Midn, MidnC, MidnDR, PlainDR
 
 
@@ -124,6 +125,44 @@ class ModelConfigC:
     # Qatar only: learnable (L+1, S) bias matrix initialised from 6×5 grid 4-connectivity.
     use_structural_bias: bool = False
 
+    fault_gate_lambda: float = 0.0
+    freeze_r_bias:     bool  = False
+    aux_loss:          bool  = False
+
+    # --- Option 4: magnitude-invariant memory (default off — backward compatible) ---
+    use_l2_norm_memory: bool = False
+    # --- Option 5: MIL-style slot readout via last-layer cross-attention weights ---
+    use_mil_readout:    bool = False
+    # --- Final decoder-output LayerNorm (canonical pre-norm transformer hygiene).
+    # Default True for new trainings; auto-detected as False when loading old
+    # checkpoints lacking `2.decoder.norm.*` keys.
+    use_final_decoder_norm: bool = True
+
+    # --- Encoder backbone for C-head.
+    # "densenet" (default): SDIDenseNet + MIL neck (original v1/B/C backbone).
+    # "itransformer":       per-sensor Linear(T, D) tokenisation + sensor-axis
+    #                       self-attention (see lib/itransformer.py).
+    encoder_type:      str = "densenet"
+    encoder_num_layers: int = 2
+    encoder_nhead:      int = 8
+    encoder_dropout:    float = 0.0
+    encoder_pos_emb:   str = "learned"   # iTransformer: "learned" | "none" | "rope"
+
+    # --- Phase B1: iTransformer tokenizer choice.
+    # "linear" (default):         Linear(T, D) — legacy behaviour.
+    # "multiscale_conv":          parallel dilated Conv1d branches, preserves
+    #                             sub-window temporal structure.
+    tokenizer_type:    str = "linear"
+
+    # --- Phase B2: fault head placement.
+    # "decoder" (default):        fault head is a submodule of MidnC, reads
+    #                             post-encoder features (legacy behaviour).
+    # "encoder":                  fault head is a submodule of
+    #                             iTransformerEncoder, reads raw per-sensor
+    #                             tokens before any cross-sensor attention
+    #                             mixing (more fault-robust at high nf).
+    fault_head_location: str = "decoder"
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -180,9 +219,41 @@ def build_model(
         cfg.use_structural_bias=True.  Must be provided by the caller
         (train.py selects the correct affinity based on dataset name).
     """
-    feature_extractor = SDIDenseNet(cfg.in_channels, structure=cfg.structure, bn_params={})
-    neck_in = _infer_neck_in_channels(feature_extractor, cfg)
-    neck = _build_neck(neck_in, cfg)
+    use_itransformer = (
+        isinstance(cfg, ModelConfigC) and cfg.encoder_type == "itransformer"
+    )
+    if use_itransformer:
+        feature_extractor = iTransformerEncoder(
+            n_sensors=cfg.n_sensors,
+            time_len=cfg.time_len,
+            embed_dim=cfg.embed_dim,
+            num_layers=cfg.encoder_num_layers,
+            nhead=cfg.encoder_nhead,
+            dropout=cfg.encoder_dropout,
+            pos_emb_type=cfg.encoder_pos_emb,
+            tokenizer_type=cfg.tokenizer_type,
+            fault_head_location=cfg.fault_head_location if cfg.use_fault_head else "decoder",
+        )
+        # nn.Identity keeps the model[:2] / model[2] slicing contract
+        # (training/eval loops split the sequential at index 2).
+        # Identity.forward returns its input verbatim, so the
+        # (sensor_features, fault_prob) tuple passes through to MidnC.
+        neck = nn.Identity()
+    else:
+        # Phase-B (tokenizer/fault-head-location) attributes only exist on
+        # ModelConfigC. For v1 (ModelConfig) and B/DR (ModelConfigDR) the
+        # check is vacuous — they always use the DenseNet path with default
+        # tokenizer and don't own a fault head.
+        if isinstance(cfg, ModelConfigC) and (
+            cfg.tokenizer_type != "linear" or cfg.fault_head_location != "decoder"
+        ):
+            raise ValueError(
+                "tokenizer_type != 'linear' and fault_head_location != 'decoder' "
+                "are only valid with encoder_type='itransformer'."
+            )
+        feature_extractor = SDIDenseNet(cfg.in_channels, structure=cfg.structure, bn_params={})
+        neck_in = _infer_neck_in_channels(feature_extractor, cfg)
+        neck = _build_neck(neck_in, cfg)
 
     if isinstance(cfg, ModelConfigDR):
         if cfg.plain:
@@ -213,6 +284,13 @@ def build_model(
             spatial_nhead=cfg.spatial_nhead,
             use_fault_head=cfg.use_fault_head,
             structural_affinity=structural_affinity,
+            fault_gate_lambda=cfg.fault_gate_lambda,
+            freeze_r_bias=cfg.freeze_r_bias,
+            aux_loss=cfg.aux_loss,
+            use_l2_norm_memory=cfg.use_l2_norm_memory,
+            use_mil_readout=cfg.use_mil_readout,
+            use_final_decoder_norm=cfg.use_final_decoder_norm,
+            fault_head_location=cfg.fault_head_location,
         )
     else:
         head = Midn(
@@ -308,28 +386,112 @@ def load_model_c_from_checkpoint(
         num_slots     = state["2.queries"].shape[0]
         num_locations = state["2.loc_head.weight"].shape[0] - 1  # L+1 outputs
         use_spatial   = "2.spatial.layers.layers.0.self_attn.in_proj_weight" in state
-        use_fault     = "2.fault_head.weight" in state
         use_struct    = "2.R_bias" in state
-        # n_sensors only needed for SensorPositionalEncoding; use default (65) otherwise —
-        # _infer_neck_in_channels returns C×T' which does not depend on S.
-        n_sensors     = state["2.pos_enc.pos_emb"].shape[0] if use_spatial else ModelConfigC().n_sensors
+        use_l2        = "2._l2_norm_memory_flag" in state
+        use_mil       = "2.sensor_loc_head.weight" in state
+        use_final_ln  = "2.decoder.norm.weight" in state
+
+        # Fault head auto-detect: key path depends on Phase-B2 location.
+        fault_in_decoder = "2.fault_head.weight" in state
+        fault_in_encoder = "0.fault_head.weight" in state
+        use_fault        = fault_in_decoder or fault_in_encoder
+        fault_head_location = "encoder" if fault_in_encoder else "decoder"
+
+        # Encoder auto-detect: iTransformer has a tokenizer at "0.tokenize.*";
+        # DenseNet backbone has "0.features.*".
+        is_itransformer = (
+            "0.tokenize.weight" in state
+            or "0.tokenize.proj.weight" in state
+        )
+        encoder_type    = "itransformer" if is_itransformer else "densenet"
+
+        if is_itransformer:
+            # Tokenizer auto-detect (Phase B1):
+            #   - linear:          "0.tokenize.weight" shape (D, T)
+            #   - multiscale_conv: "0.tokenize.proj.weight" + "0.tokenize.branches.*"
+            if "0.tokenize.weight" in state:
+                tokenizer_type = "linear"
+                time_len  = state["0.tokenize.weight"].shape[1]   # (D, T)
+                embed_dim = state["0.tokenize.weight"].shape[0]
+            else:
+                tokenizer_type = "multiscale_conv"
+                embed_dim = state["0.tokenize.proj.weight"].shape[0]
+                # MultiScaleConvTokenizer doesn't encode T in its params; fall back to
+                # ModelConfigC default (matches the fixed preprocessing contract).
+                time_len  = ModelConfigC().time_len
+
+            # Positional-embedding variant: learned keeps "0.pos_emb";
+            # rope uses custom encoder whose layers hold in_proj.weight (dotted);
+            # none has neither.
+            has_learned_pe = "0.pos_emb" in state
+            has_rope = "0.layers.layers.0.self_attn.in_proj.weight" in state
+            if has_learned_pe:
+                encoder_pos_emb = "learned"
+            elif has_rope:
+                encoder_pos_emb = "rope"
+            else:
+                encoder_pos_emb = "none"
+
+            if has_learned_pe:
+                n_sensors = state["0.pos_emb"].shape[0]
+            elif "0._n_sensors_marker" in state:
+                n_sensors = int(state["0._n_sensors_marker"].item())
+            else:
+                n_sensors = ModelConfigC().n_sensors
+
+            encoder_num_layers = sum(
+                1 for k in state
+                if k.startswith("0.layers.layers.") and k.endswith(".norm1.weight")
+            )
+        else:
+            # DenseNet path: n_sensors only matters if spatial layer is on;
+            # time_len/embed_dim come from defaults.
+            n_sensors = (
+                state["2.pos_enc.pos_emb"].shape[0] if use_spatial
+                else ModelConfigC().n_sensors
+            )
+            time_len  = ModelConfigC().time_len
+            embed_dim = ModelConfigC().embed_dim
+            encoder_num_layers = ModelConfigC().encoder_num_layers
+            tokenizer_type = "linear"  # not used for densenet; default for dataclass
+
         num_spatial_layers = (
             sum(1 for k in state if k.startswith("2.spatial.layers.layers.") and k.endswith(".norm1.weight"))
             if use_spatial else 1
         )
+        # Decoder depth auto-detect (MidnC layers live under "2.decoder.layers.N.*").
+        num_decoder_layers = sum(
+            1 for k in state
+            if k.startswith("2.decoder.layers.") and k.endswith(".norm1.weight")
+        ) or ModelConfigC().num_decoder_layers
         model_cfg = ModelConfigC(
             num_slots=num_slots,
             num_locations=num_locations,
             n_sensors=n_sensors,
+            time_len=time_len,
+            embed_dim=embed_dim,
+            num_decoder_layers=num_decoder_layers,
             use_spatial_layer=use_spatial,
             num_spatial_layers=num_spatial_layers,
             use_fault_head=use_fault,
             use_structural_bias=use_struct,
+            use_l2_norm_memory=use_l2,
+            use_mil_readout=use_mil,
+            use_final_decoder_norm=use_final_ln,
+            encoder_type=encoder_type,
+            encoder_num_layers=encoder_num_layers,
+            encoder_pos_emb=encoder_pos_emb if is_itransformer else "learned",
+            tokenizer_type=tokenizer_type,
+            fault_head_location=fault_head_location,
         )
     else:
         use_struct = model_cfg.use_structural_bias
     structural_affinity = state["2.R_bias"] if use_struct else None
     model = build_model(model_cfg, structural_affinity=structural_affinity)
+    # Backwards-compat: pre-pos_emb-variant iT checkpoints lack the _n_sensors_marker
+    # buffer. Inject it from the already-inferred n_sensors so strict load succeeds.
+    if "0.tokenize.weight" in state and "0._n_sensors_marker" not in state:
+        state["0._n_sensors_marker"] = torch.tensor(model_cfg.n_sensors, dtype=torch.long)
     model.load_state_dict(state)
     if device is not None:
         model = model.to(device)

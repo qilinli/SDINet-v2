@@ -181,4 +181,9 @@ class FaultBCELoss(nn.Module):
         Returns:
             Scalar BCE loss.
         """
-        return F.binary_cross_entropy(fault_prob, y_fault.float(), reduction="mean")
+        # F.binary_cross_entropy is blacklisted under fp16 autocast (gradients
+        # explode near sigmoid saturation); run it in fp32.
+        with torch.amp.autocast(device_type=fault_prob.device.type, enabled=False):
+            return F.binary_cross_entropy(
+                fault_prob.float(), y_fault.float(), reduction="mean",
+            )

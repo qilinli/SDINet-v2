@@ -4,6 +4,7 @@ import sys
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -216,6 +217,38 @@ class SensorSpatialLayer(nn.Module):
         return self.layers(x)
 
 
+class _AttnSavingDecoderLayer(nn.TransformerDecoderLayer):
+    """TransformerDecoderLayer variant that stashes its cross-attention weights.
+
+    Needed by MidnC's MIL readout: the last layer's head-averaged attention
+    ``(B, K, S)`` is reused to aggregate per-sensor location logits into per-slot
+    logits (attention-weighted vote instead of reading from the slot vector).
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.saved_attn_weights: Tensor | None = None
+
+    def _mha_block(
+        self,
+        x: Tensor,
+        mem: Tensor,
+        attn_mask,
+        key_padding_mask,
+        is_causal: bool = False,
+    ) -> Tensor:
+        x, attn = self.multihead_attn(
+            x, mem, mem,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=True,
+            is_causal=is_causal,
+        )
+        self.saved_attn_weights = attn
+        return self.dropout2(x)
+
+
 class MidnC(nn.Module):
     """
     DETR-style damage slot predictor (Approach C).
@@ -251,6 +284,14 @@ class MidnC(nn.Module):
         num_spatial_layers:  Depth of the SensorSpatialLayer encoder (default 1).
         spatial_nhead:       Attention heads in SensorSpatialLayer (default 8).
         use_fault_head:      Enable per-sensor binary fault classifier (default False).
+        fault_gate_lambda:   If >0 and use_fault_head, subtract ``λ·p_fault`` (detached)
+                             from cross-attention logits at every decoder layer so
+                             slots avoid sensors the fault head flags (default 0.0).
+        freeze_r_bias:       When True, R_bias is kept at physics initialisation
+                             (requires_grad=False) AND applied at decoder layer 0 too
+                             (default False — old "learnable + layers ≥1 only" behaviour).
+        aux_loss:            When True, forward returns the per-intermediate-layer
+                             (loc_logits, severity) list for DETR-style deep supervision.
     """
 
     def __init__(
@@ -266,26 +307,53 @@ class MidnC(nn.Module):
         spatial_nhead: int = 8,
         use_fault_head: bool = False,
         structural_affinity: "Tensor | None" = None,
+        fault_gate_lambda: float = 0.0,
+        freeze_r_bias: bool = False,
+        aux_loss: bool = False,
+        use_l2_norm_memory: bool = False,
+        use_mil_readout: bool = False,
+        use_final_decoder_norm: bool = True,
+        fault_head_location: str = "decoder",
     ) -> None:
         super().__init__()
+        if fault_head_location not in ("decoder", "encoder"):
+            raise ValueError(
+                f"fault_head_location must be 'decoder' or 'encoder', got {fault_head_location!r}"
+            )
         self.num_slots         = num_slots
         self.num_locations     = num_locations
         self.no_obj_idx        = num_locations
         self.use_spatial_layer = use_spatial_layer
         self.use_fault_head    = use_fault_head
+        self.fault_head_location = fault_head_location
+        self.fault_gate_lambda = fault_gate_lambda
+        self.freeze_r_bias     = freeze_r_bias
+        self.aux_loss          = aux_loss
+        self.use_l2_norm_memory = use_l2_norm_memory
+        self.use_mil_readout   = use_mil_readout
+        self.use_final_decoder_norm = use_final_decoder_norm
+        self._nhead            = nhead
 
         # Learnable slot queries — one per potential damage
         self.queries = nn.Parameter(torch.randn(num_slots, embed_dim))
 
-        # Transformer decoder: slots attend over sensor-feature memory
-        decoder_layer = nn.TransformerDecoderLayer(
+        # Transformer decoder: slots attend over sensor-feature memory.
+        # MIL readout needs per-layer access to cross-attention weights, so we
+        # swap in a subclass that stashes them.
+        layer_cls = _AttnSavingDecoderLayer if use_mil_readout else nn.TransformerDecoderLayer
+        decoder_layer = layer_cls(
             d_model=embed_dim,
             nhead=nhead,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
             norm_first=True,          # pre-norm for training stability
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
+        # Pre-norm transformers return a residual-sum at the final layer that is
+        # never LayerNormed — the canonical fix (used by every reference DETR
+        # impl) is to pass `norm=LayerNorm(d)` so decoder output is normalized
+        # before it reaches the prediction heads.
+        final_norm = nn.LayerNorm(embed_dim) if use_final_decoder_norm else None
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers, norm=final_norm)
 
         # Per-slot prediction heads
         self.loc_head = nn.Linear(embed_dim, num_locations + 1)   # L + ∅
@@ -294,73 +362,117 @@ class MidnC(nn.Module):
             nn.Sigmoid(),
         )
 
+        # MIL readout: per-sensor location logits aggregated via last-layer attention
+        if use_mil_readout:
+            self.sensor_loc_head = nn.Linear(embed_dim, num_locations + 1)
+
+        # L2-norm is a parameter-less op; register a buffer so loaders can detect it.
+        if use_l2_norm_memory:
+            self.register_buffer("_l2_norm_memory_flag", torch.tensor(True), persistent=True)
+
         # Optional: sensor spatial reasoning (positional encoding + self-attention)
         if use_spatial_layer:
             self.pos_enc = SensorPositionalEncoding(n_sensors, embed_dim)
             self.spatial = SensorSpatialLayer(embed_dim, spatial_nhead, num_spatial_layers)
 
-        # Optional: per-sensor binary fault classifier
-        if use_fault_head:
+        # Optional: per-sensor binary fault classifier.
+        # When fault_head_location == "encoder", the encoder owns this head and
+        # provides fault_prob via the forward-input tuple — MidnC does not
+        # create its own parameter in that case (avoids duplicate state_dict keys).
+        if use_fault_head and fault_head_location == "decoder":
             self.fault_head = nn.Linear(embed_dim, 1)
 
-        # Optional: structural location-sensor affinity bias in slot cross-attention
-        # R_bias[l, i]: affinity of sensor i for structural location l.
-        # At decoder layer k≥1, bias = softmax(loc_logits) @ R_bias is added to
-        # cross-attention logits, directing each slot toward structurally relevant sensors.
         self.use_structural_bias = structural_affinity is not None
         if self.use_structural_bias:
-            self.R_bias = nn.Parameter(structural_affinity.clone())  # (L+1, S), learnable
-            self._nhead = nhead
+            self.R_bias = nn.Parameter(structural_affinity.clone())
+            if freeze_r_bias:
+                self.R_bias.requires_grad_(False)
 
-    def forward(self, x: Tensor) -> tuple:
+    def forward(self, x) -> tuple:
         """
         Args:
-            x: (B, embed_dim, S) per-sensor features from the neck.
+            x: Either
+               - ``(B, embed_dim, S)`` tensor — legacy path (DenseNet encoder, or
+                 iTransformer with ``fault_head_location="decoder"``). Fault head
+                 (if enabled) computes fault_prob here from post-encoder features.
+               - ``(sensor_features, encoder_fault_prob)`` tuple — new path
+                 (iTransformer with ``fault_head_location="encoder"``). Consumes
+                 the pre-encoder fault_prob instead of computing one.
 
         Returns:
             loc_logits:  (B, K_max, L+1)  raw location logits (∅ = index L)
             severity:    (B, K_max)       sigmoid-activated severity ∈ [0, 1]
-            fault_prob:  (B, S)           per-sensor fault probability ∈ [0, 1],
-                                          or None when use_fault_head=False
+            fault_prob:  (B, S) or None   per-sensor fault probability ∈ [0, 1]
+            aux:         list[(loc_logits, severity)] per intermediate decoder
+                         layer for deep supervision, or None when aux_loss=False.
         """
+        # Unpack encoder output — tuple from iTransformerEncoder, tensor from DenseNet.
+        encoder_fault_prob: "Tensor | None" = None
+        if isinstance(x, tuple):
+            x, encoder_fault_prob = x
+
         B = x.size(0)
 
-        # Sensor features as transformer memory: (B, S, embed_dim)
-        memory = x.permute(0, 2, 1)
+        # Per-sensor features flowing into the slot decoder as cross-attn keys/values.
+        # Shape (B, S, embed_dim).
+        sensor_features = x.permute(0, 2, 1)
 
         # Optional: add positional embeddings and cross-sensor self-attention
         if self.use_spatial_layer:
-            memory = self.pos_enc(memory)
-            memory = self.spatial(memory)
-
-        # Slot queries → batch: (B, K_max, embed_dim)
-        tgt = self.queries.unsqueeze(0).expand(B, -1, -1)
-
-        # Cross-attend: slots gather information from sensor memory.
-        # With structural bias: layer 0 is unbiased (slot queries haven't seen data yet);
-        # layers ≥1 add a dynamic location-conditioned bias to cross-attention logits so
-        # each slot attends more to sensors near its current predicted location.
-        if self.use_structural_bias:
-            S_mem = memory.size(1)
-            bias_compatible = (S_mem == self.R_bias.size(-1))
-            for i, layer in enumerate(self.decoder.layers):
-                if i == 0 or not bias_compatible:
-                    tgt = layer(tgt, memory)
-                else:
-                    loc_probs = self.loc_head(tgt).softmax(-1)          # (B, K, L+1)
-                    bias = loc_probs @ self.R_bias                       # (B, K, S)
-                    bias = bias.unsqueeze(1).expand(-1, self._nhead, -1, -1)
-                    bias = bias.reshape(B * self._nhead, -1, S_mem)     # (B*H, K, S)
-                    tgt = layer(tgt, memory, memory_mask=bias)
-            slots = tgt
-        else:
-            slots = self.decoder(tgt, memory)                           # (B, K_max, embed_dim)
-
-        loc_logits = self.loc_head(slots)             # (B, K_max, L+1)
-        severity   = self.sev_head(slots).squeeze(-1) # (B, K_max)
+            sensor_features = self.pos_enc(sensor_features)
+            sensor_features = self.spatial(sensor_features)
 
         fault_prob = None
         if self.use_fault_head:
-            fault_prob = torch.sigmoid(self.fault_head(memory)).squeeze(-1)  # (B, S)
+            if self.fault_head_location == "encoder":
+                # Encoder already computed it pre-attention; pass through.
+                fault_prob = encoder_fault_prob
+            else:
+                fault_prob = torch.sigmoid(self.fault_head(sensor_features)).squeeze(-1)
 
-        return loc_logits, severity, fault_prob
+        # Detach so decoder gradients can't corrupt the fault-head BCE signal.
+        fault_bias = None
+        if fault_prob is not None and self.fault_gate_lambda > 0.0:
+            fault_bias = (-self.fault_gate_lambda * fault_prob.detach()).unsqueeze(1)
+
+        # Magnitude-invariant cross-attention: fault-induced feature scaling no
+        # longer biases the dot-product scores (direction-only keys/values).
+        if self.use_l2_norm_memory:
+            sensor_features = F.normalize(sensor_features, dim=-1)
+
+        slots = self.queries.unsqueeze(0).expand(B, -1, -1)
+        S = sensor_features.size(1)
+        rb_compatible = self.use_structural_bias and S == self.R_bias.size(-1)
+
+        aux: list[tuple[Tensor, Tensor]] | None = [] if self.aux_loss else None
+        last_idx = len(self.decoder.layers) - 1
+
+        for i, layer in enumerate(self.decoder.layers):
+            bias = None
+            if rb_compatible and (i > 0 or self.freeze_r_bias):
+                loc_probs = self.loc_head(slots).softmax(-1)
+                bias = loc_probs @ self.R_bias
+            if fault_bias is not None:
+                fb = fault_bias.expand(-1, slots.size(1), -1)
+                bias = fb if bias is None else bias + fb
+
+            if bias is not None:
+                bias = bias.unsqueeze(1).expand(-1, self._nhead, -1, -1)
+                bias = bias.reshape(B * self._nhead, -1, S)
+                slots = layer(slots, sensor_features, memory_mask=bias)
+            else:
+                slots = layer(slots, sensor_features)
+
+            if aux is not None and i < last_idx:
+                aux.append((self.loc_head(slots), self.sev_head(slots).squeeze(-1)))
+
+        if self.use_mil_readout:
+            # Attention-weighted per-sensor voting for location logits.
+            # Slot-state severity head is kept as-is.
+            per_sensor_logits = self.sensor_loc_head(sensor_features)           # (B, S, L+1)
+            attn = self.decoder.layers[-1].saved_attn_weights                   # (B, K, S)
+            loc_logits = attn @ per_sensor_logits                               # (B, K, L+1)
+        else:
+            loc_logits = self.loc_head(slots)
+        severity   = self.sev_head(slots).squeeze(-1)
+        return loc_logits, severity, fault_prob, aux
