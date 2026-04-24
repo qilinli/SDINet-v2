@@ -674,7 +674,7 @@ def _run_real_inference(model, model_name: str) -> tuple[np.ndarray, np.ndarray]
                 print(f"  [v1] global dmg_scale={dmg_val:.4f}  "
                       f"({'damaged' if dmg_val > 0.5 else 'undamaged'})")
             elif model_name == "c":
-                loc_logits, sev, _ = model(x)
+                loc_logits, sev, _, _ = model(x)
                 loc_prob = loc_logits.softmax(-1)
                 is_obj   = 1.0 - loc_prob[..., -1]
                 scale    = is_obj * sev

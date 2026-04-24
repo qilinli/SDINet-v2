@@ -513,6 +513,38 @@ def _c_slot_decode(loc_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     return active, pred_loc, is_obj
 
 
+def _c_slot_decode_ensemble(
+    loc_logits: Tensor,
+    severity: Tensor | None = None,
+    use_severity: bool = True,
+) -> Tensor:
+    """
+    Ensemble slot decoding for the C-head — all K slots fold into one per-location
+    score map.  Recovers v1-style MIL redundancy at inference without retraining:
+    instead of committing to a single argmax per slot, each slot casts a soft
+    vote weighted by its is-object confidence (and optionally severity).
+
+        M[b, l] = Σ_k is_obj[b, k] · (sev[b, k]) · softmax(loc_logits[b, k])[:L][l]
+
+    Args:
+        loc_logits:   (B, K, L+1) raw location logits (last dim = ∅).
+        severity:     (B, K) sigmoid severity ∈ [0, 1]; required when use_severity.
+        use_severity: Include severity factor in the slot weight (default True).
+
+    Returns:
+        M: (B, L) non-negative ensemble damage score per location.  Can exceed 1
+        when multiple slots vote for the same location; detection uses ratio
+        thresholding which is scale-invariant.
+    """
+    probs  = loc_logits.softmax(-1)                       # (B, K, L+1)
+    loc_p  = probs[..., :-1]                              # (B, K, L)
+    is_obj = 1.0 - probs[..., -1]                         # (B, K)
+    w      = is_obj
+    if use_severity and severity is not None:
+        w = w * severity
+    return (loc_p * w.unsqueeze(-1)).sum(dim=1)           # (B, L)
+
+
 @torch.no_grad()
 def evaluate_all_c(
     loc_logits: Tensor,
@@ -520,24 +552,48 @@ def evaluate_all_c(
     y_norm: Tensor,
     k: int | None = None,
     presence_norm_thresh: float = PRESENCE_NORM_THRESH,
+    ensemble: bool = False,
+    ratio_alpha: float | None = None,
+    ratio_beta: float = 0.0,
+    use_severity: bool = True,
     **_,
 ) -> dict[str, float]:
     """
-    Full evaluation for the C-head using pure DETR slot decoding.
+    Full evaluation for the C-head.
 
-    A slot is active when the no-object class does NOT win the argmax —
-    no threshold, no free parameter.  The predicted damage set is the set
-    of locations pointed to by active slots, naturally bounded by K_max.
+    Two decoding modes:
 
-    map_mse and ap are not applicable with discrete slot decoding and are
-    returned as NaN so comparison tables can display them as such.
+    * **Default (ensemble=False)** — pure DETR slot decoding.  A slot fires when
+      the no-object class does not win the argmax.  ``map_mse`` and ``ap`` are
+      returned as NaN because this mode does not produce a soft per-location map.
+
+    * **ensemble=True** — the K slots' softmax distributions are weighted by
+      ``is_obj`` (and optionally ``severity``) and summed into a single per-location
+      score map (see :func:`_c_slot_decode_ensemble`).  Detection then uses DR-style
+      ratio thresholding: ``pred[l] > α·max(pred)`` AND ``max(pred) > β``.  All
+      metrics (including ``map_mse`` and ``ap``) become well-defined in this mode.
 
     Args:
-        loc_logits: (N, K_max, L+1)  raw location logits (last = ∅)
-        severity:   (N, K_max)       sigmoid-activated severity ∈ [0, 1]
-        y_norm:     (N, L)           normalized ground-truth ∈ [-1, 1]
-        k:          Fixed K for top-K recall.  None = use true K per sample.
+        loc_logits:    (N, K_max, L+1) raw location logits (last = ∅).
+        severity:      (N, K_max)      sigmoid severity ∈ [0, 1].
+        y_norm:        (N, L)          normalized ground truth ∈ [-1, 1].
+        k:             Fixed K for top-K recall.  None = use true K per sample.
+        ensemble:      Use ensemble soft-map decoding instead of argmax slots.
+        ratio_alpha:   α for the ratio rule when ensemble=True.  None falls back
+                       to absolute threshold 0.5 on the ensemble map.
+        ratio_beta:    β for the ratio rule when ensemble=True.
+        use_severity:  Multiply the ensemble weight by slot severity (ensemble only).
     """
+    if ensemble:
+        M = _c_slot_decode_ensemble(loc_logits, severity, use_severity=use_severity)
+        return evaluate_all_dr(
+            M, y_norm,
+            k=k,
+            presence_norm_thresh=presence_norm_thresh,
+            ratio_alpha=ratio_alpha,
+            ratio_beta=ratio_beta,
+        )
+
     NaN = float("nan")
 
     active, pred_loc, is_obj = _c_slot_decode(loc_logits)   # (N, K) each

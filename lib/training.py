@@ -25,12 +25,21 @@ SUBSET_RNG_SEED = 42
 DEFAULT_VAL_SUBSET_COUNT = 51
 DEFAULT_VAL_SUBSET_SIZE = 10
 EPS = 1e-12
-MIXED_PRECISION_MODE = "no"
+MIXED_PRECISION_MODE = "fp16"
 
 # Optimizer / scheduler defaults
 DEFAULT_BASE_LR = 5e-4
 DEFAULT_WEIGHT_DECAY = 1.0e-2
 DEFAULT_ADAMW_BETAS = (0.9, 0.999)
+
+
+def _should_validate(epoch: int, epochs: int, every: int) -> bool:
+    return (epoch + 1) % every == 0 or epoch == epochs - 1
+
+
+def _snapshot_state_dict(model) -> dict:
+    """CPU-clone of a model's state_dict, safe to keep across training steps."""
+    return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
 
 
 @torch.no_grad()
@@ -58,7 +67,6 @@ def train_one_epoch(
     sched,
     train_dl: DataLoader,
     accel: Accelerator,
-    ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
 ) -> float:
     model.train()
@@ -80,8 +88,6 @@ def train_one_epoch(
             else:
                 loc_loss = y_hat_loc.sum() * 0.0               # no-op, keeps graph
             loss = dmg_loss + loc_loss
-            if ema is not None:
-                ema.update_parameters(model)
         accel.backward(loss)
         opt.step()
         sched.step()
@@ -237,8 +243,8 @@ def val_one_epoch(
     )
 
 
-def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None,
-                drop_rate: float = DEFAULT_DROP_RATE):
+def do_training(model, opt, sched, train_dl, val_dl, epochs: int,
+                drop_rate: float = DEFAULT_DROP_RATE, val_every: int = 1):
     accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
     model, opt, sched, train_dl, val_dl = accel.prepare(model, opt, sched, train_dl, val_dl)
 
@@ -251,15 +257,21 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None,
     val_acc = 0.0
     val_accs: list[float] = []
     val_mses: list[float] = []
+    best_val_loss = float("inf")
+    best_state: tuple[int, dict] | None = None
 
     for _epoch in epoch_bar:
-        train_loss = train_one_epoch(model, opt, sched, train_dl, accel, ema, drop_rate)
+        train_loss = train_one_epoch(model, opt, sched, train_dl, accel, drop_rate)
         train_losses.append(train_loss)
         epoch_bar.set_description(
             f"train_loss {train_loss:.3e} | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_acc:.3f}"
         )
 
-        val_loss, val_mse, val_acc = val_one_epoch(model, val_dl)
+        if _should_validate(_epoch, epochs, val_every):
+            val_loss, val_mse, val_acc = val_one_epoch(model, val_dl)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = (_epoch + 1, _snapshot_state_dict(accel.unwrap_model(model)))
         val_mses.append(val_mse)
         val_accs.append(val_acc)
         val_losses.append(val_loss)
@@ -268,9 +280,7 @@ def do_training(model, opt, sched, train_dl, val_dl, epochs: int, ema=None,
             f"train_loss {train_loss:.3e} | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_acc:.3f}"
         )
 
-    # Return the (possibly accelerator-prepared) model so callers can save
-    # the exact trained weights.
-    return train_losses, val_losses, val_dl, val_accs, val_mses, model
+    return train_losses, val_losses, val_dl, val_accs, val_mses, model, best_state
 
 
 def get_opt_and_sched(model, train_dl: DataLoader, epochs: int):
@@ -317,10 +327,10 @@ def train_one_epoch_c(
     train_dl: DataLoader,
     accel: Accelerator,
     criterion,
-    ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
     fault_criterion=None,
     fault_loss_weight: float = 1.0,
+    aux_loss_weight: float = 1.0,
 ) -> tuple[float, float, float]:
     """
     One training epoch for the C-head model.
@@ -329,6 +339,9 @@ def train_one_epoch_c(
         criterion:          :class:`~lib.losses.SetCriterion` instance.
         fault_criterion:    :class:`~lib.losses.FaultBCELoss` or None.
         fault_loss_weight:  Scale factor for fault BCE loss.
+        aux_loss_weight:    Scale factor applied to each intermediate-layer loss
+                            when the model emits aux outputs (DETR-style deep
+                            supervision).  Ignored when model.aux is None.
 
     Returns:
         (avg_total_loss, avg_loc_loss, avg_sev_loss) over the epoch.
@@ -342,13 +355,23 @@ def train_one_epoch_c(
         opt.zero_grad()
         with accel.autocast():
             x = randomise_bag_size(x, drop_rate)
-            loc_logits, severity, fault_prob = model(x)  # (B, K, L+1), (B, K), (B, S) or None
+            loc_logits, severity, fault_prob, aux = model(x)
             total, loc, sev = criterion(loc_logits, severity, y)
+            if aux is not None:
+                for aux_loc, aux_sev in aux:
+                    aux_total, _, _ = criterion(aux_loc, aux_sev, y)
+                    total = total + aux_loss_weight * aux_total
             if fault_criterion is not None and fault_prob is not None and y_fault is not None:
                 total = total + fault_loss_weight * fault_criterion(fault_prob, y_fault.to(x.device))
-            if ema is not None:
-                ema.update_parameters(model)
         accel.backward(total)
+        # DETR-style grad clipping — 0.1 is the standard value from the DETR
+        # paper and is load-bearing for transformer stability (iTransformer
+        # encoder diverged without it at LR=1e-4; DenseNet C survived by luck).
+        # Use accelerator.clip_grad_norm_ (not torch.nn.utils) so the clip is
+        # applied to the unscaled gradient norm under mixed precision — raw
+        # torch.nn.utils.clip_grad_norm_ operates on scaled grads, making the
+        # effective threshold inversely dependent on the current loss scale.
+        accel.clip_grad_norm_(model.parameters(), max_norm=0.1)
         opt.step()
         sched.step()
         accum_total += total.item()
@@ -386,7 +409,7 @@ def val_one_epoch_c(
     for x, y in val_dl:
         x, y = x.float().to(device, non_blocking=True), y.to(device, non_blocking=True)
         B = x.size(0)
-        loc_logits, severity, _ = model(x)
+        loc_logits, severity, _, _ = model(x)
 
         total, _, _ = criterion(loc_logits, severity, y)
         accum_loss += total.item() * B
@@ -450,7 +473,7 @@ def val_one_epoch_c_fault(
         x_f     = x_f.to(device, non_blocking=True)
         y_fault = y_fault.to(device, non_blocking=True)
 
-        loc_logits, severity, fault_prob = model(x_f)
+        loc_logits, severity, fault_prob, _ = model(x_f)
 
         active, pred_loc, is_obj = _c_slot_decode(loc_logits)
         y_pres = y > PRESENCE_NORM_THRESH
@@ -487,11 +510,13 @@ def do_training_c(
     val_dl: DataLoader,
     epochs: int,
     criterion,
-    ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
     fault_criterion=None,
     fault_loss_weight: float = 1.0,
+    aux_loss_weight: float = 1.0,
     fault_val_every: int = 10,
+    val_every: int = 1,
+    mixed_precision: str | None = None,
 ):
     """
     Full training loop for the C-head model.
@@ -501,7 +526,8 @@ def do_training_c(
     Returns:
         (train_losses, val_losses, val_dl, val_f1s, val_mses, model)
     """
-    accel = Accelerator(mixed_precision=MIXED_PRECISION_MODE)
+    mp = mixed_precision if mixed_precision is not None else MIXED_PRECISION_MODE
+    accel = Accelerator(mixed_precision=mp)
     model, opt, sched, train_dl, val_dl = accel.prepare(
         model, opt, sched, train_dl, val_dl
     )
@@ -513,12 +539,15 @@ def do_training_c(
 
     val_loss = val_mse = float("inf")
     val_tkr = train_loss = 0.0
+    best_val_loss = float("inf")
+    best_state: tuple[int, dict] | None = None
 
     epoch_bar = trange(epochs)
     for _epoch in epoch_bar:
         train_loss, loc, sev = train_one_epoch_c(
-            model, opt, sched, train_dl, accel, criterion, ema, drop_rate,
+            model, opt, sched, train_dl, accel, criterion, drop_rate,
             fault_criterion=fault_criterion, fault_loss_weight=fault_loss_weight,
+            aux_loss_weight=aux_loss_weight,
         )
         train_losses.append(train_loss)
         epoch_bar.set_description(
@@ -526,7 +555,11 @@ def do_training_c(
             f" | val_loss {val_loss:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
 
-        val_loss, val_mse, val_tkr = val_one_epoch_c(model, val_dl, criterion)
+        if _should_validate(_epoch, epochs, val_every):
+            val_loss, val_mse, val_tkr = val_one_epoch_c(model, val_dl, criterion)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = (_epoch + 1, _snapshot_state_dict(accel.unwrap_model(model)))
         val_losses.append(val_loss)
         val_mses.append(val_mse)
         val_f1s.append(val_tkr)
@@ -545,7 +578,7 @@ def do_training_c(
                 f"  faulted_tkr={f_tkr:.3f}  fault_f1={f_f1:.3f}"
             )
 
-    return train_losses, val_losses, val_dl, val_f1s, val_mses, model
+    return train_losses, val_losses, val_dl, val_f1s, val_mses, model, best_state
 
 
 # ===========================================================================
@@ -558,7 +591,6 @@ def train_one_epoch_dr(
     sched,
     train_dl: DataLoader,
     accel: Accelerator,
-    ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
     pos_weight: float | None = None,
 ) -> float:
@@ -591,8 +623,6 @@ def train_one_epoch_dr(
                 loss = F.binary_cross_entropy(pred.clamp(0.0, 1.0), target, weight=w)
             else:
                 loss = F.mse_loss(pred, (y + 1.0) / 2.0)
-            if ema is not None:
-                ema.update_parameters(model)
         accel.backward(loss)
         opt.step()
         sched.step()
@@ -659,9 +689,9 @@ def do_training_dr(
     train_dl: DataLoader,
     val_dl: DataLoader,
     epochs: int,
-    ema=None,
     drop_rate: float = DEFAULT_DROP_RATE,
     pos_weight: float | None = None,
+    val_every: int = 1,
 ):
     """
     Full training loop for the DR head.
@@ -681,17 +711,23 @@ def do_training_dr(
 
     val_loss = val_mse = float("inf")
     val_tkr = train_loss = 0.0
+    best_val_loss = float("inf")
+    best_state: tuple[int, dict] | None = None
 
     epoch_bar = trange(epochs)
     for _epoch in epoch_bar:
-        train_loss = train_one_epoch_dr(model, opt, sched, train_dl, accel, ema, drop_rate, pos_weight)
+        train_loss = train_one_epoch_dr(model, opt, sched, train_dl, accel, drop_rate, pos_weight)
         train_losses.append(train_loss)
         epoch_bar.set_description(
             f"train_loss {train_loss:.3e}"
             f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
 
-        val_loss, val_mse, val_tkr = val_one_epoch_dr(model, val_dl, pos_weight)
+        if _should_validate(_epoch, epochs, val_every):
+            val_loss, val_mse, val_tkr = val_one_epoch_dr(model, val_dl, pos_weight)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = (_epoch + 1, _snapshot_state_dict(accel.unwrap_model(model)))
         val_losses.append(val_loss)
         val_mses.append(val_mse)
         val_f1s.append(val_tkr)
@@ -701,5 +737,5 @@ def do_training_dr(
             f" | val_loss {val_loss:.3e} | val_map_mse {val_mse:.3e} | val_top_k_recall {val_tkr:.3f}"
         )
 
-    return train_losses, val_losses, val_dl, val_f1s, val_mses, model
+    return train_losses, val_losses, val_dl, val_f1s, val_mses, model, best_state
 

@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from lib.metrics import (
     PRESENCE_NORM_THRESH,
     _c_slot_decode,
+    _c_slot_decode_ensemble,
     distributed_map_v1,
     evaluate_all_c,
     evaluate_all_dr,
@@ -264,7 +265,7 @@ def calibrate_c_obj_threshold(
     all_l, all_y = [], []
     for dl in val_loaders:
         for x, y in dl:
-            l, _, _fault = model(x.to(device))
+            l, _, _fault, _ = model(x.to(device))
             all_l.append(l.cpu()); all_y.append(y.cpu())
     loc_logits = torch.cat(all_l)
     y_norm     = torch.cat(all_y)
@@ -289,6 +290,55 @@ def calibrate_c_obj_threshold(
     print(f"[calibration/C] mean_k_pred={mean_k_pred:.2f}  mean_k_true={mean_k_true:.2f}"
           f"  val F1={f1:.4f}  (pure argmax, no threshold)")
     return {}
+
+
+@torch.inference_mode()
+def calibrate_c_ensemble(
+    model: torch.nn.Module,
+    val_loaders,
+    device: torch.device | str,
+    use_severity: bool = True,
+) -> dict[str, float]:
+    """
+    Tune ensemble ratio threshold (α, β) for the C-head on validation data.
+
+    Ensemble decoding folds all K slots into a single per-location score map
+    (see :func:`lib.metrics._c_slot_decode_ensemble`), restoring v1-style MIL
+    redundancy at inference without retraining.  Detection uses the DR-style
+    ratio rule ``pred[l] > α·max(pred) AND max(pred) > β``.
+
+    Returns:
+        ``{"ensemble": True, "ensemble_alpha": α, "ensemble_beta": β,
+           "ensemble_use_severity": use_severity}``
+    """
+    device = torch.device(device)
+    model  = model.to(device)
+    model.eval()
+
+    all_l, all_s, all_y = [], [], []
+    for dl in val_loaders:
+        for x, y in dl:
+            l, s, _fault, _ = model(x.to(device))
+            all_l.append(l.cpu()); all_s.append(s.cpu()); all_y.append(y.cpu())
+    loc_logits = torch.cat(all_l)
+    severity   = torch.cat(all_s)
+    y_norm     = torch.cat(all_y)
+
+    M = _c_slot_decode_ensemble(loc_logits, severity, use_severity=use_severity)
+
+    alphas = torch.linspace(0.10, 0.90, _ALPHA_STEPS).tolist()
+    best_alpha, best_beta, best_f1, _ = _sweep_ratio_threshold(
+        M, y_norm, alphas, _BETA_VALUES,
+    )
+
+    print(f"[calibration/C/ensemble] alpha={best_alpha:.3f}  beta={best_beta:.3f}  "
+          f"use_severity={use_severity}  (val F1={best_f1:.4f})")
+    return {
+        "ensemble":             True,
+        "ensemble_alpha":       best_alpha,
+        "ensemble_beta":        best_beta,
+        "ensemble_use_severity": use_severity,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +483,17 @@ def eval_on_loader_c_calibrated(
     model: torch.nn.Module,
     dl,
     device: torch.device | str | None = None,
+    ensemble: bool = False,
+    ensemble_alpha: float | None = None,
+    ensemble_beta: float = 0.0,
+    ensemble_use_severity: bool = True,
     **_,
 ) -> dict[str, float]:
-    """``evaluate_all_c`` with pure DETR argmax decoding (no threshold)."""
+    """``evaluate_all_c`` with pure DETR argmax decoding by default.
+
+    When ``ensemble=True`` the K slots' softmax distributions are summed into
+    a single per-location map and detection uses ratio thresholding (α, β).
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
@@ -444,10 +502,16 @@ def eval_on_loader_c_calibrated(
 
     L, S, Y = [], [], []
     for x, y in dl:
-        l, s, _ = model(x.to(device))
+        l, s, _, _ = model(x.to(device))
         L.append(l.cpu()); S.append(s.cpu()); Y.append(y.cpu())
 
-    return evaluate_all_c(torch.cat(L), torch.cat(S), torch.cat(Y))
+    return evaluate_all_c(
+        torch.cat(L), torch.cat(S), torch.cat(Y),
+        ensemble=ensemble,
+        ratio_alpha=ensemble_alpha,
+        ratio_beta=ensemble_beta,
+        use_severity=ensemble_use_severity,
+    )
 
 
 @torch.inference_mode()
@@ -456,9 +520,13 @@ def do_real_test_c_calibrated(
     device: torch.device | str | None = None,
     print_result: bool = True,
     spec=None,
+    ensemble: bool = False,
+    ensemble_alpha: float | None = None,
+    ensemble_beta: float = 0.0,
+    ensemble_use_severity: bool = True,
     **_,
 ) -> dict[str, float]:
-    """Real .mat benchmark eval for C-head with pure DETR argmax decoding."""
+    """Real .mat benchmark eval for C-head (argmax by default, ensemble when flagged)."""
     from lib.data_7story import load_real_test_tensors, DAMAGE_PHYSICAL_SCALE, DEFAULT_BENCHMARK
 
     if device is None:
@@ -470,10 +538,16 @@ def do_real_test_c_calibrated(
     test_data, test_target = load_real_test_tensors(spec=spec if spec is not None else DEFAULT_BENCHMARK)
     x = test_data[None, None, ...].to(device)
 
-    loc_logits, severity, _ = model(x)
+    loc_logits, severity, _, _ = model(x)
     y_norm = (test_target.squeeze().to(device) / DAMAGE_PHYSICAL_SCALE - 1.0).unsqueeze(0)
 
-    result = evaluate_all_c(loc_logits, severity, y_norm)
+    result = evaluate_all_c(
+        loc_logits, severity, y_norm,
+        ensemble=ensemble,
+        ratio_alpha=ensemble_alpha,
+        ratio_beta=ensemble_beta,
+        use_severity=ensemble_use_severity,
+    )
 
     if print_result:
         from lib.data_7story import _print_eval_results
