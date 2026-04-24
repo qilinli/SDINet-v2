@@ -629,6 +629,20 @@ def _run_condition_7story_dr(
 # ASCE runners (per-batch fault injection, single counter — K ∈ {0..5})
 # ---------------------------------------------------------------------------
 
+def _asce_subset_for(K: int) -> str:
+    """Map K_true to ASCE subset label. K=0 → 'undamaged', K∈{1..5} → 'k1'..'k5'."""
+    return "undamaged" if K == 0 else f"k{K}"
+
+
+def _new_asce_counter() -> dict:
+    return dict(d_tp=0, d_fp=0, d_fn=0, tkr_hits=0, tkr_total=0,
+                f_tp=0, f_fp=0, f_fn=0, has_fault_head=False,
+                n_samples=0, n_fp_samples=0, total_k_pred=0)
+
+
+_ASCE_SUBSETS = ("undamaged", "k1", "k2", "k3", "k4", "k5")
+
+
 @torch.inference_mode()
 def _run_condition_asce_c(
     model: torch.nn.Module,
@@ -637,12 +651,9 @@ def _run_condition_asce_c(
     n_faulted: int,
     n_repeats: int,
     device: torch.device,
-) -> dict[str, float]:
-    d_tp = d_fp = d_fn = 0
-    tkr_hits = tkr_total = 0
-    f_tp = f_fp = f_fn = 0
-    has_fault_head = False
-
+) -> dict[str, dict[str, float]]:
+    """Returns {subset: row} for subset in ('undamaged','k1',…,'k5')."""
+    counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -664,30 +675,44 @@ def _run_condition_asce_c(
             k_true = y_pres.sum(-1)
 
             for b in range(x.size(0)):
+                K = int(k_true[b].item())
+                c = counters[_asce_subset_for(K)]
+
                 pred_set = set(pred_loc[b, active[b]].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
-                d_tp += len(pred_set & true_set)
-                d_fp += len(pred_set - true_set)
-                d_fn += len(true_set - pred_set)
+                fp_this = len(pred_set - true_set)
+                c["d_tp"] += len(pred_set & true_set)
+                c["d_fp"] += fp_this
+                c["d_fn"] += len(true_set - pred_set)
+                c["n_samples"]    += 1
+                c["total_k_pred"] += len(pred_set)
+                if fp_this > 0:
+                    c["n_fp_samples"] += 1
 
-                K = int(k_true[b].item())
                 if K > 0:
                     K_slots   = min(K, is_obj.size(-1))
                     top_slots = is_obj[b].topk(K_slots).indices
                     ps = set(pred_loc[b, top_slots].tolist())
-                    tkr_hits  += len(ps & true_set)
-                    tkr_total += K
+                    c["tkr_hits"]  += len(ps & true_set)
+                    c["tkr_total"] += K
 
                 if fault_prob is not None:
-                    has_fault_head = True
+                    c["has_fault_head"] = True
                     pred_f = fault_prob[b] >= 0.5
                     gt_f   = y_fault_gt[b] > 0.5
-                    f_tp += int((pred_f &  gt_f).sum())
-                    f_fp += int((pred_f & ~gt_f).sum())
-                    f_fn += int((~pred_f & gt_f).sum())
+                    c["f_tp"] += int((pred_f &  gt_f).sum())
+                    c["f_fp"] += int((pred_f & ~gt_f).sum())
+                    c["f_fn"] += int((~pred_f & gt_f).sum())
 
-    return _make_row(d_tp, d_fp, d_fn, tkr_hits, tkr_total,
-                     f_tp, f_fp, f_fn, has_fault_head)
+    return {
+        k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
+                     c["tkr_hits"], c["tkr_total"],
+                     c["f_tp"], c["f_fp"], c["f_fn"], c["has_fault_head"],
+                     n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
+                     total_k_pred=c["total_k_pred"],
+                     is_undamaged=(k == "undamaged"))
+        for k, c in counters.items() if c["n_samples"] > 0
+    }
 
 
 @torch.inference_mode()
@@ -702,10 +727,8 @@ def _run_condition_asce_v1(
     ratio_alpha: float | None = None,
     ratio_beta: float = 0.0,
     dmg_gate: float | None = None,
-) -> dict[str, float]:
-    d_tp = d_fp = d_fn = 0
-    tkr_hits = tkr_total = 0
-
+) -> dict[str, dict[str, float]]:
+    counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -734,18 +757,31 @@ def _run_condition_asce_v1(
             k_true = y_pres.sum(-1)
 
             for b in range(x.size(0)):
+                K = int(k_true[b].item())
+                c = counters[_asce_subset_for(K)]
                 pred_set = set(pred_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
-                d_tp += len(pred_set & true_set)
-                d_fp += len(pred_set - true_set)
-                d_fn += len(true_set - pred_set)
-                K = int(k_true[b].item())
+                fp_this = len(pred_set - true_set)
+                c["d_tp"] += len(pred_set & true_set)
+                c["d_fp"] += fp_this
+                c["d_fn"] += len(true_set - pred_set)
+                c["n_samples"]    += 1
+                c["total_k_pred"] += len(pred_set)
+                if fp_this > 0:
+                    c["n_fp_samples"] += 1
                 if K > 0:
                     top_locs = probs[b].topk(K).indices.tolist()
-                    tkr_hits  += len(set(top_locs) & true_set)
-                    tkr_total += K
+                    c["tkr_hits"]  += len(set(top_locs) & true_set)
+                    c["tkr_total"] += K
 
-    return _make_row(d_tp, d_fp, d_fn, tkr_hits, tkr_total, 0, 0, 0, False)
+    return {
+        k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
+                     c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
+                     n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
+                     total_k_pred=c["total_k_pred"],
+                     is_undamaged=(k == "undamaged"))
+        for k, c in counters.items() if c["n_samples"] > 0
+    }
 
 
 @torch.inference_mode()
@@ -759,10 +795,8 @@ def _run_condition_asce_dr(
     threshold: float = 0.5,
     ratio_alpha: float | None = None,
     ratio_beta: float = 0.0,
-) -> dict[str, float]:
-    d_tp = d_fp = d_fn = 0
-    tkr_hits = tkr_total = 0
-
+) -> dict[str, dict[str, float]]:
+    counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -787,18 +821,31 @@ def _run_condition_asce_dr(
             k_true = y_pres.sum(-1)
 
             for b in range(x.size(0)):
+                K = int(k_true[b].item())
+                c = counters[_asce_subset_for(K)]
                 pred_set = set(pred_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
-                d_tp += len(pred_set & true_set)
-                d_fp += len(pred_set - true_set)
-                d_fn += len(true_set - pred_set)
-                K = int(k_true[b].item())
+                fp_this = len(pred_set - true_set)
+                c["d_tp"] += len(pred_set & true_set)
+                c["d_fp"] += fp_this
+                c["d_fn"] += len(true_set - pred_set)
+                c["n_samples"]    += 1
+                c["total_k_pred"] += len(pred_set)
+                if fp_this > 0:
+                    c["n_fp_samples"] += 1
                 if K > 0:
                     top_locs = pred[b].topk(K).indices.tolist()
-                    tkr_hits  += len(set(top_locs) & true_set)
-                    tkr_total += K
+                    c["tkr_hits"]  += len(set(top_locs) & true_set)
+                    c["tkr_total"] += K
 
-    return _make_row(d_tp, d_fp, d_fn, tkr_hits, tkr_total, 0, 0, 0, False)
+    return {
+        k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
+                     c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
+                     n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
+                     total_k_pred=c["total_k_pred"],
+                     is_undamaged=(k == "undamaged"))
+        for k, c in counters.items() if c["n_samples"] > 0
+    }
 
 
 def _run_sweep_asce(
@@ -812,16 +859,18 @@ def _run_sweep_asce(
     device,
     out_stem,
 ) -> list[dict]:
-    """Per-batch fault sweep for ASCE — single row per (fault_type, n_faulted)."""
+    """Per-batch fault sweep for ASCE — {'undamaged','k1',...,'k5'} × (fault_type, n_faulted)."""
     rows: list[dict] = []
 
     if 0 in n_faulted_list:
         print(f"[{model_name}] clean baseline")
-        row = run_fn(model, test_dl, "hard", 0, 1, device)
-        row["model"]      = model_name
-        row["fault_type"] = "clean"
-        row["n_faulted"]  = 0
-        rows.append(row)
+        results = run_fn(model, test_dl, "hard", 0, 1, device)
+        for subset, row in results.items():
+            row["model"]      = model_name
+            row["fault_type"] = "clean"
+            row["n_faulted"]  = 0
+            row["subset"]     = subset
+            rows.append(row)
 
     nf_nonzero = [n for n in n_faulted_list if n > 0]
     total = len(fault_types) * len(nf_nonzero)
@@ -830,11 +879,13 @@ def _run_sweep_asce(
         for nf in nf_nonzero:
             done += 1
             print(f"[{model_name}] ({done}/{total})  fault={ft}  n_faulted={nf}")
-            row = run_fn(model, test_dl, ft, nf, n_repeats, device)
-            row["model"]      = model_name
-            row["fault_type"] = ft
-            row["n_faulted"]  = nf
-            rows.append(row)
+            results = run_fn(model, test_dl, ft, nf, n_repeats, device)
+            for subset, row in results.items():
+                row["model"]      = model_name
+                row["fault_type"] = ft
+                row["n_faulted"]  = nf
+                row["subset"]     = subset
+                rows.append(row)
 
     _print_table(rows, model_name)
     if out_stem is not None:
