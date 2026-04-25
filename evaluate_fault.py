@@ -1142,7 +1142,7 @@ def main() -> None:
         description="Fault robustness sweep for C, v1, and DR heads.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset",      default="qatar", choices=["qatar", "7story", "lumo", "asce"],
+    parser.add_argument("--dataset",      default="qatar", choices=["qatar", "7story", "lumo", "asce", "asce-columns"],
                         help="Dataset to evaluate on (default: qatar).")
     parser.add_argument("--c",            default=None, metavar="CKPT",
                         help="C-head checkpoint path.")
@@ -1486,15 +1486,21 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # ASCE branch (per-batch injection, single row per condition)
     # -------------------------------------------------------------------------
-    elif args.dataset == "asce":
+    elif args.dataset in ("asce", "asce-columns"):
         from lib.data_asce import get_asce_dataloaders
-        root = args.root or "data/asce_hammer"
-        print(f"[evaluate_fault] Loading ASCE test set from: {root}")
+        if args.dataset == "asce-columns":
+            root = args.root or "data/asce_hammer_columns"
+            n_loc = 36
+        else:
+            root = args.root or "data/asce_hammer"
+            n_loc = 32
+        print(f"[evaluate_fault] Loading {args.dataset} test set from: {root}  (L={n_loc})")
         _, _, test_dl = get_asce_dataloaders(
             root=root,
             num_workers=0,
             eval_batch_size=args.batch_size,
             norm_method=args.norm_method,
+            n_locations=n_loc,
         )
         n_samples = len(test_dl.dataset)
         print(f"[evaluate_fault] {n_samples} test samples")

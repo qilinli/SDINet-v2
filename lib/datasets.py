@@ -52,6 +52,7 @@ from lib.data_asce import (
     ASCE_N_SENSORS,
     ASCE_TIME_LEN,
     build_structural_affinity_asce,
+    build_structural_affinity_asce_columns,
     get_asce_dataloaders,
 )
 
@@ -254,6 +255,18 @@ def _loader_asce(root, num_workers, train_batch_size, eval_batch_size, seed, **k
     )
 
 
+def _loader_asce_columns(root, num_workers, train_batch_size, eval_batch_size, seed, **kw):
+    return get_asce_dataloaders(
+        root=root,
+        num_workers=num_workers,
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        seed=seed,
+        n_locations=36,
+        **kw,
+    )
+
+
 def _loader_qatar(root, window_size, overlap, downsample,
                   num_workers, train_batch_size, eval_batch_size, seed, **kw):
     return get_qatar_dataloaders(
@@ -343,6 +356,18 @@ DATASETS: dict[str, DatasetConfig] = {
         _loader_fn=_loader_asce,
         _structural_affinity_fn=build_structural_affinity_asce,
         # K_max=5 → give the C-head 6 slots (+1 for room; ∅ class is a separate logit).
+        _model_cfg_overrides={"c": {"num_slots": 6}},
+    ),
+    "asce-columns": DatasetConfig(
+        name="asce-columns",
+        n_sensors=ASCE_N_SENSORS,
+        n_locations=36,      # 9 columns × 4 stories
+        time_len=ASCE_TIME_LEN,
+        label_type="continuous",
+        supports_real_benchmark=False,
+        default_root="data/asce_hammer_columns",
+        _loader_fn=_loader_asce_columns,
+        _structural_affinity_fn=build_structural_affinity_asce_columns,
         _model_cfg_overrides={"c": {"num_slots": 6}},
     ),
     "qatar": DatasetConfig(

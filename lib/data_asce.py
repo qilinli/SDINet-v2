@@ -102,7 +102,7 @@ _struct_masks_asce = build_struct_masks_asce()
 
 
 def build_structural_affinity_asce() -> torch.Tensor:
-    """(L+1, S) = (33, 16) binary location-sensor affinity under rigid-floor coupling.
+    """(L+1, S) = (33, 16) binary location-sensor affinity for the brace dataset.
 
     Each brace spans two adjacent floors; sensors on either of those floors
     receive 1.  Ground floor has no sensors so story-1 braces couple only to
@@ -122,15 +122,34 @@ def build_structural_affinity_asce() -> torch.Tensor:
     return R
 
 
+def build_structural_affinity_asce_columns() -> torch.Tensor:
+    """(L+1, S) = (37, 16) affinity for the 36-column ASCE-hammer-columns dataset.
+
+    Each story contains 9 columns (3×3 plan grid) spanning two adjacent floors.
+    Coupling rules mirror the brace affinity (same rigid-floor sensor groups),
+    only the "n_per_story" constant grows from 8 → 9.
+    """
+    N_LOC = 36
+    R = torch.zeros(N_LOC + 1, ASCE_N_SENSORS)
+    R[0:9,    0:4]   = 1.0   # story 1 columns (ground↔F1)
+    R[9:18,   0:8]   = 1.0   # story 2 columns (F1↔F2)
+    R[18:27,  4:12]  = 1.0   # story 3 columns (F2↔F3)
+    R[27:36,  8:16]  = 1.0   # story 4 columns (F3↔F4)
+    return R
+
+
 # ---------------------------------------------------------------------------
 # Cache build (one-time, ~5–10 min)
 # ---------------------------------------------------------------------------
 
-def _build_cache(root: Path, cache_path: Path) -> None:
+def _build_cache(root: Path, cache_path: Path, n_locations: int = ASCE_N_LOCATIONS) -> None:
     """Read all 51 000 .mat files, window + decimate, save one NPZ.
 
     Cached signal is **pre-normalisation**; RMS is applied at load time so
     ``--norm-method`` can toggle it.
+
+    ``n_locations`` is the target-vector width in the .mat files; 32 for the
+    brace dataset, 36 for the columns dataset. The cache shape follows it.
     """
     import h5py
 
@@ -138,7 +157,7 @@ def _build_cache(root: Path, cache_path: Path) -> None:
 
     N = sum(_CLASS_COUNTS.values())
     X = np.empty((N, ASCE_TIME_LEN, ASCE_N_SENSORS), dtype=np.float32)
-    Y = np.empty((N, ASCE_N_LOCATIONS),              dtype=np.float32)
+    Y = np.empty((N, n_locations),                    dtype=np.float32)
     K = np.empty((N,),                                dtype=np.int8)
 
     i = 0
@@ -166,11 +185,11 @@ def _build_cache(root: Path, cache_path: Path) -> None:
     np.savez(cache_path, X=X, Y=Y, K=K)
 
 
-def _load_cache(root: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_cache(root: Path, n_locations: int = ASCE_N_LOCATIONS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     cache_path = root / "processed" / _CACHE_NAME
     if not cache_path.exists():
         print(f"[asce] cache not found at {cache_path}; building (one-time, ~5–10 min)")
-        _build_cache(root, cache_path)
+        _build_cache(root, cache_path, n_locations=n_locations)
     f = np.load(cache_path)
     return f["X"], f["Y"], f["K"]
 
@@ -216,6 +235,7 @@ def get_asce_dataloaders(
     p_struct_mask: float = 0.0,
     p_soft: float = 0.0,
     norm_method: str = "none",
+    n_locations: int = ASCE_N_LOCATIONS,
     **_,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Return train / val / test DataLoaders for the ASCE hammer benchmark.
@@ -230,7 +250,7 @@ def get_asce_dataloaders(
             the divisor (matches v1/B original-paper preprocessing).
     """
     root = Path(root)
-    X, Y, K = _load_cache(root)
+    X, Y, K = _load_cache(root, n_locations=n_locations)
 
     # Apply load-time normalisation so --norm-method controls it.
     X = normalize_rms(X, ref_channel=None, method=norm_method)

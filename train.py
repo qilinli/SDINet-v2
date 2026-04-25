@@ -85,7 +85,7 @@ def _build_dl_kwargs(args, dataset) -> dict:
         if args.subsets:
             base["subsets"] = args.subsets
         base["norm_method"] = args.norm_method
-    elif dataset.name == "asce":
+    elif dataset.name in ("asce", "asce-columns"):
         base["norm_method"] = args.norm_method
     elif dataset.name == "tower":
         base["tower_excitation"] = tuple(args.tower_excitation)
@@ -317,6 +317,9 @@ def main(args) -> None:
             parts.append(f"s{k_eff}")
         if args.num_decoder_layers != 2:
             parts.append(f"d{args.num_decoder_layers}")
+        # embed_dim marker: omit at default 768. Encode as e<N>.
+        if args.embed_dim != 768:
+            parts.append(f"e{args.embed_dim}")
         if args.use_mil_readout:
             parts.append("mil")
         model_label = "-".join(parts)
@@ -388,7 +391,7 @@ def _run_eval_fault(args, ckpt_path, model_label, run_name):
     ]
     if args.root is not None:
         cmd += ["--root", args.root]
-    if args.dataset in ("7story", "7story-sparse", "asce"):
+    if args.dataset in ("7story", "7story-sparse", "asce", "asce-columns"):
         cmd += ["--norm-method", args.norm_method]
 
     print(f"\n{'=' * 60}")
