@@ -29,7 +29,20 @@ Structural Damage Identification (SHM) neural network. Sensor accelerometer data
 - **Approach DR** (`MidnDR`): per-location regression with MIL sensor attention
 - **Baseline B** (`PlainDR`): plain per-location regression (mean-pool over sensors, no learned attention) — isolates MIL contribution
 
-Current development focus: **fault-robust SDI on 7story-fault-k0 (single + double + undamaged on `unc=0` and `unc=1`)**, with the proposed configuration being iT+C+fh+sb with **pre-encoder fault head** (`--fault-head-location encoder`), **`no_obj_weight=0.5`** (up from DETR default 0.1), and **`--norm-method none`** (consistency across v1, B, and C on this protocol — `none` is within noise of `mean` for the iT backbone per Insight 30 revised). Canonical auto-label: `c-nn-it4-pfh-sb-nw5`. This config **ties v1 on K=1 F1** (0.962 vs 0.962), **wins K=2 F1** (0.883 grand, +0.24 over v1's 0.646), and **wins K=0 sample-FAR** (0.010 grand vs B's 0.167 vs v1's 0.507). The two tuning changes compose cleanly: nw=0.5 fixes the K=0 false-alarm problem by giving the ∅ class adequate gradient (Insight 32); pre-encoder fault head releases encoder capacity from gradient-path competition with damage supervision (Insight 33). Abandoned / deferred: structural affinity bias (`R_bias`) is retained from the legacy baseline but not the star; spatial self-attention (`SensorSpatialLayer`, Insight 21) remained off; multi-scale conv tokenizer failed to converge at 200 epochs under our training budget and is deferred (Insight 35, `docs/future_plans.md` F5). ASCE-hammer replication with the same config (`c-nn-it4-pfh-sb-nw5-s6`) confirms the architectural claims on a second dataset, though absolute F1 there sits in a 2-fold geometric symmetry ceiling (≈0.65 K=1) caused by same-wall-span equivalence in the 16-sensor ASCE layout.
+Current development focus: **fault-robust SDI on impact-hammer benchmarks** — 7-story-fault-k0 (K_max=2) and asce-hammer-columns (K_max=5; replaces the brace-damage variant which had a 2-fold geometric ceiling at ≈0.65 K=1). The proposed architecture is iT+C+fh+sb with **pre-encoder fault head** (`--fault-head-location encoder`), **`no_obj_weight=1.5`** (peak ∅ supervision per the 7-story HP sweep, up from DETR default 0.1), and **`--norm-method none`** (CLI default; v1/B/C all share preprocessing). Encoder depth is the only task-dependent knob:
+
+- **7-story-fault-k0 canonical**: `c-nn-it4-pfh-sb-nw15` — full encoder (iT depth 4). Wins K=1 F1 (0.968), K=2 F1 (+0.24 vs v1's 0.646), K=0 FAR (0.002), precision (0.944), and damaged grand F1 (0.926).
+- **asce-columns canonical**: `c-nn-it2-pfh-sb-nw15-s6` — lightweight encoder (iT depth 2, num_slots=6 for K_max=5). Wins damaged grand F1 (0.835), K=0 FAR (0.001), fault_F1 (0.852), and beats every K-level (k1..k5) of v1 and B.
+
+Common building blocks across both datasets (paper headline):
+- nw=1.5 universally. The original DETR default of 0.1 is calibrated for image detection (K_max≫K_true); for SHM with K_max≤5 the ∅ class needs much higher weight. nw=1.5 peaks the curve; nw=2.0 over-suppresses K=2 (Insight 32).
+- Pre-encoder fault head decouples damage and fault gradients (Insight 33).
+- Structural affinity bias retained from the legacy baseline (Insight 22, 28).
+- K=0 training data included (200 undamaged samples on 7-story; native k0 folder on ASCE).
+
+Counter-intuitive per-dataset tuning: encoder depth is **deeper for the easier task (K_max=2)** and **shallower for the harder task (K_max=5)**. Mechanism: at high K_max the slot decoder does more work and benefits from a tighter encoder; at low K_max the encoder needs more depth to push K=2 detection (where it's not capacity-limited).
+
+Abandoned / deferred: the spatial self-attention layer (SensorSpatialLayer, Insight 21) stayed off; multi-scale conv tokenizer failed at the 200-epoch budget (Insight 35, `docs/future_plans.md` F5); decoder depth and embed_dim sweeps showed neutral effects (HP sweep on 7-story).
 
 ## Collaboration workflow
 
@@ -185,6 +198,7 @@ c-<norm>[-<tokenizer>]-<encoder><depth>[-<posemb>][-<faulthead>][-<bias>][-s<K>d
 | `s<K>` | no — omit if default (5) | e.g. `s3` |
 | `d<D>` | no — omit if default (2) | e.g. `d4` (decoder depth, not to be confused with `it<D>` encoder depth) |
 | `nw<X>` | no — omit if default (0.1) | e.g. `nw5` (no_obj_weight=0.5), `nw3` (=0.3). `X = int(value × 10)` |
+| `e<N>` | no — omit if default (768) | e.g. `e256`, `e512`, `e1024` — embed_dim |
 | `<readout>` | no — omit if direct | `mil` |
 
 Examples:
