@@ -47,6 +47,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from lib.calibration import load_calibration
@@ -67,9 +68,79 @@ from lib.model import (
 )
 
 _DMG_METRICS   = ["f1", "precision", "recall", "top_k_recall"]
+_AP_METRICS    = ["mAP", "AR_at_Kmax"]
 _K0_METRICS    = ["sample_far", "mean_k_pred"]
 _FAULT_METRICS = ["fault_f1", "fault_precision", "fault_recall"]
-_ALL_METRICS   = _DMG_METRICS + _K0_METRICS + _FAULT_METRICS
+_ALL_METRICS   = _DMG_METRICS + _AP_METRICS + _K0_METRICS + _FAULT_METRICS
+
+# K_max per dataset — used as the K in AR@K_max (top-K recall per sample,
+# averaged over samples in a subset). 7-story uses K_max=2 since the
+# sweep includes single + double; ASCE has K_max=5.
+DATASET_KMAX = {
+    "7story": 2,
+    "asce":         5,
+    "asce-columns": 5,
+}
+
+
+def _score_per_loc_c(loc_logits: torch.Tensor) -> torch.Tensor:
+    """(B, K_slots, L+1) -> (B, L). Per-location score = sum over slots of
+    softmax_loc[k][l] * is_obj[k]. The 'expected slot fire on location l'."""
+    sm = torch.softmax(loc_logits, dim=-1)
+    real_loc = sm[..., :-1]                          # (B, K, L)
+    is_obj   = 1.0 - sm[..., -1]                     # (B, K)
+    return (real_loc * is_obj.unsqueeze(-1)).sum(dim=1)
+
+
+def _finalize_ap(score_lists, label_lists, k_max):
+    """{subset: list[(L,)]} -> {subset: (mAP, AR@Kmax)}."""
+    out = {}
+    for sub in score_lists:
+        if score_lists[sub]:
+            S = np.stack(score_lists[sub])
+            L = np.stack(label_lists[sub])
+            out[sub] = _compute_ap_ar(S, L, k_max)
+        else:
+            out[sub] = (float("nan"), float("nan"))
+    return out
+
+
+def _compute_ap_ar(scores: np.ndarray, labels: np.ndarray, k_max: int) -> tuple[float, float]:
+    """Compute (macro-mAP across L locations, AR@k_max) for a pool of samples.
+
+    Args:
+        scores: (N, L) per-location score in any monotone-increasing range.
+        labels: (N, L) binary 0/1 label per location.
+        k_max:  AR@K_max top-K cutoff (we take each sample's top-k_max scores
+                and ask what fraction of true damages fell into them).
+
+    Returns NaN for either metric when its denominator is empty (e.g. K=0
+    samples have no positives → mAP undefined; AR also undefined).
+    """
+    from sklearn.metrics import average_precision_score
+    if scores.shape[0] == 0:
+        return float("nan"), float("nan")
+
+    L = scores.shape[1]
+    aps: list[float] = []
+    for l in range(L):
+        if labels[:, l].sum() > 0:
+            aps.append(average_precision_score(labels[:, l], scores[:, l]))
+    mAP = float(np.mean(aps)) if aps else float("nan")
+
+    recalls: list[float] = []
+    k_eff = max(1, min(k_max, L))
+    # argpartition is O(L) — top-k indices per sample, no full sort.
+    top_k_idx = np.argpartition(-scores, kth=k_eff - 1, axis=1)[:, :k_eff]
+    for n in range(scores.shape[0]):
+        true_count = int(labels[n].sum())
+        if true_count == 0:
+            continue
+        top_set = set(top_k_idx[n].tolist())
+        true_set = set(np.where(labels[n] > 0)[0].tolist())
+        recalls.append(len(top_set & true_set) / true_count)
+    AR = float(np.mean(recalls)) if recalls else float("nan")
+    return mAP, AR
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +460,8 @@ def _run_condition_7story_c(
                     f_tp=0, f_fp=0, f_fn=0, has_fault_head=False,
                     n_samples=0, n_fp_samples=0, total_k_pred=0)
     counters = {"single": _new_counter(), "double": _new_counter(), "undamaged": _new_counter()}
+    score_lists: dict[str, list] = {s: [] for s in counters}
+    label_lists: dict[str, list] = {s: [] for s in counters}
 
     for repeat in range(repeats):
         rng = torch.Generator()
@@ -407,8 +480,11 @@ def _run_condition_7story_c(
             y_pres = y > PRESENCE_NORM_THRESH  # (B, L)
             k_true = y_pres.sum(-1)            # (B,)
 
+            # Per-location score for AP (sum-over-slots aggregation).
+            # When ensemble alpha is set we already have per-location M; reuse.
             if ensemble_alpha is not None:
                 M = _c_slot_decode_ensemble(loc_logits, severity, use_severity=ensemble_use_severity)
+                score_per_loc = M
                 max_M = M.max(dim=-1, keepdim=True).values
                 pred_pres = (M > ensemble_alpha * max_M) & (max_M > ensemble_beta)
                 for b in range(x.size(0)):
@@ -426,6 +502,8 @@ def _run_condition_7story_c(
                     c["total_k_pred"] += len(pred_set)
                     if fp_this > 0:
                         c["n_fp_samples"] += 1
+                    score_lists[subset].append(score_per_loc[b].detach().cpu().numpy())
+                    label_lists[subset].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
 
                     if K > 0:
                         ps = set(M[b].topk(K).indices.tolist())
@@ -441,6 +519,7 @@ def _run_condition_7story_c(
                         c["f_fn"] += int((~pred_f & gt_f).sum())
             else:
                 active, pred_loc, is_obj = _c_slot_decode(loc_logits)
+                score_per_loc = _score_per_loc_c(loc_logits)
                 for b in range(x.size(0)):
                     K = int(k_true[b].item())
                     subset = "undamaged" if K == 0 else ("double" if K >= 2 else "single")
@@ -456,6 +535,8 @@ def _run_condition_7story_c(
                     c["total_k_pred"] += len(pred_set)
                     if fp_this > 0:
                         c["n_fp_samples"] += 1
+                    score_lists[subset].append(score_per_loc[b].detach().cpu().numpy())
+                    label_lists[subset].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
 
                     if K > 0:
                         K_slots   = min(K, is_obj.size(-1))
@@ -472,6 +553,7 @@ def _run_condition_7story_c(
                         c["f_fp"] += int((pred_f & ~gt_f).sum())
                         c["f_fn"] += int((~pred_f & gt_f).sum())
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=2)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"],
@@ -479,7 +561,8 @@ def _run_condition_7story_c(
                      c["has_fault_head"],
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
-                     is_undamaged=(k == "undamaged"))
+                     is_undamaged=(k == "undamaged"),
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1])
         for k, c in counters.items() if c["n_samples"] > 0
     }
 
@@ -502,6 +585,8 @@ def _run_condition_7story_v1(
         return dict(d_tp=0, d_fp=0, d_fn=0, tkr_hits=0, tkr_total=0,
                     n_samples=0, n_fp_samples=0, total_k_pred=0)
     counters = {"single": _new_counter(), "double": _new_counter(), "undamaged": _new_counter()}
+    score_lists = {s: [] for s in counters}
+    label_lists = {s: [] for s in counters}
 
     for repeat in range(repeats):
         rng = torch.Generator()
@@ -542,17 +627,21 @@ def _run_condition_7story_v1(
                 c["total_k_pred"] += len(pred_set)
                 if fp_this > 0:
                     c["n_fp_samples"] += 1
+                score_lists[subset].append(probs[b].detach().cpu().numpy())
+                label_lists[subset].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
                 if K > 0:
                     top_locs = probs[b].topk(K).indices.tolist()
                     c["tkr_hits"]  += len(set(top_locs) & true_set)
                     c["tkr_total"] += K
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=2)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
-                     is_undamaged=(k == "undamaged"))
+                     is_undamaged=(k == "undamaged"),
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1])
         for k, c in counters.items() if c["n_samples"] > 0
     }
 
@@ -574,6 +663,8 @@ def _run_condition_7story_dr(
         return dict(d_tp=0, d_fp=0, d_fn=0, tkr_hits=0, tkr_total=0,
                     n_samples=0, n_fp_samples=0, total_k_pred=0)
     counters = {"single": _new_counter(), "double": _new_counter(), "undamaged": _new_counter()}
+    score_lists = {s: [] for s in counters}
+    label_lists = {s: [] for s in counters}
 
     for repeat in range(repeats):
         rng = torch.Generator()
@@ -610,17 +701,21 @@ def _run_condition_7story_dr(
                 c["total_k_pred"] += len(pred_set)
                 if fp_this > 0:
                     c["n_fp_samples"] += 1
+                score_lists[subset].append(pred[b].detach().cpu().numpy())
+                label_lists[subset].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
                 if K > 0:
                     top_locs = pred[b].topk(K).indices.tolist()
                     c["tkr_hits"]  += len(set(top_locs) & true_set)
                     c["tkr_total"] += K
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=2)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
-                     is_undamaged=(k == "undamaged"))
+                     is_undamaged=(k == "undamaged"),
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1])
         for k, c in counters.items() if c["n_samples"] > 0
     }
 
@@ -654,6 +749,8 @@ def _run_condition_asce_c(
 ) -> dict[str, dict[str, float]]:
     """Returns {subset: row} for subset in ('undamaged','k1',…,'k5')."""
     counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
+    score_lists = {s: [] for s in _ASCE_SUBSETS}
+    label_lists = {s: [] for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -671,12 +768,14 @@ def _run_condition_asce_c(
 
             loc_logits, severity, fault_prob, _ = model(x)
             active, pred_loc, is_obj = _c_slot_decode(loc_logits)
+            score_per_loc = _score_per_loc_c(loc_logits)
             y_pres = y > PRESENCE_NORM_THRESH
             k_true = y_pres.sum(-1)
 
             for b in range(x.size(0)):
                 K = int(k_true[b].item())
-                c = counters[_asce_subset_for(K)]
+                sub = _asce_subset_for(K)
+                c = counters[sub]
 
                 pred_set = set(pred_loc[b, active[b]].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
@@ -688,6 +787,8 @@ def _run_condition_asce_c(
                 c["total_k_pred"] += len(pred_set)
                 if fp_this > 0:
                     c["n_fp_samples"] += 1
+                score_lists[sub].append(score_per_loc[b].detach().cpu().numpy())
+                label_lists[sub].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
 
                 if K > 0:
                     K_slots   = min(K, is_obj.size(-1))
@@ -704,13 +805,15 @@ def _run_condition_asce_c(
                     c["f_fp"] += int((pred_f & ~gt_f).sum())
                     c["f_fn"] += int((~pred_f & gt_f).sum())
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=5)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"],
                      c["f_tp"], c["f_fp"], c["f_fn"], c["has_fault_head"],
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
-                     is_undamaged=(k == "undamaged"))
+                     is_undamaged=(k == "undamaged"),
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1])
         for k, c in counters.items() if c["n_samples"] > 0
     }
 
@@ -729,6 +832,8 @@ def _run_condition_asce_v1(
     dmg_gate: float | None = None,
 ) -> dict[str, dict[str, float]]:
     counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
+    score_lists = {s: [] for s in _ASCE_SUBSETS}
+    label_lists = {s: [] for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -758,7 +863,8 @@ def _run_condition_asce_v1(
 
             for b in range(x.size(0)):
                 K = int(k_true[b].item())
-                c = counters[_asce_subset_for(K)]
+                sub = _asce_subset_for(K)
+                c = counters[sub]
                 pred_set = set(pred_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 fp_this = len(pred_set - true_set)
@@ -769,17 +875,21 @@ def _run_condition_asce_v1(
                 c["total_k_pred"] += len(pred_set)
                 if fp_this > 0:
                     c["n_fp_samples"] += 1
+                score_lists[sub].append(probs[b].detach().cpu().numpy())
+                label_lists[sub].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
                 if K > 0:
                     top_locs = probs[b].topk(K).indices.tolist()
                     c["tkr_hits"]  += len(set(top_locs) & true_set)
                     c["tkr_total"] += K
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=5)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
-                     is_undamaged=(k == "undamaged"))
+                     is_undamaged=(k == "undamaged"),
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1])
         for k, c in counters.items() if c["n_samples"] > 0
     }
 
@@ -797,6 +907,8 @@ def _run_condition_asce_dr(
     ratio_beta: float = 0.0,
 ) -> dict[str, dict[str, float]]:
     counters = {s: _new_asce_counter() for s in _ASCE_SUBSETS}
+    score_lists = {s: [] for s in _ASCE_SUBSETS}
+    label_lists = {s: [] for s in _ASCE_SUBSETS}
     repeats = max(1, n_repeats) if n_faulted > 0 else 1
 
     for repeat in range(repeats):
@@ -822,7 +934,8 @@ def _run_condition_asce_dr(
 
             for b in range(x.size(0)):
                 K = int(k_true[b].item())
-                c = counters[_asce_subset_for(K)]
+                sub = _asce_subset_for(K)
+                c = counters[sub]
                 pred_set = set(pred_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 true_set = set(y_pres[b].nonzero(as_tuple=False)[:, 0].tolist())
                 fp_this = len(pred_set - true_set)
@@ -833,16 +946,20 @@ def _run_condition_asce_dr(
                 c["total_k_pred"] += len(pred_set)
                 if fp_this > 0:
                     c["n_fp_samples"] += 1
+                score_lists[sub].append(pred[b].detach().cpu().numpy())
+                label_lists[sub].append(y_pres[b].detach().cpu().numpy().astype(np.float32))
                 if K > 0:
                     top_locs = pred[b].topk(K).indices.tolist()
                     c["tkr_hits"]  += len(set(top_locs) & true_set)
                     c["tkr_total"] += K
 
+    ap_results = _finalize_ap(score_lists, label_lists, k_max=5)
     return {
         k: _make_row(c["d_tp"], c["d_fp"], c["d_fn"],
                      c["tkr_hits"], c["tkr_total"], 0, 0, 0, False,
                      n_samples=c["n_samples"], n_fp_samples=c["n_fp_samples"],
                      total_k_pred=c["total_k_pred"],
+                     mAP=ap_results[k][0], AR_at_Kmax=ap_results[k][1],
                      is_undamaged=(k == "undamaged"))
         for k, c in counters.items() if c["n_samples"] > 0
     }
@@ -950,6 +1067,7 @@ def _make_row(
     f_tp, f_fp, f_fn, has_fault_head,
     n_samples=0, n_fp_samples=0, total_k_pred=0,
     is_undamaged=False,
+    mAP: float = float("nan"), AR_at_Kmax: float = float("nan"),
 ) -> dict[str, float]:
     row: dict[str, float] = {}
     if is_undamaged:
@@ -974,6 +1092,9 @@ def _make_row(
     else:
         row["sample_far"]  = float("nan")
         row["mean_k_pred"] = float("nan")
+
+    row["mAP"]        = mAP
+    row["AR_at_Kmax"] = AR_at_Kmax
 
     if has_fault_head:
         ff1, fprec, frec = f1_from_counts(f_tp, f_fp, f_fn)
